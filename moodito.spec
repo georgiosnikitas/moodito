@@ -17,7 +17,7 @@ a = Analysis(
     ["app.py"],
     pathex=[],
     binaries=mp_binaries,
-    datas=mp_datas + [("moodito.png", ".")],
+    datas=mp_datas + [("moodito.png", "."), ("bmc_qr.png", ".")],
     hiddenimports=mp_hiddenimports + ["AVFoundation", "objc"],
     hookspath=[],
     hooksconfig={},

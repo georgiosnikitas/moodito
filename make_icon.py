@@ -9,7 +9,6 @@ into a multi-resolution macOS .icns file. Re-run after changing the design:
 from __future__ import annotations
 
 import math
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path

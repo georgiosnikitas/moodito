@@ -32,6 +32,8 @@ MODEL_URL = (
 MENUBAR_ICON = "moodito.png"
 # Support / tip jar link opened from the menu.
 BMC_URL = "https://buymeacoffee.com/georgiosnikitas"
+# QR code image (bundled) shown under the Buy Me a Coffee menu item.
+BMC_QR = "bmc_qr.png"
 # Store the model in a writable per-user directory so it works both when run
 # from source and when packaged as a read-only .app bundle.
 DATA_DIR = os.path.expanduser("~/Library/Application Support/Moodito")
@@ -378,6 +380,12 @@ class MooditoApp(rumps.App):
             rumps.MenuItem("Pause", callback=self.toggle_pause),
             None,
             rumps.MenuItem("Buy Me a Coffee ☕", callback=self.buy_me_a_coffee),
+            rumps.MenuItem(
+                "",
+                icon=resource_path(BMC_QR),
+                dimensions=[180, 180],
+                callback=self.buy_me_a_coffee,
+            ),
             rumps.MenuItem("Quit", callback=self.quit_app),
         ]
         self._detected_item = self.menu["Detected: …"]
