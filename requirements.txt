@@ -1,0 +1,5 @@
+rumps>=0.4.0
+opencv-python>=4.9.0
+mediapipe>=0.10.14
+numpy>=1.26.0
+pyobjc-framework-AVFoundation>=10.0

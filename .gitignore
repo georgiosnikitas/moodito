@@ -1,0 +1,35 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec.bak
+
+# Downloaded MediaPipe model
+face_landmarker.task
+
+# Distribution / packaging
+*.egg-info/
+.eggs/
+*.egg
+
+# Logs and temp files
+*.log
+*.out
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
