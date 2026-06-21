@@ -370,6 +370,20 @@ class MooditoApp(rumps.App):
         )
         self._stats_menu.add(self._stats_reset_item)
 
+        # Buy Me a Coffee submenu: an "open page" action plus the QR code image.
+        self._bmc_menu = rumps.MenuItem("Buy Me a Coffee ☕")
+        self._bmc_menu.add(
+            rumps.MenuItem("Open buymeacoffee.com", callback=self.buy_me_a_coffee)
+        )
+        self._bmc_menu.add(
+            rumps.MenuItem(
+                "",
+                icon=resource_path(BMC_QR),
+                dimensions=[180, 180],
+                callback=self.buy_me_a_coffee,
+            )
+        )
+
         self.menu = [
             rumps.MenuItem("Detected: …", callback=None),
             None,
@@ -379,13 +393,7 @@ class MooditoApp(rumps.App):
             rumps.MenuItem("Camera Grant Access", callback=self.grant_camera),
             rumps.MenuItem("Pause", callback=self.toggle_pause),
             None,
-            rumps.MenuItem("Buy Me a Coffee ☕", callback=self.buy_me_a_coffee),
-            rumps.MenuItem(
-                "",
-                icon=resource_path(BMC_QR),
-                dimensions=[180, 180],
-                callback=self.buy_me_a_coffee,
-            ),
+            self._bmc_menu,
             rumps.MenuItem("Quit", callback=self.quit_app),
         ]
         self._detected_item = self.menu["Detected: …"]
