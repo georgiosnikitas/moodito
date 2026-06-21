@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -43,6 +44,10 @@ MODEL_PATH = os.path.join(DATA_DIR, MODEL_FILENAME)
 SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
 # Persisted usage statistics (time + occurrences per emotion).
 STATS_PATH = os.path.join(DATA_DIR, "stats.json")
+# Raw per-sample detection log (one row per refresh tick).
+RAW_PATH = os.path.join(DATA_DIR, "raw_data.csv")
+# Column labels for the raw detection log.
+RAW_HEADER = ["timestamp", "state", "score"]
 # Emotions accumulated in the statistics.
 TRACKED_EMOTIONS = ["happy", "sad", "surprised", "angry", "neutral", "no face"]
 # Non-emotion states that are also tracked.
@@ -154,6 +159,33 @@ def stats_file_size() -> int:
         return os.path.getsize(STATS_PATH)
     except OSError:
         return 0
+
+
+def raw_file_size() -> int:
+    """Return the size in bytes of the raw detection log (0 if absent)."""
+    try:
+        return os.path.getsize(RAW_PATH)
+    except OSError:
+        return 0
+
+
+def append_raw_samples(rows: list[tuple]) -> None:
+    """Append raw detection samples to the raw CSV log (best-effort).
+
+    Writes the column-label header row the first time the file is created.
+    """
+    if not rows:
+        return
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        write_header = not os.path.exists(RAW_PATH) or os.path.getsize(RAW_PATH) == 0
+        with open(RAW_PATH, "a", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            if write_header:
+                writer.writerow(RAW_HEADER)
+            writer.writerows(rows)
+    except OSError:
+        pass
 
 
 def format_duration(seconds: float) -> str:
@@ -349,6 +381,8 @@ class MooditoApp(rumps.App):
             save_stats(self._stats, self._stats_started_at)
         self._last_emotion: str | None = None
         self._ticks_since_save = 0
+        # Buffered raw detection samples awaiting flush to RAW_PATH.
+        self._raw_buffer: list[tuple] = []
 
         # Build the live Statistics submenu (one row per tracked state).
         self._stats_menu = rumps.MenuItem("Statistics")
@@ -367,7 +401,7 @@ class MooditoApp(rumps.App):
         self._stats_menu.add(self._stats_total_item)
         self._stats_menu.add(None)
         self._stats_export_item = rumps.MenuItem(
-            "Download Data (CSV)", callback=self.export_csv
+            "Download Raw Data (CSV)", callback=self.export_csv
         )
         self._stats_menu.add(self._stats_export_item)
         self._stats_reset_item = rumps.MenuItem(
@@ -451,10 +485,15 @@ class MooditoApp(rumps.App):
         result = self._worker.result
         self._render_status(result.title, allow_icon=True)
         self._detected_item.title = f"Detected: {result.label} ({result.score:.0%})"
-        self._accumulate_stats(result.label)
+        self._accumulate_stats(result.label, result.score)
 
-    def _accumulate_stats(self, label: str) -> None:
+    def _accumulate_stats(self, label: str, score: float | None = None) -> None:
         """Add elapsed time to the current emotion and persist periodically."""
+        # Record the raw per-sample reading for the raw data export.
+        timestamp = datetime.now().isoformat(timespec="milliseconds")
+        self._raw_buffer.append(
+            (timestamp, label, "" if score is None else f"{score:.4f}")
+        )
         if label in self._stats:
             self._stats[label]["seconds"] += UI_REFRESH_INTERVAL
             # Count a new occurrence each time the emotion changes.
@@ -468,6 +507,8 @@ class MooditoApp(rumps.App):
         if self._ticks_since_save * UI_REFRESH_INTERVAL >= 10:
             self._ticks_since_save = 0
             save_stats(self._stats, self._stats_started_at)
+            append_raw_samples(self._raw_buffer)
+            self._raw_buffer.clear()
 
     def _update_stats_menu(self) -> None:
         """Refresh the Statistics submenu rows as an aligned table."""
@@ -505,7 +546,7 @@ class MooditoApp(rumps.App):
         set_monospaced_title(self._stats_total_item, total_row)
         self._stats_since_item.title = f"Since {format_timestamp(self._stats_started_at)}"
         self._stats_reset_item.title = (
-            f"Reset Statistics ({format_bytes(stats_file_size())})"
+            f"Reset Statistics ({format_bytes(raw_file_size())})"
         )
 
     def toggle_icon_only(self, sender) -> None:
@@ -545,43 +586,20 @@ class MooditoApp(rumps.App):
         subprocess.run(["open", BMC_URL], check=False)
 
     def export_csv(self, _sender) -> None:
-        """Export the raw statistics to a CSV file in the Downloads folder."""
+        """Export the raw detection log to a CSV file in the Downloads folder."""
+        # Flush any buffered samples first so the export includes everything.
+        append_raw_samples(self._raw_buffer)
+        self._raw_buffer.clear()
         downloads = os.path.join(os.path.expanduser("~"), "Downloads")
-        filename = f"moodito-stats-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+        filename = f"moodito-raw-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
         path = os.path.join(downloads, filename)
-        exported_at = datetime.now().isoformat(timespec="seconds")
-        total_seconds = sum(e.get("seconds", 0.0) for e in self._stats.values())
         try:
-            with open(path, "w", newline="", encoding="utf-8") as fh:
-                writer = csv.writer(fh)
-                writer.writerow(
-                    [
-                        "state",
-                        "emoji",
-                        "count",
-                        "seconds",
-                        "duration",
-                        "percent_time",
-                        "tracking_started",
-                        "exported_at",
-                    ]
-                )
-                for key in STAT_KEYS:
-                    entry = self._stats.get(key, {})
-                    seconds = float(entry.get("seconds", 0.0))
-                    percent = (seconds / total_seconds * 100) if total_seconds else 0.0
-                    writer.writerow(
-                        [
-                            key,
-                            STAT_EMOJI.get(key, ""),
-                            entry.get("count", 0),
-                            f"{seconds:.3f}",
-                            format_duration(seconds),
-                            f"{percent:.1f}",
-                            self._stats_started_at or "",
-                            exported_at,
-                        ]
-                    )
+            if os.path.exists(RAW_PATH):
+                shutil.copyfile(RAW_PATH, path)
+            else:
+                # No samples recorded yet: write a header-only file.
+                with open(path, "w", newline="", encoding="utf-8") as fh:
+                    csv.writer(fh).writerow(RAW_HEADER)
         except OSError as exc:
             rumps.notification("Moodito", "Export failed", str(exc))
             return
@@ -589,11 +607,16 @@ class MooditoApp(rumps.App):
         subprocess.run(["open", "-R", path], check=False)
 
     def reset_stats(self, _sender) -> None:
-        """Clear all accumulated statistics."""
+        """Clear all accumulated statistics and the raw detection log."""
         self._stats = {
             key: {"seconds": 0.0, "count": 0} for key in STAT_KEYS
         }
         self._last_emotion = None
+        self._raw_buffer.clear()
+        try:
+            os.remove(RAW_PATH)
+        except OSError:
+            pass
         self._stats_started_at = datetime.now().isoformat(timespec="seconds")
         save_stats(self._stats, self._stats_started_at)
         self._update_stats_menu()
@@ -601,6 +624,8 @@ class MooditoApp(rumps.App):
     def quit_app(self, _sender) -> None:
         self._worker.stop()
         save_stats(self._stats, self._stats_started_at)
+        append_raw_samples(self._raw_buffer)
+        self._raw_buffer.clear()
         rumps.quit_application()
 
 

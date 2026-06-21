@@ -20,6 +20,7 @@ def data_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(app, "SETTINGS_PATH", str(tmp_path / "settings.json"))
     monkeypatch.setattr(app, "STATS_PATH", str(tmp_path / "stats.json"))
+    monkeypatch.setattr(app, "RAW_PATH", str(tmp_path / "raw_data.csv"))
     monkeypatch.setattr(app, "MODEL_PATH", str(tmp_path / "model.task"))
     return tmp_path
 
@@ -170,6 +171,44 @@ class TestStatsFileSize:
         assert app.stats_file_size() == 5
 
 
+class TestRawFileSize:
+    def test_absent_returns_zero(self, data_dir) -> None:
+        assert app.raw_file_size() == 0
+
+    def test_present_returns_size(self, data_dir) -> None:
+        (data_dir / "raw_data.csv").write_bytes(b"abcdefg")
+        assert app.raw_file_size() == 7
+
+
+class TestAppendRawSamples:
+    def test_empty_rows_writes_nothing(self, data_dir) -> None:
+        app.append_raw_samples([])
+        assert not (data_dir / "raw_data.csv").exists()
+
+    def test_writes_header_then_rows(self, data_dir) -> None:
+        app.append_raw_samples([("2026-06-21T22:00:00.000", "happy", "0.9000")])
+        lines = (data_dir / "raw_data.csv").read_text().splitlines()
+        assert lines[0] == "timestamp,state,score"
+        assert lines[1] == "2026-06-21T22:00:00.000,happy,0.9000"
+
+    def test_appends_without_duplicating_header(self, data_dir) -> None:
+        app.append_raw_samples([("t1", "happy", "0.9")])
+        app.append_raw_samples([("t2", "sad", "")])
+        lines = (data_dir / "raw_data.csv").read_text().splitlines()
+        assert lines == [
+            "timestamp,state,score",
+            "t1,happy,0.9",
+            "t2,sad,",
+        ]
+
+    def test_swallows_os_error(self, data_dir, monkeypatch) -> None:
+        def boom(*_a, **_k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(app.os, "makedirs", boom)
+        app.append_raw_samples([("t", "happy", "0.9")])  # must not raise
+
+
 class TestCameraAccess:
     def test_status_returns_none_without_avfoundation(self, monkeypatch) -> None:
         real_import = builtins.__import__
@@ -276,6 +315,7 @@ def _bare_app():
     inst._stats = {k: {"seconds": 0.0, "count": 0} for k in app.STAT_KEYS}
     inst._last_emotion = None
     inst._ticks_since_save = 0
+    inst._raw_buffer = []
     inst._stats_started_at = "2026-06-21T22:00:00"
     inst._stats_items = {k: rumps.MenuItem(k) for k in app.STAT_KEYS}
     inst._stats_header_item = rumps.MenuItem("header")
@@ -308,6 +348,7 @@ class TestStatsAccumulation:
     def test_periodic_save_flushes(self, monkeypatch) -> None:
         saved = []
         monkeypatch.setattr(app, "save_stats", lambda *a, **k: saved.append(a))
+        monkeypatch.setattr(app, "append_raw_samples", lambda *a, **k: None)
         inst = _bare_app()
         ticks = int(10 / app.UI_REFRESH_INTERVAL) + 1
         for _ in range(ticks):
@@ -320,3 +361,328 @@ class TestStatsAccumulation:
         inst._update_stats_menu()
         assert "Since" in inst._stats_since_item.title
         assert "Reset Statistics" in inst._stats_reset_item.title
+
+
+class TestRawRecording:
+    def test_accumulate_buffers_raw_sample_with_score(self, monkeypatch) -> None:
+        monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
+        inst = _bare_app()
+        inst._accumulate_stats("happy", 0.9123)
+        assert len(inst._raw_buffer) == 1
+        timestamp, state, score = inst._raw_buffer[0]
+        assert state == "happy"
+        assert score == "0.9123"
+        assert timestamp  # ISO timestamp string
+
+    def test_accumulate_buffers_empty_score_when_none(self, monkeypatch) -> None:
+        monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
+        inst = _bare_app()
+        inst._accumulate_stats("paused")
+        assert inst._raw_buffer[0][1] == "paused"
+        assert inst._raw_buffer[0][2] == ""
+
+    def test_periodic_flush_appends_and_clears_buffer(self, monkeypatch) -> None:
+        flushed = []
+        monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
+        monkeypatch.setattr(
+            app, "append_raw_samples", lambda rows: flushed.extend(rows)
+        )
+        inst = _bare_app()
+        ticks = int(10 / app.UI_REFRESH_INTERVAL) + 1
+        for _ in range(ticks):
+            inst._accumulate_stats("happy", 0.5)
+        assert flushed  # raw samples were flushed
+        assert inst._raw_buffer == []  # buffer cleared after flush
+
+
+class TestExportCsv:
+    def test_copies_existing_raw_file_to_downloads(
+        self, data_dir, monkeypatch
+    ) -> None:
+        # Pretend HOME is the temp dir and create a Downloads folder.
+        monkeypatch.setenv("HOME", str(data_dir))
+        (data_dir / "Downloads").mkdir()
+        (data_dir / "raw_data.csv").write_text("timestamp,state,score\nt,happy,0.9\n")
+        opened = []
+        monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: opened.append(a))
+        inst = _bare_app()
+        inst.export_csv(None)
+        exported = list((data_dir / "Downloads").glob("moodito-raw-*.csv"))
+        assert len(exported) == 1
+        assert "happy" in exported[0].read_text()
+        assert opened and opened[0][0][0] == "open"
+
+    def test_flushes_buffer_before_export(self, data_dir, monkeypatch) -> None:
+        monkeypatch.setenv("HOME", str(data_dir))
+        (data_dir / "Downloads").mkdir()
+        monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: None)
+        inst = _bare_app()
+        inst._raw_buffer = [("t", "happy", "0.9")]
+        inst.export_csv(None)
+        assert inst._raw_buffer == []
+        exported = list((data_dir / "Downloads").glob("moodito-raw-*.csv"))
+        assert "happy" in exported[0].read_text()
+
+    def test_writes_header_only_when_no_raw_file(
+        self, data_dir, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("HOME", str(data_dir))
+        (data_dir / "Downloads").mkdir()
+        monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: None)
+        inst = _bare_app()
+        inst.export_csv(None)
+        exported = list((data_dir / "Downloads").glob("moodito-raw-*.csv"))
+        assert exported[0].read_text().strip() == "timestamp,state,score"
+
+    def test_notifies_on_os_error(self, data_dir, monkeypatch) -> None:
+        # Missing Downloads folder makes the copy raise OSError.
+        monkeypatch.setenv("HOME", str(data_dir))
+        (data_dir / "raw_data.csv").write_text("timestamp,state,score\n")
+        notes = []
+        monkeypatch.setattr(
+            app.rumps, "notification", lambda *a, **k: notes.append(a)
+        )
+        ran = []
+        monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: ran.append(a))
+        inst = _bare_app()
+        inst.export_csv(None)
+        assert notes  # a failure notification was shown
+        assert not ran  # Finder reveal was skipped
+
+
+class TestResetStats:
+    def test_clears_stats_and_raw_log(self, data_dir, monkeypatch) -> None:
+        monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
+        (data_dir / "raw_data.csv").write_text("timestamp,state,score\nt,happy,0.9\n")
+        inst = _bare_app()
+        inst._stats["happy"] = {"seconds": 30.0, "count": 5}
+        inst._raw_buffer = [("t", "happy", "0.9")]
+        inst.reset_stats(None)
+        assert all(v == {"seconds": 0.0, "count": 0} for v in inst._stats.values())
+        assert inst._raw_buffer == []
+        assert not (data_dir / "raw_data.csv").exists()
+        assert inst._last_emotion is None
+
+    def test_missing_raw_file_is_tolerated(self, data_dir, monkeypatch) -> None:
+        monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
+        inst = _bare_app()
+        inst.reset_stats(None)  # no raw file present; must not raise
+
+
+class TestQuitApp:
+    def test_stops_worker_and_flushes_raw(self, monkeypatch) -> None:
+        saved = []
+        flushed = []
+        monkeypatch.setattr(app, "save_stats", lambda *a, **k: saved.append(a))
+        monkeypatch.setattr(
+            app, "append_raw_samples", lambda rows: flushed.extend(rows)
+        )
+        monkeypatch.setattr(app.rumps, "quit_application", lambda: None)
+        inst = _bare_app()
+        stopped = []
+        inst._worker = type("W", (), {"stop": lambda self: stopped.append(True)})()
+        inst._raw_buffer = [("t", "happy", "0.9")]
+        inst.quit_app(None)
+        assert stopped == [True]
+        assert flushed == [("t", "happy", "0.9")]
+        assert inst._raw_buffer == []
+        assert saved
+
+
+@pytest.fixture
+def full_app(data_dir, monkeypatch):
+    """Construct a full MooditoApp without starting the camera thread."""
+    monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
+    monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+    return app.MooditoApp()
+
+
+class TestMooditoAppInit:
+    def test_builds_menu_and_records_start_time(self, full_app) -> None:
+        assert full_app._stats_started_at is not None
+        assert full_app._raw_buffer == []
+        assert "Download Raw Data (CSV)" in full_app._stats_export_item.title
+        assert set(full_app._stats_items) == set(app.STAT_KEYS)
+
+    def test_restores_icon_only_setting(self, data_dir, monkeypatch) -> None:
+        app.save_settings({"icon_only": True})
+        monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+        inst = app.MooditoApp()
+        assert inst._icon_only is True
+        assert inst._icon_only_item.state == 1
+
+
+class TestRefresh:
+    def test_normal_updates_detected_and_buffers_raw(self, full_app) -> None:
+        full_app._worker._set_result(EmotionResult("happy", 0.8))
+        full_app.refresh(None)
+        assert "happy" in full_app._detected_item.title
+        assert full_app._raw_buffer[-1][1] == "happy"
+
+    def test_paused_records_paused_state(self, full_app) -> None:
+        full_app._paused = True
+        full_app.refresh(None)
+        assert full_app._raw_buffer[-1][1] == "paused"
+
+    def test_error_updates_detected_title(self, full_app) -> None:
+        full_app._worker._set_error("camera gone")
+        full_app.refresh(None)
+        assert full_app._detected_item.title.startswith("Error:")
+        assert full_app._raw_buffer[-1][1] == "error"
+
+
+class TestRenderStatus:
+    def test_icon_mode_shows_icon(self, full_app) -> None:
+        full_app._icon_only = True
+        full_app._showing_icon = False
+        full_app._render_status("😀 happy", allow_icon=True)
+        assert full_app._showing_icon is True
+
+    def test_text_mode_sets_title(self, full_app) -> None:
+        full_app._showing_icon = True
+        full_app._render_status("😀 happy", allow_icon=False)
+        assert full_app._showing_icon is False
+        assert full_app.title == "😀 happy"
+
+
+class TestToggles:
+    def test_toggle_pause_round_trip(self, full_app) -> None:
+        full_app.toggle_pause(None)
+        assert full_app._paused is True
+        assert full_app._pause_item.title == "Resume"
+        full_app.toggle_pause(None)
+        assert full_app._paused is False
+        assert full_app._pause_item.title == "Pause"
+
+    def test_toggle_icon_only_persists(self, full_app, monkeypatch) -> None:
+        saved = []
+        monkeypatch.setattr(app, "save_settings", lambda s: saved.append(s))
+        full_app._paused = True  # skip the refresh branch
+        full_app.toggle_icon_only(full_app._icon_only_item)
+        assert full_app._icon_only is True
+        assert saved and saved[0]["icon_only"] is True
+
+
+class TestGrantCamera:
+    def test_unavailable_shows_alert(self, full_app, monkeypatch) -> None:
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: None)
+        alerts = []
+        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: alerts.append(a))
+        full_app.grant_camera(None)
+        assert alerts
+
+    def test_not_determined_requests_access(self, full_app, monkeypatch) -> None:
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 0)
+        called = []
+        monkeypatch.setattr(app, "request_camera_access", lambda: called.append(True))
+        full_app.grant_camera(None)
+        assert called == [True]
+
+    def test_authorized_shows_alert(self, full_app, monkeypatch) -> None:
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+        alerts = []
+        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: alerts.append(a))
+        full_app.grant_camera(None)
+        assert alerts
+
+    def test_denied_opens_settings(self, full_app, monkeypatch) -> None:
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 2)
+        opened = []
+        monkeypatch.setattr(app, "open_camera_settings", lambda: opened.append(True))
+        full_app.grant_camera(None)
+        assert opened == [True]
+
+
+class _FakeCap:
+    """A minimal cv2.VideoCapture stand-in for worker-loop tests."""
+
+    def __init__(self, worker, opened=True, frames=2) -> None:
+        self._worker = worker
+        self._opened = opened
+        self._frames = frames
+        self.reads = 0
+        self.released = False
+
+    def isOpened(self) -> bool:
+        return self._opened
+
+    def read(self):
+        self.reads += 1
+        if self.reads >= self._frames:
+            self._worker._stop.set()
+        return True, "frame"
+
+    def release(self) -> None:
+        self.released = True
+
+
+class _Blendshape:
+    category_name = "mouthSmileLeft"
+    score = 0.6
+
+
+class _Detection:
+    def __init__(self, has_face=True) -> None:
+        self.face_blendshapes = [[_Blendshape()]] if has_face else []
+
+
+class TestFaceWorkerRun:
+    def test_run_reports_model_download_failure(self, monkeypatch) -> None:
+        def boom() -> None:
+            raise RuntimeError("no network")
+
+        monkeypatch.setattr(app, "ensure_model", boom)
+        worker = app.FaceWorker()
+        worker.run()
+        assert "model download failed" in worker.error
+
+    def test_capture_loop_processes_face_frame(self, monkeypatch) -> None:
+        monkeypatch.setattr(app.cv2, "cvtColor", lambda *a, **k: "rgb")
+        monkeypatch.setattr(app.cv2, "COLOR_BGR2RGB", 0, raising=False)
+        monkeypatch.setattr(app.mp, "Image", lambda **k: "image")
+        monkeypatch.setattr(
+            app, "infer_emotion", lambda scores: EmotionResult("happy", 0.9)
+        )
+        worker = app.FaceWorker()
+        landmarker = type(
+            "L", (), {"detect_for_video": lambda self, img, ts: _Detection(True)}
+        )()
+        cap = _FakeCap(worker, frames=2)
+        worker._run_capture_loop(cap, landmarker)
+        assert worker.result == EmotionResult("happy", 0.9)
+
+    def test_capture_loop_handles_no_face(self, monkeypatch) -> None:
+        monkeypatch.setattr(app.cv2, "cvtColor", lambda *a, **k: "rgb")
+        monkeypatch.setattr(app.cv2, "COLOR_BGR2RGB", 0, raising=False)
+        monkeypatch.setattr(app.mp, "Image", lambda **k: "image")
+        worker = app.FaceWorker()
+        landmarker = type(
+            "L", (), {"detect_for_video": lambda self, img, ts: _Detection(False)}
+        )()
+        cap = _FakeCap(worker, frames=2)
+        worker._run_capture_loop(cap, landmarker)
+        assert worker.result == EmotionResult("no face", 0.0)
+
+    def test_capture_loop_reopens_after_many_read_failures(self, monkeypatch) -> None:
+        worker = app.FaceWorker()
+
+        class FailingCap:
+            def read(self):
+                return False, None
+
+        worker._run_capture_loop(FailingCap(), object())
+        assert worker.error == "lost camera, reconnecting…"
+
+
+class TestMain:
+    def test_main_runs_app(self, monkeypatch) -> None:
+        monkeypatch.setattr(app, "request_camera_access", lambda: None)
+        run_calls = []
+        monkeypatch.setattr(app.MooditoApp, "run", lambda self: run_calls.append(True))
+        monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+        app.main()
+        assert run_calls == [True]
+
+
