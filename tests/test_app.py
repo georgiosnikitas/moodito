@@ -267,6 +267,35 @@ class TestMonospacedTitle:
         assert item.title == "plain text"
 
 
+class TestSymbolIcon:
+    def test_sets_template_image_on_macos(self) -> None:
+        import rumps
+
+        item = rumps.MenuItem("row")
+        app.set_symbol_icon(item, "gear")  # valid SF Symbol on macOS
+
+    def test_invalid_symbol_is_noop(self) -> None:
+        import rumps
+
+        item = rumps.MenuItem("row")
+        # An unknown symbol name returns None; must not raise.
+        app.set_symbol_icon(item, "definitely-not-a-real-symbol-xyz")
+
+    def test_fallback_when_appkit_missing(self, monkeypatch) -> None:
+        import rumps
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "AppKit":
+                raise ImportError("no AppKit")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        item = rumps.MenuItem("row")
+        app.set_symbol_icon(item, "gear")  # must not raise
+
+
 class TestOpenActions:
     def test_open_camera_settings_invokes_open(self, monkeypatch) -> None:
         calls = []
