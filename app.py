@@ -385,7 +385,7 @@ class MooditoApp(rumps.App):
         self._raw_buffer: list[tuple] = []
 
         # Build the live Statistics submenu (one row per tracked state).
-        self._stats_menu = rumps.MenuItem("Statistics")
+        self._stats_menu = rumps.MenuItem("📊 Statistics")
         self._stats_since_item = rumps.MenuItem("Since …", callback=None)
         self._stats_menu.add(self._stats_since_item)
         self._stats_menu.add(None)
@@ -401,18 +401,18 @@ class MooditoApp(rumps.App):
         self._stats_menu.add(self._stats_total_item)
         self._stats_menu.add(None)
         self._stats_export_item = rumps.MenuItem(
-            "Download Raw Data (CSV)", callback=self.export_csv
+            "⬇️ Download Raw Data (CSV)", callback=self.export_csv
         )
         self._stats_menu.add(self._stats_export_item)
         self._stats_reset_item = rumps.MenuItem(
-            "Reset Statistics", callback=self.reset_stats
+            "🔄 Reset Statistics", callback=self.reset_stats
         )
         self._stats_menu.add(self._stats_reset_item)
 
         # Buy Me a Coffee submenu: an "open page" action plus the QR code image.
-        self._bmc_menu = rumps.MenuItem("Buy Me a Coffee ☕")
+        self._bmc_menu = rumps.MenuItem("☕ Buy Me a Coffee")
         self._bmc_menu.add(
-            rumps.MenuItem("Open buymeacoffee.com", callback=self.buy_me_a_coffee)
+            rumps.MenuItem("🌐 Open buymeacoffee.com", callback=self.buy_me_a_coffee)
         )
         self._bmc_menu.add(
             rumps.MenuItem(
@@ -424,21 +424,21 @@ class MooditoApp(rumps.App):
         )
 
         self.menu = [
-            rumps.MenuItem("Detected: …", callback=None),
+            rumps.MenuItem("🔍 Detected: …", callback=None),
             None,
             self._stats_menu,
             None,
-            rumps.MenuItem("Show icon only", callback=self.toggle_icon_only),
-            rumps.MenuItem("Camera Grant Access", callback=self.grant_camera),
-            rumps.MenuItem("Pause", callback=self.toggle_pause),
+            rumps.MenuItem("🖼️ Show icon only", callback=self.toggle_icon_only),
+            rumps.MenuItem("📷 Camera Grant Access", callback=self.grant_camera),
+            rumps.MenuItem("⏸️ Pause", callback=self.toggle_pause),
             None,
             self._bmc_menu,
-            rumps.MenuItem("Quit", callback=self.quit_app),
+            rumps.MenuItem("🚪 Quit", callback=self.quit_app),
         ]
-        self._detected_item = self.menu["Detected: …"]
-        self._pause_item = self.menu["Pause"]
-        self._icon_only_item = self.menu["Show icon only"]
-        self._camera_item = self.menu["Camera Grant Access"]
+        self._detected_item = self.menu["🔍 Detected: …"]
+        self._pause_item = self.menu["⏸️ Pause"]
+        self._icon_only_item = self.menu["🖼️ Show icon only"]
+        self._camera_item = self.menu["📷 Camera Grant Access"]
         # Reflect the restored display mode in the menu item's checkmark.
         self._icon_only_item.state = self._icon_only
         self._update_stats_menu()
@@ -478,13 +478,13 @@ class MooditoApp(rumps.App):
         error = self._worker.error
         if error:
             self._render_status("⚠️ Moodito", allow_icon=False)
-            self._detected_item.title = f"Error: {error}"
+            self._detected_item.title = f"🔍 Detected: error ({error})"
             self._accumulate_stats("error")
             return
 
         result = self._worker.result
         self._render_status(result.title, allow_icon=True)
-        self._detected_item.title = f"Detected: {result.label} ({result.score:.0%})"
+        self._detected_item.title = f"🔍 Detected: {result.label} ({result.score:.0%})"
         self._accumulate_stats(result.label, result.score)
 
     def _accumulate_stats(self, label: str, score: float | None = None) -> None:
@@ -546,7 +546,7 @@ class MooditoApp(rumps.App):
         set_monospaced_title(self._stats_total_item, total_row)
         self._stats_since_item.title = f"Since {format_timestamp(self._stats_started_at)}"
         self._stats_reset_item.title = (
-            f"Reset Statistics ({format_bytes(raw_file_size())})"
+            f"🔄 Reset Statistics ({format_bytes(raw_file_size())})"
         )
 
     def toggle_icon_only(self, sender) -> None:
@@ -562,11 +562,11 @@ class MooditoApp(rumps.App):
     def toggle_pause(self, _sender) -> None:
         self._paused = not self._paused
         if self._paused:
-            self._pause_item.title = "Resume"
+            self._pause_item.title = "▶️ Resume"
             self._render_status("⏸️ Moodito", allow_icon=False)
-            self._detected_item.title = "Paused"
+            self._detected_item.title = "🔍 Detected: paused"
         else:
-            self._pause_item.title = "Pause"
+            self._pause_item.title = "⏸️ Pause"
 
     def grant_camera(self, _sender) -> None:
         status = camera_authorization_status()

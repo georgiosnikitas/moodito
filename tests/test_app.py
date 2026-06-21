@@ -528,7 +528,7 @@ class TestRefresh:
     def test_error_updates_detected_title(self, full_app) -> None:
         full_app._worker._set_error("camera gone")
         full_app.refresh(None)
-        assert full_app._detected_item.title.startswith("Error:")
+        assert "error" in full_app._detected_item.title
         assert full_app._raw_buffer[-1][1] == "error"
 
 
@@ -550,10 +550,10 @@ class TestToggles:
     def test_toggle_pause_round_trip(self, full_app) -> None:
         full_app.toggle_pause(None)
         assert full_app._paused is True
-        assert full_app._pause_item.title == "Resume"
+        assert "Resume" in full_app._pause_item.title
         full_app.toggle_pause(None)
         assert full_app._paused is False
-        assert full_app._pause_item.title == "Pause"
+        assert "Pause" in full_app._pause_item.title
 
     def test_toggle_icon_only_persists(self, full_app, monkeypatch) -> None:
         saved = []
