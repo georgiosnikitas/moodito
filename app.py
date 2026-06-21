@@ -7,6 +7,7 @@ and shows it as an emoji + label in the menu bar title.
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import subprocess
@@ -365,6 +366,10 @@ class MooditoApp(rumps.App):
         self._stats_total_item = rumps.MenuItem("Total", callback=None)
         self._stats_menu.add(self._stats_total_item)
         self._stats_menu.add(None)
+        self._stats_export_item = rumps.MenuItem(
+            "Download Data (CSV)", callback=self.export_csv
+        )
+        self._stats_menu.add(self._stats_export_item)
         self._stats_reset_item = rumps.MenuItem(
             "Reset Statistics", callback=self.reset_stats
         )
@@ -538,6 +543,50 @@ class MooditoApp(rumps.App):
     def buy_me_a_coffee(self, _sender) -> None:
         """Open the Buy Me a Coffee page in the default browser."""
         subprocess.run(["open", BMC_URL], check=False)
+
+    def export_csv(self, _sender) -> None:
+        """Export the raw statistics to a CSV file in the Downloads folder."""
+        downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+        filename = f"moodito-stats-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+        path = os.path.join(downloads, filename)
+        exported_at = datetime.now().isoformat(timespec="seconds")
+        total_seconds = sum(e.get("seconds", 0.0) for e in self._stats.values())
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(
+                    [
+                        "state",
+                        "emoji",
+                        "count",
+                        "seconds",
+                        "duration",
+                        "percent_time",
+                        "tracking_started",
+                        "exported_at",
+                    ]
+                )
+                for key in STAT_KEYS:
+                    entry = self._stats.get(key, {})
+                    seconds = float(entry.get("seconds", 0.0))
+                    percent = (seconds / total_seconds * 100) if total_seconds else 0.0
+                    writer.writerow(
+                        [
+                            key,
+                            STAT_EMOJI.get(key, ""),
+                            entry.get("count", 0),
+                            f"{seconds:.3f}",
+                            format_duration(seconds),
+                            f"{percent:.1f}",
+                            self._stats_started_at or "",
+                            exported_at,
+                        ]
+                    )
+        except OSError as exc:
+            rumps.notification("Moodito", "Export failed", str(exc))
+            return
+        # Reveal the exported file in Finder.
+        subprocess.run(["open", "-R", path], check=False)
 
     def reset_stats(self, _sender) -> None:
         """Clear all accumulated statistics."""
