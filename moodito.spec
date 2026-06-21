@@ -1,6 +1,12 @@
 # PyInstaller spec for Moodito — builds a standalone macOS menu bar .app.
 # Build with:  pyinstaller moodito.spec
+import os
+
 from PyInstaller.utils.hooks import collect_all
+
+# Version comes from the release tag (set by CI as MOODITO_VERSION, e.g. "1.0.0");
+# falls back to a sensible default for local builds.
+VERSION = os.environ.get("MOODITO_VERSION", "1.0.0")
 
 # Bundle MediaPipe's native libraries and data files (.tflite, .binarypb, etc.).
 mp_datas, mp_binaries, mp_hiddenimports = collect_all("mediapipe")
@@ -66,8 +72,8 @@ app = BUNDLE(
         "NSCameraUsageDescription": "Moodito uses the camera to detect your facial expression.",
         "CFBundleName": "Moodito",
         "CFBundleDisplayName": "Moodito",
-        "CFBundleShortVersionString": "1.0.0",
-        "CFBundleVersion": "1.0.0",
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": VERSION,
         "NSHighResolutionCapable": True,
     },
 )

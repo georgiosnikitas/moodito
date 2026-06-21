@@ -30,6 +30,8 @@ MODEL_URL = (
 )
 # Colored app icon shown in the menu bar when "icon only" mode is enabled.
 MENUBAR_ICON = "moodito.png"
+# Support / tip jar link opened from the menu.
+BMC_URL = "https://buymeacoffee.com/georgiosnikitas"
 # Store the model in a writable per-user directory so it works both when run
 # from source and when packaged as a read-only .app bundle.
 DATA_DIR = os.path.expanduser("~/Library/Application Support/Moodito")
@@ -374,6 +376,8 @@ class MooditoApp(rumps.App):
             rumps.MenuItem("Show icon only", callback=self.toggle_icon_only),
             rumps.MenuItem("Camera Grant Access", callback=self.grant_camera),
             rumps.MenuItem("Pause", callback=self.toggle_pause),
+            None,
+            rumps.MenuItem("Buy Me a Coffee ☕", callback=self.buy_me_a_coffee),
             rumps.MenuItem("Quit", callback=self.quit_app),
         ]
         self._detected_item = self.menu["Detected: …"]
@@ -512,6 +516,10 @@ class MooditoApp(rumps.App):
         else:
             # Denied or restricted → can't re-prompt, open Settings instead.
             open_camera_settings()
+
+    def buy_me_a_coffee(self, _sender) -> None:
+        """Open the Buy Me a Coffee page in the default browser."""
+        subprocess.run(["open", BMC_URL], check=False)
 
     def reset_stats(self, _sender) -> None:
         """Clear all accumulated statistics."""

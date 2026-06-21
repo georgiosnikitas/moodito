@@ -1,5 +1,7 @@
 # Moodito
 
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=georgiosnikitas_moodito&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=georgiosnikitas_moodito)
+
 A macOS menu bar app that watches your face through the webcam and shows your
 current emotion as an emoji + label in the menu bar.
 
@@ -76,3 +78,15 @@ allowing it under System Settings -> Privacy & Security). The model is cached in
 The emotion heuristics live in [`emotion.py`](emotion.py) in `infer_emotion()`.
 Adjust the linear weights or the `0.25` neutral threshold to make detection more
 or less sensitive.
+
+## Support
+
+If you enjoy Moodito, you can support development by buying me a coffee ☕
+
+[buymeacoffee.com/georgiosnikitas](https://buymeacoffee.com/georgiosnikitas)
+
+<img src="bmc_qr.png" alt="Buy Me a Coffee QR code" width="200">
+
+There's also a **Buy Me a Coffee ☕** item in the menu bar dropdown that opens
+the page directly.
+
