@@ -1,8 +1,12 @@
 # Moodito is a macOS-only menu bar app. rumps and pyobjc are macOS-only and
 # their build scripts call /usr/bin/sw_vers, so guard them with a platform
 # marker to keep requirements resolvable on Linux (e.g. pip-compile in CI).
-rumps>=0.4.0; sys_platform == "darwin"
-opencv-python>=4.9.0
-mediapipe>=0.10.14
-numpy>=1.26.0
-pyobjc-framework-AVFoundation>=10.0; sys_platform == "darwin"
+#
+# Versions are pinned exactly (locked) so builds are reproducible and security
+# scanners can verify the resolved dependency set. numpy 2.4.x requires
+# Python >= 3.11.
+rumps==0.4.0; sys_platform == "darwin"
+opencv-python==4.13.0.92
+mediapipe==0.10.35
+numpy==2.4.6
+pyobjc-framework-AVFoundation==12.2.1; sys_platform == "darwin"

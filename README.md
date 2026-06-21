@@ -1,6 +1,12 @@
 # Moodito
 
-[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=georgiosnikitas_moodito&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=georgiosnikitas_moodito)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=georgiosnikitas_moodito&metric=alert_status)](https://sonarcloud.io/summary/overall?id=georgiosnikitas_moodito)
+[![CI](https://github.com/georgiosnikitas/moodito/actions/workflows/ci.yml/badge.svg)](https://github.com/georgiosnikitas/moodito/actions/workflows/ci.yml)
+[![Release](https://github.com/georgiosnikitas/moodito/actions/workflows/release.yml/badge.svg?event=push)](https://github.com/georgiosnikitas/moodito/actions/workflows/release.yml)
+[![Python](https://img.shields.io/badge/Python-3.11–3.13-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white)](https://www.apple.com/macos/)
+[![License](https://img.shields.io/github/license/georgiosnikitas/moodito)](LICENSE)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=flat&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/georgiosnikitas)
 
 A macOS menu bar app that watches your face through the webcam and shows your
 current emotion as an emoji + label in the menu bar.
@@ -16,7 +22,7 @@ small set of coarse emotions: happy, sad, surprised, angry, and neutral.
 ## Requirements
 
 - macOS
-- Python 3.10–3.12 (MediaPipe wheels are not yet published for 3.13+)
+- Python 3.11–3.13 (MediaPipe wheels are not yet published for 3.13+)
 - A webcam
 
 ## Setup
@@ -89,4 +95,8 @@ If you enjoy Moodito, you can support development by buying me a coffee ☕
 
 There's also a **Buy Me a Coffee ☕** item in the menu bar dropdown that opens
 the page directly.
+
+## License
+
+Moodito is released under the [MIT License](LICENSE).
 

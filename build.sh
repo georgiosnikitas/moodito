@@ -13,7 +13,7 @@ fi
 source .venv/bin/activate
 
 pip install --only-binary :all: --upgrade pip >/dev/null
-pip install --only-binary :all: -r requirements.txt pyinstaller >/dev/null
+pip install --only-binary :all: --no-binary rumps -r requirements.txt pyinstaller >/dev/null
 
 python -m PyInstaller --noconfirm --clean moodito.spec
 
