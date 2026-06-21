@@ -24,37 +24,29 @@ BASE = 1024
 R = BASE * SCALE
 
 # Palette.
-GRAD_TOP = (255, 209, 102)   # warm yellow
-GRAD_BOTTOM = (255, 138, 76)  # orange
-FACE = (74, 45, 8)            # deep warm brown
-
-
-def _lerp(a: tuple[int, int, int], b: tuple[int, int, int], t: float) -> tuple[int, int, int]:
-    return tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))  # type: ignore[return-value]
-
-
-def _vertical_gradient(size: int) -> Image.Image:
-    """Build a top-to-bottom gradient image."""
-    column = Image.new("RGB", (1, size))
-    for y in range(size):
-        column.putpixel((0, y), _lerp(GRAD_TOP, GRAD_BOTTOM, y / (size - 1)))
-    return column.resize((size, size))
+FACE = (255, 255, 255)        # white lines and border
 
 
 def render_master() -> Image.Image:
     """Render the icon at full supersampled resolution."""
-    # Rounded-square background matching macOS icon proportions.
-    pad = round(0.0977 * R)            # content inset
-    radius = round(0.180 * R)          # corner radius
-    rect = (pad, pad, R - pad, R - pad)
-
-    mask = Image.new("L", (R, R), 0)
-    ImageDraw.Draw(mask).rounded_rectangle(rect, radius=radius, fill=255)
-
     icon = Image.new("RGBA", (R, R), (0, 0, 0, 0))
-    icon.paste(_vertical_gradient(R), (0, 0), mask)
-
     draw = ImageDraw.Draw(icon)
+
+    # Scalloped ("ruffled") ring border on a transparent background: the radius
+    # oscillates with the angle to create evenly spaced wavy bumps.
+    border = round(0.04 * R)
+    cx0, cy0 = 0.5 * R, 0.5 * R
+    base_r = 0.40 * R          # mean radius of the ring
+    amplitude = 0.025 * R      # depth of each bump
+    scallops = 16              # number of bumps around the edge
+    samples = 1440             # smoothness of the curve
+
+    points = []
+    for i in range(samples + 1):
+        t = 2 * math.pi * i / samples
+        r = base_r + amplitude * math.cos(scallops * t)
+        points.append((cx0 + r * math.cos(t), cy0 + r * math.sin(t)))
+    draw.line(points, fill=FACE, width=border, joint="curve")
 
     # Eyes.
     eye_ry = 0.072 * R
