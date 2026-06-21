@@ -37,9 +37,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
-          pip install ruff pytest
+          python -m pip install --only-binary :all: --upgrade pip
+          pip install --only-binary :all: -r requirements.txt pyinstaller
+          pip install --only-binary :all: ruff pytest
 
       - name: Lint (ruff)
         run: ruff check .
@@ -79,9 +79,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-cov
+          python -m pip install --only-binary :all: --upgrade pip
+          pip install --only-binary :all: -r requirements.txt
+          pip install --only-binary :all: pytest pytest-cov
 
       - name: Tests with coverage
         run: |
@@ -89,7 +89,7 @@ jobs:
           python -m pytest --cov=app --cov=emotion --cov-report=xml -q || [ $? -eq 5 ]
 
       - name: SonarCloud scan
-        uses: SonarSource/sonarqube-scan-action@v5
+        uses: SonarSource/sonarqube-scan-action@2f77a1ec69fb1d595b06f35ab27e97605bdef703 # v5.3.2
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: https://sonarcloud.io

@@ -488,9 +488,11 @@ class MooditoApp(rumps.App):
                 f"{'×' + str(entry['count']):>7}"
             )
             set_monospaced_title(item, row)
-        # Totals row, aligned with the same columns.
+        # Totals row, aligned with the same columns. Σ is a single-width glyph
+        # whereas the emoji column above is double-width, so pad with an extra
+        # space to keep the name column aligned with the rows above.
         total_row = (
-            f"Σ  {'Total':<9}"
+            f"Σ   {'Total':<9}"
             f"{100 if total else 0:>4.0f}%"
             f"{format_duration(total):>9}"
             f"{'×' + str(total_count):>7}"

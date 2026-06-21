@@ -12,8 +12,8 @@ if [[ ! -d .venv ]]; then
 fi
 source .venv/bin/activate
 
-pip install --upgrade pip >/dev/null
-pip install -r requirements.txt pyinstaller >/dev/null
+pip install --only-binary :all: --upgrade pip >/dev/null
+pip install --only-binary :all: -r requirements.txt pyinstaller >/dev/null
 
 python -m PyInstaller --noconfirm --clean moodito.spec
 
