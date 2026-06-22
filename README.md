@@ -46,6 +46,7 @@ first time — grant it, otherwise the app shows a "could not open webcam" error
 The menu bar shows the live emotion (e.g. `😀 happy`). The dropdown menu lets you:
 
 - See the detected emotion and confidence
+- Toggle **Show Emojis** (off shows the Moodito icon) and **Show Labels**
 - **Pause / Resume** detection (stops processing webcam frames)
 - Manage your **License** (buy, restore, activate, deactivate)
 - **Quit**

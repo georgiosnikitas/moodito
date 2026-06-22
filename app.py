@@ -532,11 +532,17 @@ class MooditoApp(rumps.App):
         super().__init__("Moodito", title="😐 neutral", quit_button=None)
         self._worker = FaceWorker()
         self._paused = False
-        # Display mode: False = emoji + label text, True = Moodito icon only.
-        # Restored from persisted settings so the choice survives restarts.
+        # Menu bar display options, restored from persisted settings:
+        #   show_emojis — show the emotion emoji; when off, show the Moodito icon
+        #   show_labels — show the emotion label text
+        # Legacy "icon only" mode maps to both options being off.
         self._settings = load_settings()
-        self._icon_only = bool(self._settings.get("icon_only", False))
-        self._showing_icon = False
+        legacy_icon_only = bool(self._settings.get("icon_only", False))
+        self._show_emojis = bool(self._settings.get("show_emojis", not legacy_icon_only))
+        self._show_labels = bool(self._settings.get("show_labels", not legacy_icon_only))
+        # Last (icon_path, title) applied to the menu bar; skips redundant
+        # updates so the status item doesn't flicker every refresh tick.
+        self._last_render: tuple[str | None, str | None] | None = None
         self._icon_path = resource_path(MENUBAR_ICON)
         # Persisted per-emotion usage statistics.
         self._stats, self._stats_started_at = load_stats()
@@ -630,7 +636,8 @@ class MooditoApp(rumps.App):
             None,
             self._stats_menu,
             None,
-            rumps.MenuItem("Show icon only", callback=self.toggle_icon_only),
+            rumps.MenuItem("Show Emojis", callback=self.toggle_emojis),
+            rumps.MenuItem("Show Labels", callback=self.toggle_labels),
             rumps.MenuItem("Camera Grant Access", callback=self.grant_camera),
             rumps.MenuItem("Pause", callback=self.toggle_pause),
             None,
@@ -640,7 +647,8 @@ class MooditoApp(rumps.App):
         ]
         self._detected_item = self.menu["Detected: …"]
         self._pause_item = self.menu["Pause"]
-        self._icon_only_item = self.menu["Show icon only"]
+        self._emojis_item = self.menu["Show Emojis"]
+        self._labels_item = self.menu["Show Labels"]
         self._camera_item = self.menu["Camera Grant Access"]
         self._quit_item = self.menu["Quit"]
         # Give each actionable menu option a monochrome SF Symbol icon.
@@ -648,7 +656,8 @@ class MooditoApp(rumps.App):
         set_symbol_icon(self._stats_menu, "chart.bar")
         set_symbol_icon(self._stats_export_item, "square.and.arrow.down")
         set_symbol_icon(self._stats_reset_item, "arrow.counterclockwise")
-        set_symbol_icon(self._icon_only_item, "photo")
+        set_symbol_icon(self._emojis_item, "face.smiling")
+        set_symbol_icon(self._labels_item, "textformat")
         set_symbol_icon(self._camera_item, "camera")
         set_symbol_icon(self._pause_item, "pause.fill")
         set_symbol_icon(self._bmc_menu, "cup.and.saucer.fill")
@@ -659,8 +668,9 @@ class MooditoApp(rumps.App):
         set_symbol_icon(self._license_activate_item, "checkmark.seal")
         set_symbol_icon(self._license_deactivate_item, "xmark.seal")
         set_symbol_icon(self._quit_item, "power")
-        # Reflect the restored display mode in the menu item's checkmark.
-        self._icon_only_item.state = self._icon_only
+        # Reflect the restored display options in the menu items' checkmarks.
+        self._emojis_item.state = self._show_emojis
+        self._labels_item.state = self._show_labels
         self._update_stats_menu()
         self._apply_license_visibility()
 
@@ -670,26 +680,37 @@ class MooditoApp(rumps.App):
         if self._license_active:
             threading.Thread(target=self._recheck_license, daemon=True).start()
 
-    def _render_status(self, title_text: str, allow_icon: bool) -> None:
-        """Update the menu bar to show either the icon or the title text.
+    def _set_menubar(self, icon_path: str | None, title: str | None) -> None:
+        """Apply an icon and/or title to the menu bar, skipping no-op updates.
 
-        `allow_icon` is False for transient states (error, paused) so they are
-        always shown as text regardless of the chosen display mode.
+        Setting the new value(s) before clearing the other avoids a momentary
+        empty state where rumps falls back to showing the app name. Repeated
+        identical renders are skipped so the status item does not flicker.
         """
-        if self._icon_only and allow_icon:
-            if not self._showing_icon:
-                # Set the icon BEFORE clearing the title, otherwise rumps
-                # momentarily has neither and falls back to the app name
-                # ("Moodito"), which then sticks alongside the icon.
-                self.icon = self._icon_path
-                self.title = None
-                self._showing_icon = True
+        if (icon_path, title) == self._last_render:
+            return
+        self._last_render = (icon_path, title)
+        if icon_path is not None:
+            self.icon = icon_path
+            self.title = title
         else:
-            # Set the title BEFORE removing the icon for the same reason.
-            self.title = title_text
-            if self._showing_icon:
-                self.icon = None
-                self._showing_icon = False
+            self.title = title
+            self.icon = None
+
+    def _render_emotion(self, result: EmotionResult) -> None:
+        """Render an emotion in the menu bar per the show emojis/labels options.
+
+        With emojis off, the Moodito icon replaces the emoji glyph; labels add
+        the emotion name. If both options are off, only the Moodito icon shows.
+        """
+        if self._show_emojis:
+            title = (
+                f"{result.emoji} {result.label}" if self._show_labels else result.emoji
+            )
+            self._set_menubar(None, title)
+        else:
+            label = result.label if self._show_labels else None
+            self._set_menubar(self._icon_path, label)
 
     @rumps.timer(UI_REFRESH_INTERVAL)
     def refresh(self, _timer) -> None:
@@ -705,13 +726,13 @@ class MooditoApp(rumps.App):
 
         error = self._worker.error
         if error:
-            self._render_status("⚠️ Moodito", allow_icon=False)
+            self._set_menubar(None, "⚠️ Moodito")
             self._detected_item.title = f"Detected: error ({error})"
             self._accumulate_stats("error")
             return
 
         result = self._worker.result
-        self._render_status(result.title, allow_icon=True)
+        self._render_emotion(result)
         self._detected_item.title = f"Detected: {result.label} ({result.score:.0%})"
         self._accumulate_stats(result.label, result.score)
 
@@ -777,11 +798,21 @@ class MooditoApp(rumps.App):
             f"Reset Statistics ({format_bytes(raw_file_size())})"
         )
 
-    def toggle_icon_only(self, sender) -> None:
-        self._icon_only = not self._icon_only
-        sender.state = self._icon_only
+    def toggle_emojis(self, sender) -> None:
+        self._show_emojis = not self._show_emojis
+        sender.state = self._show_emojis
         # Persist the choice so it is restored on the next launch.
-        self._settings["icon_only"] = self._icon_only
+        self._settings["show_emojis"] = self._show_emojis
+        save_settings(self._settings)
+        # Apply immediately rather than waiting for the next refresh tick.
+        if not self._paused:
+            self.refresh(None)
+
+    def toggle_labels(self, sender) -> None:
+        self._show_labels = not self._show_labels
+        sender.state = self._show_labels
+        # Persist the choice so it is restored on the next launch.
+        self._settings["show_labels"] = self._show_labels
         save_settings(self._settings)
         # Apply immediately rather than waiting for the next refresh tick.
         if not self._paused:
@@ -792,7 +823,7 @@ class MooditoApp(rumps.App):
         if self._paused:
             self._pause_item.title = "Resume"
             set_symbol_icon(self._pause_item, "play.fill")
-            self._render_status("⏸️ Moodito", allow_icon=False)
+            self._set_menubar(None, "⏸️ Moodito")
             self._detected_item.title = "Detected: paused"
         else:
             self._pause_item.title = "Pause"

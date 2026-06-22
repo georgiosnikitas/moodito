@@ -968,13 +968,23 @@ class TestMooditoAppInit:
         assert "Download Raw Data (CSV)" in full_app._stats_export_item.title
         assert set(full_app._stats_items) == set(app.STAT_KEYS)
 
-    def test_restores_icon_only_setting(self, data_dir, monkeypatch) -> None:
+    def test_restores_display_settings(self, data_dir, monkeypatch) -> None:
+        app.save_settings({"show_emojis": False, "show_labels": True})
+        monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+        inst = app.MooditoApp()
+        assert inst._show_emojis is False
+        assert inst._show_labels is True
+        assert inst._emojis_item.state == 0
+        assert inst._labels_item.state == 1
+
+    def test_legacy_icon_only_maps_to_both_off(self, data_dir, monkeypatch) -> None:
         app.save_settings({"icon_only": True})
         monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
         monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
         inst = app.MooditoApp()
-        assert inst._icon_only is True
-        assert inst._icon_only_item.state == 1
+        assert inst._show_emojis is False
+        assert inst._show_labels is False
 
 
 class TestRefresh:
@@ -997,17 +1007,45 @@ class TestRefresh:
 
 
 class TestRenderStatus:
-    def test_icon_mode_shows_icon(self, full_app) -> None:
-        full_app._icon_only = True
-        full_app._showing_icon = False
-        full_app._render_status("😀 happy", allow_icon=True)
-        assert full_app._showing_icon is True
-
-    def test_text_mode_sets_title(self, full_app) -> None:
-        full_app._showing_icon = True
-        full_app._render_status("😀 happy", allow_icon=False)
-        assert full_app._showing_icon is False
+    def test_emojis_and_labels_show_emoji_and_text(self, full_app) -> None:
+        full_app._show_emojis = True
+        full_app._show_labels = True
+        full_app._last_render = None
+        full_app._render_emotion(EmotionResult("happy", 0.8))
         assert full_app.title == "😀 happy"
+        assert full_app.icon is None
+
+    def test_emojis_only_shows_emoji(self, full_app) -> None:
+        full_app._show_emojis = True
+        full_app._show_labels = False
+        full_app._last_render = None
+        full_app._render_emotion(EmotionResult("happy", 0.8))
+        assert full_app.title == "😀"
+
+    def test_no_emojis_with_labels_shows_icon_and_label(self, full_app) -> None:
+        full_app._show_emojis = False
+        full_app._show_labels = True
+        full_app._last_render = None
+        full_app._render_emotion(EmotionResult("happy", 0.8))
+        assert full_app.icon is not None
+        assert full_app.title == "happy"
+
+    def test_no_emojis_no_labels_shows_icon_only(self, full_app) -> None:
+        full_app._show_emojis = False
+        full_app._show_labels = False
+        full_app._last_render = None
+        full_app._render_emotion(EmotionResult("happy", 0.8))
+        assert full_app.icon is not None
+        assert full_app.title is None
+
+    def test_set_menubar_skips_redundant_render(self, full_app) -> None:
+        full_app._last_render = None
+        full_app._set_menubar(None, "😀 happy")
+        assert full_app.title == "😀 happy"
+        # A second identical call is a no-op (state already cached).
+        full_app.title = "sentinel"
+        full_app._set_menubar(None, "😀 happy")
+        assert full_app.title == "sentinel"
 
 
 class TestToggles:
@@ -1019,13 +1057,21 @@ class TestToggles:
         assert full_app._paused is False
         assert "Pause" in full_app._pause_item.title
 
-    def test_toggle_icon_only_persists(self, full_app, monkeypatch) -> None:
+    def test_toggle_emojis_persists(self, full_app, monkeypatch) -> None:
         saved = []
         monkeypatch.setattr(app, "save_settings", lambda s: saved.append(s))
         full_app._paused = True  # skip the refresh branch
-        full_app.toggle_icon_only(full_app._icon_only_item)
-        assert full_app._icon_only is True
-        assert saved and saved[0]["icon_only"] is True
+        full_app.toggle_emojis(full_app._emojis_item)
+        assert full_app._show_emojis is False
+        assert saved and saved[0]["show_emojis"] is False
+
+    def test_toggle_labels_persists(self, full_app, monkeypatch) -> None:
+        saved = []
+        monkeypatch.setattr(app, "save_settings", lambda s: saved.append(s))
+        full_app._paused = True  # skip the refresh branch
+        full_app.toggle_labels(full_app._labels_item)
+        assert full_app._show_labels is False
+        assert saved and saved[0]["show_labels"] is False
 
 
 class TestGrantCamera:
