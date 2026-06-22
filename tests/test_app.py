@@ -21,6 +21,7 @@ def data_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "SETTINGS_PATH", str(tmp_path / "settings.json"))
     monkeypatch.setattr(app, "STATS_PATH", str(tmp_path / "stats.json"))
     monkeypatch.setattr(app, "RAW_PATH", str(tmp_path / "raw_data.csv"))
+    monkeypatch.setattr(app, "LICENSE_PATH", str(tmp_path / "license.json"))
     monkeypatch.setattr(app, "MODEL_PATH", str(tmp_path / "model.task"))
     return tmp_path
 
@@ -516,6 +517,440 @@ class TestQuitApp:
         assert flushed == [("t", "happy", "0.9")]
         assert inst._raw_buffer == []
         assert saved
+
+
+class TestLicensePersistence:
+    def test_load_missing_returns_empty(self, data_dir) -> None:
+        assert app.load_license() == {}
+
+    def test_save_then_load_roundtrip(self, data_dir) -> None:
+        data = {"license_key": "abc", "instance_id": "xyz", "instance_name": "Moodito"}
+        app.save_license(data)
+        assert app.load_license() == data
+
+    def test_non_dict_json_returns_empty(self, data_dir) -> None:
+        (data_dir / "license.json").write_text("[1, 2, 3]")
+        assert app.load_license() == {}
+
+    def test_corrupt_json_returns_empty(self, data_dir) -> None:
+        (data_dir / "license.json").write_text("{broken")
+        assert app.load_license() == {}
+
+    def test_clear_removes_file(self, data_dir) -> None:
+        app.save_license({"license_key": "abc", "instance_id": "xyz"})
+        app.clear_license()
+        assert not (data_dir / "license.json").exists()
+
+    def test_clear_missing_file_is_tolerated(self, data_dir) -> None:
+        app.clear_license()  # must not raise
+
+    def test_save_swallows_os_error(self, data_dir, monkeypatch) -> None:
+        monkeypatch.setattr(
+            app.os, "makedirs", lambda *a, **k: (_ for _ in ()).throw(OSError())
+        )
+        app.save_license({"license_key": "abc"})  # best-effort, no raise
+
+    def test_is_license_active(self) -> None:
+        assert app.is_license_active({"license_key": "k", "instance_id": "i"}) is True
+        assert app.is_license_active({"license_key": "k"}) is False
+        assert app.is_license_active({"instance_id": "i"}) is False
+        assert app.is_license_active({}) is False
+
+    def test_instance_name_includes_hostname(self, monkeypatch) -> None:
+        monkeypatch.setattr(app.socket, "gethostname", lambda: "MyMac")
+        assert app.license_instance_name() == "Moodito on MyMac"
+
+    def test_instance_name_tolerates_failure(self, monkeypatch) -> None:
+        def boom():
+            raise OSError("no host")
+
+        monkeypatch.setattr(app.socket, "gethostname", boom)
+        assert app.license_instance_name() == "Moodito on Mac"
+
+
+class TestLicenseApi:
+    def test_activate_success(self, monkeypatch) -> None:
+        captured = {}
+
+        def fake_request(action, params):
+            captured["action"] = action
+            captured["params"] = params
+            return {"activated": True, "instance": {"id": "iid"}}
+
+        monkeypatch.setattr(app, "_license_api_request", fake_request)
+        ok, message, instance_id = app.activate_license("key-1", "Moodito on Mac")
+        assert ok is True
+        assert message == "activated"
+        assert instance_id == "iid"
+        assert captured["action"] == "activate"
+        assert captured["params"] == {
+            "license_key": "key-1",
+            "instance_name": "Moodito on Mac",
+        }
+
+    def test_activate_rejected_returns_error(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            app,
+            "_license_api_request",
+            lambda *a, **k: {"activated": False, "error": "limit reached"},
+        )
+        ok, message, instance_id = app.activate_license("key-1", "Moodito")
+        assert ok is False
+        assert message == "limit reached"
+        assert instance_id == ""
+
+    def test_activate_missing_instance_id_fails(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            app,
+            "_license_api_request",
+            lambda *a, **k: {"activated": True, "instance": {}},
+        )
+        ok, message, instance_id = app.activate_license("key-1", "Moodito")
+        assert ok is False
+        assert "instance id" in message
+        assert instance_id == ""
+
+    def test_activate_network_error(self, monkeypatch) -> None:
+        def boom(*_a, **_k):
+            raise OSError("offline")
+
+        monkeypatch.setattr(app, "_license_api_request", boom)
+        ok, message, instance_id = app.activate_license("key-1", "Moodito")
+        assert ok is False
+        assert "license server" in message
+        assert instance_id == ""
+
+    def test_validate_valid(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            app, "_license_api_request", lambda *a, **k: {"valid": True}
+        )
+        assert app.validate_license("key-1", "iid") == app.LICENSE_VALID
+
+    def test_validate_invalid(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            app,
+            "_license_api_request",
+            lambda *a, **k: {"valid": False, "error": "expired"},
+        )
+        assert app.validate_license("key-1", "iid") == app.LICENSE_INVALID
+
+    def test_validate_network_error(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            app,
+            "_license_api_request",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("offline")),
+        )
+        assert app.validate_license("key-1", "iid") == app.LICENSE_UNREACHABLE
+
+    def test_deactivate_success(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            app, "_license_api_request", lambda *a, **k: {"deactivated": True}
+        )
+        ok, message = app.deactivate_license("key-1", "iid")
+        assert ok is True
+        assert message == "deactivated"
+
+    def test_deactivate_failure(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            app,
+            "_license_api_request",
+            lambda *a, **k: {"deactivated": False, "error": "not found"},
+        )
+        ok, message = app.deactivate_license("key-1", "iid")
+        assert ok is False
+        assert message == "not found"
+
+    def test_api_request_posts_form_encoded(self, monkeypatch) -> None:
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"activated": true}'
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["data"] = request.data
+            captured["method"] = request.get_method()
+            captured["accept"] = request.get_header("Accept")
+            return FakeResponse()
+
+        monkeypatch.setattr(app.urllib.request, "urlopen", fake_urlopen)
+        result = app._license_api_request("activate", {"license_key": "k"})
+        assert result == {"activated": True}
+        assert captured["url"] == f"{app.LICENSE_API_BASE}/activate"
+        assert captured["data"] == b"license_key=k"
+        assert captured["method"] == "POST"
+        assert captured["accept"] == "application/json"
+
+    def test_api_request_parses_http_error_body(self, monkeypatch) -> None:
+        import io
+
+        def fake_urlopen(request, timeout):
+            raise app.urllib.error.HTTPError(
+                request.full_url, 422, "Unprocessable", {},
+                io.BytesIO(b'{"error": "invalid key"}'),
+            )
+
+        monkeypatch.setattr(app.urllib.request, "urlopen", fake_urlopen)
+        result = app._license_api_request("activate", {"license_key": "k"})
+        assert result == {"error": "invalid key"}
+
+
+def _bare_license_app(active: bool = False):
+    """Build a MooditoApp with just the attributes the license logic needs."""
+    import rumps
+
+    inst = object.__new__(app.MooditoApp)
+    inst._license = (
+        {"license_key": "key-1", "instance_id": "iid", "instance_name": "Moodito"}
+        if active
+        else {}
+    )
+    inst._license_active = active
+    inst._license_lock = app.threading.Lock()
+    inst._license_busy = app.threading.Event()
+    inst._license_alert = None
+    inst._license_dirty = app.threading.Event()
+    inst._license_status_item = rumps.MenuItem("status")
+    inst._license_activate_item = rumps.MenuItem("activate")
+    inst._license_deactivate_item = rumps.MenuItem("deactivate")
+    inst._bmc_menu = rumps.MenuItem("bmc")
+    return inst
+
+
+class _FakeWindowResponse:
+    def __init__(self, clicked, text):
+        self.clicked = clicked
+        self.text = text
+
+
+def _patch_window(monkeypatch, clicked, text):
+    """Make rumps.Window(...).run() return a canned response."""
+
+    class FakeWindow:
+        def __init__(self, *a, **k):
+            pass
+
+        def run(self):
+            return _FakeWindowResponse(clicked, text)
+
+    monkeypatch.setattr(app.rumps, "Window", FakeWindow)
+
+
+def _patch_sync_threads(monkeypatch):
+    """Run threads spawned by app code synchronously inside .start()."""
+
+    class SyncThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
+
+        def start(self):
+            self._target(*self._args, **self._kwargs)
+
+    monkeypatch.setattr(app.threading, "Thread", SyncThread)
+
+
+class TestLicenseMenu:
+    def test_visibility_when_active(self) -> None:
+        inst = _bare_license_app(active=True)
+        inst._apply_license_visibility()
+        assert inst._license_activate_item.hidden is True
+        assert inst._license_deactivate_item.hidden is False
+        assert inst._bmc_menu.hidden is True
+        assert "Licensed" in inst._license_status_item.title
+
+    def test_visibility_when_inactive(self) -> None:
+        inst = _bare_license_app(active=False)
+        inst._apply_license_visibility()
+        assert inst._license_activate_item.hidden is False
+        assert inst._license_deactivate_item.hidden is True
+        assert inst._bmc_menu.hidden is False
+        assert "Not licensed" in inst._license_status_item.title
+
+    def test_buy_and_restore_open_urls(self, monkeypatch) -> None:
+        calls = []
+        monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: calls.append(a[0]))
+        inst = _bare_license_app()
+        inst.buy_license(None)
+        inst.restore_license(None)
+        assert calls[0] == ["open", app.LICENSE_BUY_URL]
+        assert calls[1] == ["open", app.LICENSE_RESTORE_URL]
+
+    def test_activate_dialog_success(self, data_dir, monkeypatch) -> None:
+        _patch_window(monkeypatch, clicked=1, text="  my-key  ")
+        _patch_sync_threads(monkeypatch)
+        monkeypatch.setattr(app, "license_instance_name", lambda: "Moodito on Mac")
+        monkeypatch.setattr(
+            app, "activate_license", lambda key, name: (True, "activated", "iid")
+        )
+        inst = _bare_license_app(active=False)
+        inst.activate_license_dialog(None)
+        assert inst._license_active is True
+        assert inst._license["license_key"] == "my-key"
+        assert inst._license["instance_id"] == "iid"
+        assert app.load_license()["license_key"] == "my-key"
+        assert inst._license_busy.is_set() is False
+        assert inst._license_dirty.is_set() is True
+        assert "Thank you" in inst._license_alert
+
+    def test_activate_dialog_cancelled(self, data_dir, monkeypatch) -> None:
+        _patch_window(monkeypatch, clicked=0, text="my-key")
+        _patch_sync_threads(monkeypatch)
+        called = []
+        monkeypatch.setattr(
+            app,
+            "activate_license",
+            lambda *a, **k: called.append(a) or (True, "", "iid"),
+        )
+        inst = _bare_license_app(active=False)
+        inst.activate_license_dialog(None)
+        assert called == []  # API not hit on cancel
+        assert inst._license_active is False
+        assert inst._license_busy.is_set() is False
+
+    def test_activate_dialog_empty_key_ignored(self, data_dir, monkeypatch) -> None:
+        _patch_window(monkeypatch, clicked=1, text="   ")
+        _patch_sync_threads(monkeypatch)
+        called = []
+        monkeypatch.setattr(
+            app,
+            "activate_license",
+            lambda *a, **k: called.append(a) or (True, "", "iid"),
+        )
+        inst = _bare_license_app(active=False)
+        inst.activate_license_dialog(None)
+        assert called == []
+        assert inst._license_active is False
+
+    def test_activate_dialog_busy_is_ignored(self, monkeypatch) -> None:
+        windows = []
+
+        class FakeWindow:
+            def __init__(self, *a, **k):
+                windows.append(True)
+
+            def run(self):
+                return _FakeWindowResponse(1, "key")
+
+        monkeypatch.setattr(app.rumps, "Window", FakeWindow)
+        inst = _bare_license_app(active=False)
+        inst._license_busy.set()
+        inst.activate_license_dialog(None)
+        assert windows == []  # dialog never opened while busy
+
+    def test_activate_worker_failure_sets_alert(self, data_dir, monkeypatch) -> None:
+        monkeypatch.setattr(app, "license_instance_name", lambda: "Moodito")
+        monkeypatch.setattr(
+            app, "activate_license", lambda *a, **k: (False, "limit reached", "")
+        )
+        inst = _bare_license_app(active=False)
+        inst._license_busy.set()
+        inst._activate_worker("bad-key")
+        assert inst._license_active is False
+        assert "limit reached" in inst._license_alert
+        assert inst._license_busy.is_set() is False
+        assert inst._license_dirty.is_set() is True
+
+    def test_deactivate_success(self, data_dir, monkeypatch) -> None:
+        _patch_sync_threads(monkeypatch)
+        app.save_license({"license_key": "key-1", "instance_id": "iid"})
+        monkeypatch.setattr(app, "deactivate_license", lambda *a, **k: (True, "ok"))
+        inst = _bare_license_app(active=True)
+        inst.deactivate_license_action(None)
+        assert inst._license_active is False
+        assert inst._license == {}
+        assert not (data_dir / "license.json").exists()
+        assert "deactivated" in inst._license_alert
+        assert inst._license_dirty.is_set() is True
+
+    def test_deactivate_failure_keeps_license(self, data_dir, monkeypatch) -> None:
+        _patch_sync_threads(monkeypatch)
+        monkeypatch.setattr(
+            app, "deactivate_license", lambda *a, **k: (False, "not found")
+        )
+        inst = _bare_license_app(active=True)
+        inst.deactivate_license_action(None)
+        assert inst._license_active is True  # unchanged on failure
+        assert "not found" in inst._license_alert
+
+    def test_consume_license_updates_applies_and_alerts(self, monkeypatch) -> None:
+        alerts = []
+        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: alerts.append(a))
+        inst = _bare_license_app(active=True)
+        inst._license_alert = "License activated. Thank you! 🎉"
+        inst._license_dirty.set()
+        inst._consume_license_updates()
+        assert inst._license_dirty.is_set() is False
+        assert inst._license_alert is None
+        assert alerts and "Thank you" in alerts[0][1]
+        # Visibility was applied from the (active) state.
+        assert inst._bmc_menu.hidden is True
+
+    def test_consume_license_updates_noop_when_clean(self, monkeypatch) -> None:
+        alerts = []
+        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: alerts.append(a))
+        inst = _bare_license_app(active=False)
+        inst._consume_license_updates()
+        assert alerts == []
+
+    def test_periodic_check_rechecks_when_active(self, monkeypatch) -> None:
+        _patch_sync_threads(monkeypatch)
+        monkeypatch.setattr(app, "clear_license", lambda: None)
+        monkeypatch.setattr(
+            app, "validate_license", lambda *a, **k: app.LICENSE_INVALID
+        )
+        inst = _bare_license_app(active=True)
+        inst._periodic_license_check(None)
+        assert inst._license_active is False
+        assert inst._license_dirty.is_set() is True
+
+    def test_periodic_check_skips_when_inactive(self, monkeypatch) -> None:
+        called = []
+        monkeypatch.setattr(
+            app, "validate_license", lambda *a, **k: called.append(a) or "valid"
+        )
+        inst = _bare_license_app(active=False)
+        inst._periodic_license_check(None)
+        assert called == []
+
+    def test_recheck_valid_keeps_license(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            app, "validate_license", lambda *a, **k: app.LICENSE_VALID
+        )
+        inst = _bare_license_app(active=True)
+        inst._recheck_license()
+        assert inst._license_active is True
+        assert inst._license_dirty.is_set() is False
+
+    def test_recheck_invalid_clears_license(self, data_dir, monkeypatch) -> None:
+        app.save_license({"license_key": "key-1", "instance_id": "iid"})
+        monkeypatch.setattr(
+            app, "validate_license", lambda *a, **k: app.LICENSE_INVALID
+        )
+        inst = _bare_license_app(active=True)
+        inst._recheck_license()
+        assert inst._license_active is False
+        assert inst._license == {}
+        assert inst._license_dirty.is_set() is True
+        assert not (data_dir / "license.json").exists()
+
+    def test_recheck_unreachable_keeps_license(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            app, "validate_license", lambda *a, **k: app.LICENSE_UNREACHABLE
+        )
+        inst = _bare_license_app(active=True)
+        inst._recheck_license()
+        assert inst._license_active is True  # transient error → keep
+        assert inst._license_dirty.is_set() is False
+
 
 
 @pytest.fixture

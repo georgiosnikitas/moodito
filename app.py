@@ -11,9 +11,12 @@ import csv
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 
@@ -36,12 +39,30 @@ MENUBAR_ICON = "assets/moodito.png"
 BMC_URL = "https://buymeacoffee.com/georgiosnikitas"
 # QR code image (bundled) shown under the Buy Me a Coffee menu item.
 BMC_QR = "assets/bmc_qr.png"
+# Lemon Squeezy storefront where a license can be purchased.
+LICENSE_BUY_URL = "https://georgiosnikitas.lemonsqueezy.com/"
+# Lemon Squeezy customer portal used to look up past orders / license keys.
+LICENSE_RESTORE_URL = "https://app.lemonsqueezy.com/my-orders"
+# Lemon Squeezy License API base (separate from the main API; no auth needed).
+LICENSE_API_BASE = "https://api.lemonsqueezy.com/v1/licenses"
+# Network timeout (seconds) for license API calls.
+LICENSE_API_TIMEOUT = 10
+# Title shown on every license-related alert dialog.
+LICENSE_ALERT_TITLE = "Moodito License"
+# How often (seconds) an active license is re-validated in the background.
+LICENSE_RECHECK_INTERVAL = 6 * 60 * 60
+# Outcomes returned by validate_license().
+LICENSE_VALID = "valid"  # confirmed active by Lemon Squeezy
+LICENSE_INVALID = "invalid"  # reachable, but expired/disabled/deactivated
+LICENSE_UNREACHABLE = "unreachable"  # network/server error (treated as transient)
 # Store the model in a writable per-user directory so it works both when run
 # from source and when packaged as a read-only .app bundle.
 DATA_DIR = os.path.expanduser("~/Library/Application Support/Moodito")
 MODEL_PATH = os.path.join(DATA_DIR, MODEL_FILENAME)
 # Persisted user preferences (e.g. the "icon only" display mode).
 SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
+# Persisted license activation (key + Lemon Squeezy instance id).
+LICENSE_PATH = os.path.join(DATA_DIR, "license.json")
 # Persisted usage statistics (time + occurrences per emotion).
 STATS_PATH = os.path.join(DATA_DIR, "stats.json")
 # Raw per-sample detection log (one row per refresh tick).
@@ -95,6 +116,128 @@ def save_settings(settings: dict) -> None:
             json.dump(settings, fh)
     except OSError:
         pass
+
+
+def load_license() -> dict:
+    """Load the stored license activation, or an empty dict if none exists."""
+    try:
+        with open(LICENSE_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_license(license_data: dict) -> None:
+    """Persist the license activation to disk (best-effort)."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(LICENSE_PATH, "w", encoding="utf-8") as fh:
+            json.dump(license_data, fh)
+    except OSError:
+        pass
+
+
+def clear_license() -> None:
+    """Remove the stored license activation (best-effort)."""
+    try:
+        os.remove(LICENSE_PATH)
+    except OSError:
+        pass
+
+
+def is_license_active(license_data: dict) -> bool:
+    """True if the stored license has both a key and an activation instance."""
+    return bool(license_data.get("license_key") and license_data.get("instance_id"))
+
+
+def license_instance_name() -> str:
+    """A human label sent to Lemon Squeezy to identify this activation."""
+    try:
+        host = socket.gethostname() or "Mac"
+    except OSError:
+        host = "Mac"
+    return f"Moodito on {host}"
+
+
+def _license_api_request(action: str, params: dict) -> dict:
+    """POST to the Lemon Squeezy License API and return the parsed JSON body.
+
+    Returns the decoded response for both success (2xx) and documented client
+    errors (4xx), which also carry a JSON body with an ``error`` field.
+    """
+    url = f"{LICENSE_API_BASE}/{action}"
+    body = urllib.parse.urlencode(params).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=LICENSE_API_TIMEOUT) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.load(exc)
+        except ValueError:
+            return {"error": f"HTTP {exc.code}"}
+
+
+def activate_license(key: str, instance_name: str) -> tuple[bool, str, str]:
+    """Activate a license key with Lemon Squeezy.
+
+    Returns (ok, message, instance_id). On success ``instance_id`` is the
+    non-empty Lemon Squeezy activation instance id.
+    """
+    try:
+        data = _license_api_request(
+            "activate", {"license_key": key, "instance_name": instance_name}
+        )
+    except (OSError, ValueError) as exc:
+        return False, f"could not reach license server: {exc}", ""
+    if not data.get("activated"):
+        return False, str(data.get("error") or "activation failed"), ""
+    instance = data.get("instance") if isinstance(data.get("instance"), dict) else {}
+    instance_id = str(instance.get("id") or "")
+    if not instance_id:
+        return False, "activation succeeded but no instance id was returned", ""
+    return True, "activated", instance_id
+
+
+def validate_license(key: str, instance_id: str) -> str:
+    """Validate a previously activated license key instance.
+
+    Returns one of ``LICENSE_VALID`` (still active), ``LICENSE_INVALID``
+    (reachable but expired/disabled/deactivated) or ``LICENSE_UNREACHABLE``
+    (network/server error — caller should treat as transient).
+    """
+    try:
+        data = _license_api_request(
+            "validate", {"license_key": key, "instance_id": instance_id}
+        )
+    except (OSError, ValueError):
+        return LICENSE_UNREACHABLE
+    return LICENSE_VALID if data.get("valid") else LICENSE_INVALID
+
+
+def deactivate_license(key: str, instance_id: str) -> tuple[bool, str]:
+    """Deactivate a license key instance with Lemon Squeezy.
+
+    Returns (ok, message).
+    """
+    try:
+        data = _license_api_request(
+            "deactivate", {"license_key": key, "instance_id": instance_id}
+        )
+    except (OSError, ValueError) as exc:
+        return False, f"could not reach license server: {exc}"
+    if data.get("deactivated"):
+        return True, "deactivated"
+    return False, str(data.get("error") or "deactivation failed")
 
 
 def load_stats() -> tuple[dict, str | None]:
@@ -405,6 +548,19 @@ class MooditoApp(rumps.App):
         self._ticks_since_save = 0
         # Buffered raw detection samples awaiting flush to RAW_PATH.
         self._raw_buffer: list[tuple] = []
+        # Persisted Lemon Squeezy license activation (if any).
+        self._license = load_license()
+        self._license_active = is_license_active(self._license)
+        # Guards the license fields above, which are read on the main thread
+        # but mutated by background activate/deactivate/re-check threads.
+        self._license_lock = threading.Lock()
+        # Set while a license network call is in flight (prevents double taps).
+        self._license_busy = threading.Event()
+        # Pending alert text to show on the main thread after a network call.
+        self._license_alert: str | None = None
+        # Set by a background license thread when the menu's license visibility
+        # (and any pending alert) need to be applied on the main thread.
+        self._license_dirty = threading.Event()
 
         # Build the live Statistics submenu (one row per tracked state).
         self._stats_menu = rumps.MenuItem("Statistics")
@@ -446,6 +602,29 @@ class MooditoApp(rumps.App):
             )
         )
 
+        # License submenu (Lemon Squeezy). "Activate" is shown only while
+        # unlicensed; "Deactivate" only while licensed.
+        self._license_menu = rumps.MenuItem("License")
+        self._license_status_item = rumps.MenuItem("Status: …", callback=None)
+        self._license_menu.add(self._license_status_item)
+        self._license_menu.add(None)
+        self._license_buy_item = rumps.MenuItem(
+            "Buy License…", callback=self.buy_license
+        )
+        self._license_menu.add(self._license_buy_item)
+        self._license_restore_item = rumps.MenuItem(
+            "Restore License…", callback=self.restore_license
+        )
+        self._license_menu.add(self._license_restore_item)
+        self._license_activate_item = rumps.MenuItem(
+            "Activate License…", callback=self.activate_license_dialog
+        )
+        self._license_menu.add(self._license_activate_item)
+        self._license_deactivate_item = rumps.MenuItem(
+            "Deactivate License", callback=self.deactivate_license_action
+        )
+        self._license_menu.add(self._license_deactivate_item)
+
         self.menu = [
             rumps.MenuItem("Detected: …", callback=None),
             None,
@@ -455,6 +634,7 @@ class MooditoApp(rumps.App):
             rumps.MenuItem("Camera Grant Access", callback=self.grant_camera),
             rumps.MenuItem("Pause", callback=self.toggle_pause),
             None,
+            self._license_menu,
             self._bmc_menu,
             rumps.MenuItem("Quit", callback=self.quit_app),
         ]
@@ -473,12 +653,22 @@ class MooditoApp(rumps.App):
         set_symbol_icon(self._pause_item, "pause.fill")
         set_symbol_icon(self._bmc_menu, "cup.and.saucer.fill")
         set_symbol_icon(self._bmc_open_item, "globe")
+        set_symbol_icon(self._license_menu, "key.fill")
+        set_symbol_icon(self._license_buy_item, "cart")
+        set_symbol_icon(self._license_restore_item, "arrow.clockwise")
+        set_symbol_icon(self._license_activate_item, "checkmark.seal")
+        set_symbol_icon(self._license_deactivate_item, "xmark.seal")
         set_symbol_icon(self._quit_item, "power")
         # Reflect the restored display mode in the menu item's checkmark.
         self._icon_only_item.state = self._icon_only
         self._update_stats_menu()
+        self._apply_license_visibility()
 
         self._worker.start()
+        # If a license is stored, confirm it is still active in the background
+        # and fall back to the unlicensed UI if Lemon Squeezy says otherwise.
+        if self._license_active:
+            threading.Thread(target=self._recheck_license, daemon=True).start()
 
     def _render_status(self, title_text: str, allow_icon: bool) -> None:
         """Update the menu bar to show either the icon or the title text.
@@ -505,6 +695,9 @@ class MooditoApp(rumps.App):
     def refresh(self, _timer) -> None:
         # Hide the grant-access item once camera permission is authorized.
         self._camera_item.hidden = camera_authorization_status() == 3
+
+        # Apply any license state change made by a background license thread.
+        self._consume_license_updates()
 
         if self._paused:
             self._accumulate_stats("paused")
@@ -621,6 +814,143 @@ class MooditoApp(rumps.App):
     def buy_me_a_coffee(self, _sender) -> None:
         """Open the Buy Me a Coffee page in the default browser."""
         subprocess.run(["open", BMC_URL], check=False)
+
+    def _apply_license_visibility(self) -> None:
+        """Sync menu visibility and status text with the current license state.
+
+        Activate is shown only while unlicensed; Deactivate only while
+        licensed; the Buy Me a Coffee tip jar is hidden once licensed.
+        """
+        active = self._license_active
+        self._license_activate_item.hidden = active
+        self._license_deactivate_item.hidden = not active
+        self._bmc_menu.hidden = active
+        self._license_status_item.title = (
+            "Status: Licensed ✓" if active else "Status: Not licensed"
+        )
+
+    def _consume_license_updates(self) -> None:
+        """Apply any pending license state change on the main thread.
+
+        Background license threads only mutate the shared license fields and
+        set ``_license_dirty``; the actual menu update and any user-facing
+        alert happen here, on the main (UI) thread.
+        """
+        if not self._license_dirty.is_set():
+            return
+        self._license_dirty.clear()
+        self._apply_license_visibility()
+        with self._license_lock:
+            alert = self._license_alert
+            self._license_alert = None
+        if alert:
+            rumps.alert(LICENSE_ALERT_TITLE, alert)
+
+    @rumps.timer(LICENSE_RECHECK_INTERVAL)
+    def _periodic_license_check(self, _timer) -> None:
+        """Periodically re-validate an active license while the app runs."""
+        if self._license_active and not self._license_busy.is_set():
+            threading.Thread(target=self._recheck_license, daemon=True).start()
+
+    def _recheck_license(self) -> None:
+        """Background: confirm the stored license is still valid (fallback).
+
+        If Lemon Squeezy reports the license as invalid, the activation is
+        cleared locally and the menu falls back to the unlicensed state. A
+        network/server error is treated as transient and left untouched.
+        """
+        with self._license_lock:
+            key = self._license.get("license_key", "")
+            instance_id = self._license.get("instance_id", "")
+        if validate_license(key, instance_id) != LICENSE_INVALID:
+            # Valid, or could not reach the server (transient) → keep as-is.
+            return
+        clear_license()
+        with self._license_lock:
+            self._license = {}
+            self._license_active = False
+        self._license_dirty.set()
+
+    def buy_license(self, _sender) -> None:
+        """Open the Lemon Squeezy storefront to purchase a license."""
+        subprocess.run(["open", LICENSE_BUY_URL], check=False)
+
+    def restore_license(self, _sender) -> None:
+        """Open the Lemon Squeezy customer portal to find a past order."""
+        subprocess.run(["open", LICENSE_RESTORE_URL], check=False)
+
+    def activate_license_dialog(self, _sender) -> None:
+        """Prompt for a license key and activate it (network call off-thread)."""
+        if self._license_busy.is_set():
+            return
+        window = rumps.Window(
+            title="Activate Moodito License",
+            message="Enter your license key:",
+            default_text="",
+            ok="Activate",
+            cancel="Cancel",
+            dimensions=(320, 24),
+        )
+        response = window.run()
+        if response.clicked != 1:
+            return
+        key = response.text.strip()
+        if not key:
+            return
+        self._license_busy.set()
+        self._license_status_item.title = "Status: Activating…"
+        threading.Thread(
+            target=self._activate_worker, args=(key,), daemon=True
+        ).start()
+
+    def _activate_worker(self, key: str) -> None:
+        """Background: activate ``key`` and stage the result for the UI thread."""
+        instance_name = license_instance_name()
+        ok, message, instance_id = activate_license(key, instance_name)
+        if ok:
+            license_data = {
+                "license_key": key,
+                "instance_id": instance_id,
+                "instance_name": instance_name,
+            }
+            save_license(license_data)
+            with self._license_lock:
+                self._license = license_data
+                self._license_active = True
+                self._license_alert = "License activated. Thank you! 🎉"
+        else:
+            with self._license_lock:
+                self._license_alert = f"Could not activate license:\n{message}"
+        self._license_busy.clear()
+        self._license_dirty.set()
+
+    def deactivate_license_action(self, _sender) -> None:
+        """Deactivate the current license (network call off-thread)."""
+        if self._license_busy.is_set():
+            return
+        with self._license_lock:
+            key = self._license.get("license_key", "")
+            instance_id = self._license.get("instance_id", "")
+        self._license_busy.set()
+        self._license_status_item.title = "Status: Deactivating…"
+        threading.Thread(
+            target=self._deactivate_worker, args=(key, instance_id), daemon=True
+        ).start()
+
+    def _deactivate_worker(self, key: str, instance_id: str) -> None:
+        """Background: deactivate the license and stage the UI-thread result."""
+        ok, message = deactivate_license(key, instance_id)
+        if ok:
+            clear_license()
+            with self._license_lock:
+                self._license = {}
+                self._license_active = False
+                self._license_alert = "License deactivated."
+        else:
+            with self._license_lock:
+                self._license_alert = f"Could not deactivate license:\n{message}"
+        self._license_busy.clear()
+        self._license_dirty.set()
 
     def export_csv(self, _sender) -> None:
         """Export the raw detection log to a CSV file in the Downloads folder."""

@@ -47,6 +47,7 @@ The menu bar shows the live emotion (e.g. `😀 happy`). The dropdown menu lets 
 
 - See the detected emotion and confidence
 - **Pause / Resume** detection (stops processing webcam frames)
+- Manage your **License** (buy, restore, activate, deactivate)
 - **Quit**
 
 ## Build a standalone .app
@@ -84,6 +85,27 @@ allowing it under System Settings -> Privacy & Security). The model is cached in
 The emotion heuristics live in [`emotion.py`](emotion.py) in `infer_emotion()`.
 Adjust the linear weights or the `0.25` neutral threshold to make detection more
 or less sensitive.
+
+## Licensing
+
+Moodito integrates with [Lemon Squeezy](https://www.lemonsqueezy.com/) for
+license management. The **License** submenu in the menu bar dropdown offers:
+
+- **Buy License…** — opens the [storefront](https://georgiosnikitas.lemonsqueezy.com/)
+- **Restore License…** — opens your [Lemon Squeezy orders](https://app.lemonsqueezy.com/my-orders)
+  to look up a key you already bought
+- **Activate License…** — prompts for your key and activates it (shown only while
+  unlicensed)
+- **Deactivate License** — releases this device's activation (shown only while
+  licensed)
+
+Activation is verified against the Lemon Squeezy
+[License API](https://docs.lemonsqueezy.com/api/license-api) and stored in
+`~/Library/Application Support/Moodito/license.json`. A licensed copy re-validates
+on launch and periodically in the background; if the key has expired or been
+deactivated elsewhere, Moodito falls back to the unlicensed experience. Network
+errors are treated as transient and never revoke a license. While a license is
+active, the Buy Me a Coffee tip jar is hidden.
 
 ## Support
 
