@@ -31,11 +31,11 @@ MODEL_URL = (
     "face_landmarker/float16/1/face_landmarker.task"
 )
 # Colored app icon shown in the menu bar when "icon only" mode is enabled.
-MENUBAR_ICON = "moodito.png"
+MENUBAR_ICON = "assets/moodito.png"
 # Support / tip jar link opened from the menu.
 BMC_URL = "https://buymeacoffee.com/georgiosnikitas"
 # QR code image (bundled) shown under the Buy Me a Coffee menu item.
-BMC_QR = "bmc_qr.png"
+BMC_QR = "assets/bmc_qr.png"
 # Store the model in a writable per-user directory so it works both when run
 # from source and when packaged as a read-only .app bundle.
 DATA_DIR = os.path.expanduser("~/Library/Application Support/Moodito")

@@ -3,14 +3,16 @@
 
 Dev-only helper (not bundled into the app). Run after changing the URL:
 
-    python make_qr.py
+    python scripts/make_qr.py
 """
 from __future__ import annotations
+
+from pathlib import Path
 
 import qrcode
 
 BMC_URL = "https://buymeacoffee.com/georgiosnikitas"
-OUTPUT = "bmc_qr.png"
+OUTPUT = Path(__file__).resolve().parent.parent / "assets" / "bmc_qr.png"
 
 
 def main() -> None:

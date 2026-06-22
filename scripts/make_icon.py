@@ -3,9 +3,8 @@
 Draws a friendly smiley on a warm rounded-square background and packages it
 into a multi-resolution macOS .icns file. Re-run after changing the design:
 
-    python make_icon.py
+    python scripts/make_icon.py
 """
-
 from __future__ import annotations
 
 import math
@@ -16,6 +15,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 HERE = Path(__file__).resolve().parent
+ASSETS = HERE.parent / "assets"
 
 # Supersample everything, then downscale with LANCZOS for crisp anti-aliasing.
 SCALE = 4
@@ -75,7 +75,7 @@ def render_master() -> Image.Image:
 
 def build_icns() -> Path:
     master = render_master()
-
+    ASSETS.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
         iconset = Path(tmp) / "moodito.iconset"
         iconset.mkdir()
@@ -93,13 +93,13 @@ def build_icns() -> Path:
             img = master.resize((px, px), Image.LANCZOS)
             img.save(iconset / f"icon_{size}x{size}{suffix}.png")
 
-        out = HERE / "moodito.icns"
+        out = ASSETS / "moodito.icns"
         subprocess.run(
             ["iconutil", "-c", "icns", str(iconset), "-o", str(out)],
             check=True,
         )
         # Keep a PNG preview alongside the .icns.
-        master.save(HERE / "moodito.png")
+        master.save(ASSETS / "moodito.png")
         return out
 
 

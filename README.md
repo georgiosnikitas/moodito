@@ -91,7 +91,7 @@ If you enjoy Moodito, you can support development by buying me a coffee ☕
 
 [buymeacoffee.com/georgiosnikitas](https://buymeacoffee.com/georgiosnikitas)
 
-<img src="bmc_qr.png" alt="Buy Me a Coffee QR code" width="200">
+<img src="assets/bmc_qr.png" alt="Buy Me a Coffee QR code" width="200">
 
 There's also a **Buy Me a Coffee ☕** item in the menu bar dropdown that opens
 the page directly.

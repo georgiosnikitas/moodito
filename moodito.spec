@@ -17,7 +17,7 @@ a = Analysis(
     ["app.py"],
     pathex=[],
     binaries=mp_binaries,
-    datas=mp_datas + [("moodito.png", "."), ("bmc_qr.png", ".")],
+    datas=mp_datas + [("assets/moodito.png", "assets"), ("assets/bmc_qr.png", "assets")],
     hiddenimports=mp_hiddenimports + ["AVFoundation", "objc"],
     hookspath=[],
     hooksconfig={},
@@ -63,7 +63,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="Moodito.app",
-    icon="moodito.icns",
+    icon="assets/moodito.icns",
     bundle_identifier="com.moodito.app",
     info_plist={
         # Menu-bar-only app: no Dock icon, no main window.

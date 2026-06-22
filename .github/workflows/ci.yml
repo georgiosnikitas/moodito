@@ -46,7 +46,7 @@ jobs:
 
       - name: Syntax / import check
         run: |
-          python -m compileall -q app.py emotion.py make_icon.py
+          python -m compileall -q app.py emotion.py scripts/make_icon.py scripts/make_qr.py
           python -c "import app, emotion"
 
       - name: Unit tests (pytest)
