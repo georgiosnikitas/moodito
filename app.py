@@ -898,31 +898,11 @@ class MooditoApp(rumps.App):
         )
         self._license_menu.add(self._license_buy_item)
 
-        # Sensitivity submenu: grouped by emotion. Each group leads with a
-        # disabled "<emoji> <Emotion>" header, followed by the Low/Normal/High
-        # rows which line up in a vertical column; a checkmark marks the active
-        # level and one click sets it. Level rows are added with their unique
-        # full titles so rumps (which keys items by title and drops duplicates)
-        # keeps them all, then their display text is set to the bare level.
-        # Dividers separate the groups — no nested submenu and no dialog window.
-        self._sensitivity_menu = rumps.MenuItem("Sensitivity")
-        self._sensitivity_items: dict[tuple[str, str], rumps.MenuItem] = {}
-        for index, emotion in enumerate(SENSITIVITY_EMOTIONS):
-            if index:
-                self._sensitivity_menu.add(None)
-            emoji = EMOTION_EMOJI.get(emotion, "")
-            self._sensitivity_menu.add(
-                rumps.MenuItem(f"{emoji} {emotion.capitalize()}".strip(), callback=None)
-            )
-            for level in SENSITIVITY_LEVELS:
-                item = rumps.MenuItem(
-                    self._sensitivity_full_title(emotion, level),
-                    callback=self.set_sensitivity,
-                )
-                self._sensitivity_menu.add(item)
-                item.title = level.capitalize()
-                self._sensitivity_items[(emotion, level)] = item
-            self._update_sensitivity_states(emotion)
+        # Sensitivity is configured in a native NSAlert dialog (built each time
+        # it is opened) — see open_sensitivity_window.
+        self._sensitivity_menu = rumps.MenuItem(
+            "Sensitivity…", callback=self.open_sensitivity_window
+        )
 
         self.menu = [
             rumps.MenuItem("Detected: …", callback=None),
@@ -1366,32 +1346,113 @@ class MooditoApp(rumps.App):
                     result[emotion] = level
         return result
 
-    def _sensitivity_full_title(self, emotion: str, level: str) -> str:
-        """Unique add-time row title (only used as the rumps menu key)."""
-        emoji = EMOTION_EMOJI.get(emotion, "")
-        return f"{level.capitalize()} · {emoji} {emotion.capitalize()}".strip()
+    def _apply_sensitivity(self, emotion: str, level: str) -> None:
+        """Record a level for an emotion, share it with the worker, persist it.
 
-    def _update_sensitivity_states(self, emotion: str) -> None:
-        """Move the radio checkmark to the emotion's selected level."""
-        selected = self._sensitivity.get(emotion, DEFAULT_SENSITIVITY)
-        for level in SENSITIVITY_LEVELS:
-            self._sensitivity_items[(emotion, level)].state = level == selected
-
-    def set_sensitivity(self, sender) -> None:
-        """Apply the level chosen from the Sensitivity menu."""
-        target = next(
-            (key for key, item in self._sensitivity_items.items() if item is sender),
-            None,
-        )
-        if target is None:
+        Validates inputs so callers (including the settings window) can never
+        store a bogus value.
+        """
+        if emotion not in SENSITIVITY_EMOTIONS or level not in SENSITIVITY_LEVELS:
             return
-        emotion, level = target
+        if self._sensitivity.get(emotion) == level:
+            return
         self._sensitivity[emotion] = level
-        self._update_sensitivity_states(emotion)
-        # Share the new setting with the inference thread and persist it.
         self._worker.sensitivity = self._sensitivity
         self._settings["sensitivity"] = self._sensitivity
         save_settings(self._settings)
+
+    def open_sensitivity_window(self, _sender) -> None:
+        """Show the Sensitivity dialog (a native NSAlert, like the other windows).
+
+        Built as an NSAlert with a custom accessory view holding one segmented
+        control per emotion, so it matches the Datetime Range / license windows
+        (Moodito icon, standard Apply/Cancel buttons). Changes are committed only
+        when Apply is clicked; Cancel discards them.
+        """
+        try:
+            from AppKit import NSAlert, NSAlertFirstButtonReturn, NSApp, NSImage
+
+            view, controls = self._build_sensitivity_accessory()
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Sensitivity")
+            alert.setInformativeText_("How readily each emotion is detected.")
+            alert.addButtonWithTitle_("Apply")
+            alert.addButtonWithTitle_("Cancel")
+            icon = NSImage.alloc().initByReferencingFile_(resource_path(MENUBAR_ICON))
+            if icon is not None and icon.isValid():
+                alert.setIcon_(icon)
+            alert.setAccessoryView_(view)
+            NSApp.activateIgnoringOtherApps_(True)
+            if alert.runModal() == NSAlertFirstButtonReturn:
+                self._apply_sensitivity_from_controls(controls)
+        except Exception:  # noqa: BLE001 - never let a UI glitch crash the menu
+            pass
+
+    def _apply_sensitivity_from_controls(self, controls: dict) -> None:
+        """Commit the level selected in each emotion's segmented control."""
+        for emotion, control in controls.items():
+            index = int(control.selectedSegment())
+            if 0 <= index < len(SENSITIVITY_LEVELS):
+                self._apply_sensitivity(emotion, SENSITIVITY_LEVELS[index])
+
+    def _build_sensitivity_accessory(self):
+        """Build the NSAlert accessory view: one segmented control per emotion.
+
+        Returns ``(view, {emotion: NSSegmentedControl})``. Plain frame-based
+        layout (no auto-layout); each control starts on the emotion's current
+        level.
+        """
+        from AppKit import (
+            NSFont,
+            NSSegmentedControl,
+            NSSegmentStyleRounded,
+            NSTextField,
+            NSView,
+        )
+        from Foundation import NSMakeRect
+
+        label_w = 120.0
+        gap = 10.0
+        control_w = 210.0
+        row_h = 34.0
+        width = label_w + gap + control_w
+        n = len(SENSITIVITY_EMOTIONS)
+        height = n * row_h
+
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, width, height))
+        controls: dict[str, object] = {}
+        for i, emotion in enumerate(SENSITIVITY_EMOTIONS):
+            row_y = height - (i + 1) * row_h
+            label = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(0.0, row_y + 7.0, label_w, 22.0)
+            )
+            label.setStringValue_(
+                f"{EMOTION_EMOJI.get(emotion, '')} {emotion.capitalize()}".strip()
+            )
+            label.setBezeled_(False)
+            label.setDrawsBackground_(False)
+            label.setEditable_(False)
+            label.setSelectable_(False)
+            label.setFont_(NSFont.systemFontOfSize_(13.0))
+            view.addSubview_(label)
+
+            segmented = NSSegmentedControl.alloc().initWithFrame_(
+                NSMakeRect(label_w + gap, row_y + 5.0, control_w, 24.0)
+            )
+            segmented.setSegmentCount_(len(SENSITIVITY_LEVELS))
+            segmented.setSegmentStyle_(NSSegmentStyleRounded)
+            for seg, level in enumerate(SENSITIVITY_LEVELS):
+                segmented.setLabel_forSegment_(level.capitalize(), seg)
+                segmented.setWidth_forSegment_(control_w / len(SENSITIVITY_LEVELS), seg)
+            segmented.setSelectedSegment_(
+                SENSITIVITY_LEVELS.index(
+                    self._sensitivity.get(emotion, DEFAULT_SENSITIVITY)
+                )
+            )
+            view.addSubview_(segmented)
+            controls[emotion] = segmented
+
+        return view, controls
 
     def toggle_pause(self, _sender) -> None:
         self._paused = not self._paused
