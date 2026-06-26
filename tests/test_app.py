@@ -1772,12 +1772,42 @@ class TestLLMHelpers:
         with pytest.raises(ValueError):
             app._llm_text({"t": "   "}, lambda d: d["t"])
 
-    def test_build_mood_tip_prompt_mentions_emotion(self) -> None:
-        prompt = app.build_mood_tip_prompt("happy")
-        assert "happy" in prompt
+    def test_format_hourly_durations_lists_nonzero_hours(self) -> None:
+        values = [0.0] * 24
+        values[9] = 120.0
+        values[14] = 30.0
+        out = app._format_hourly_durations(values)
+        assert "09h" in out
+        assert "14h" in out
+        assert "00h" not in out
 
-    def test_build_mood_tip_prompt_defaults_to_neutral(self) -> None:
-        assert "neutral" in app.build_mood_tip_prompt("")
+    def test_format_hourly_durations_empty_is_none(self) -> None:
+        assert app._format_hourly_durations([0.0] * 24) == "none"
+
+    def test_build_mood_report_prompt_includes_range_and_stats(self) -> None:
+        start = app.datetime(2026, 6, 21, 8, 0)
+        end = app.datetime(2026, 6, 21, 20, 0)
+        stats = {k: {"seconds": 0.0, "count": 0} for k in app.STAT_KEYS}
+        stats["happy"] = {"seconds": 600.0, "count": 5}
+        stats["sad"] = {"seconds": 200.0, "count": 2}
+        hourly = [0.0] * 24
+        hourly[9] = 400.0
+        heat = {k: [0.0] * 24 for k in app.STAT_KEYS}
+        heat["happy"][9] = 400.0
+        prompt = app.build_mood_report_prompt(start, end, stats, hourly, heat)
+        assert "Jun 21, 2026 08:00" in prompt
+        assert "Jun 21, 2026 20:00" in prompt
+        assert "happy" in prompt
+        assert "occurrences" in prompt
+        assert "09h" in prompt  # hourly detail present
+
+    def test_build_mood_report_prompt_handles_live_end(self) -> None:
+        start = app.datetime(2026, 6, 21, 8, 0)
+        stats = {k: {"seconds": 0.0, "count": 0} for k in app.STAT_KEYS}
+        prompt = app.build_mood_report_prompt(
+            start, None, stats, [0.0] * 24, {k: [0.0] * 24 for k in app.STAT_KEYS}
+        )
+        assert "to now" in prompt
 
 
 class TestCallLLM:
@@ -2025,8 +2055,24 @@ class TestMoodTip:
         _patch_sync_threads(monkeypatch)
         full_app.mood_tip(None)
         with full_app._llm_lock:
-            assert "Could not get a mood tip" in full_app._llm_alert
+            assert "Could not get a mood report" in full_app._llm_alert
             assert "offline" in full_app._llm_alert
+
+    def test_sends_range_report_prompt_to_llm(self, full_app, monkeypatch) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda s: None)
+        full_app._apply_ai_provider("OpenAI", {"api_key": "k", "model": "gpt"})
+        captured = {}
+
+        def fake_call(provider, config, prompt):
+            captured["prompt"] = prompt
+            return "report"
+
+        monkeypatch.setattr(app, "call_llm", fake_call)
+        _patch_sync_threads(monkeypatch)
+        full_app.mood_tip(None)
+        # The prompt is built from the selected range's aggregated data.
+        assert "Total tracked time" in captured["prompt"]
+        assert "wellbeing suggestions" in captured["prompt"]
 
 
 class TestGrantCamera:

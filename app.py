@@ -108,8 +108,8 @@ AI_FIELD_PLACEHOLDERS = {
 }
 # Network timeout (seconds) for LLM API calls.
 LLM_API_TIMEOUT = 30
-# Upper bound on tokens requested from the LLM (keeps replies short + cheap).
-LLM_MAX_TOKENS = 300
+# Upper bound on tokens requested from the LLM (room for a detailed report).
+LLM_MAX_TOKENS = 1000
 # Anthropic Messages API endpoint + required version header.
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -462,15 +462,73 @@ def test_ai_connection(provider: str, config: dict) -> tuple[bool, str]:
     return True, "Connection successful."
 
 
-def build_mood_tip_prompt(emotion: str) -> str:
-    """Build the prompt asking the LLM for a short tip for ``emotion``."""
-    emotion = (emotion or "neutral").strip() or "neutral"
-    return (
-        "You are Moodito, a friendly menu-bar companion that reads a person's "
-        f"facial expression. Their expression currently reads as '{emotion}'. "
-        "In one or two short, warm sentences, offer a gentle, uplifting tip "
-        "suited to feeling this way. Reply in plain text without markdown."
-    )
+def _format_hourly_durations(values: list[float]) -> str:
+    """Summarise 24 hourly seconds-buckets as compact 'HH:duration' pairs.
+
+    Only non-empty hours are listed; an all-empty day renders as 'none'.
+    """
+    parts = [
+        f"{hour:02d}h {format_duration(seconds)}"
+        for hour, seconds in enumerate(values)
+        if seconds > 0
+    ]
+    return ", ".join(parts) if parts else "none"
+
+
+def build_mood_report_prompt(
+    start: datetime,
+    end: datetime | None,
+    stats: dict,
+    hourly_activity: list[float],
+    hourly_emotion: dict,
+) -> str:
+    """Build the prompt asking the LLM for a detailed mood report.
+
+    Uses the full aggregated detail of the data collected within the selected
+    date range: per-state durations/shares/occurrences plus the hourly activity
+    and per-emotion hourly breakdown.
+    """
+    end_text = "now" if end is None else format_datetime(end)
+    total = sum(entry.get("seconds", 0.0) for entry in stats.values())
+    lines = [
+        "You are Moodito, an assistant that analyses a person's facial "
+        "expressions captured from their webcam over time.",
+        "",
+        f"Data collected from {format_datetime(start)} to {end_text}.",
+        f"Total tracked time: {format_duration(total)}.",
+        "",
+        "Time spent in each detected state "
+        "(state: duration, share of total, distinct occurrences):",
+    ]
+    for key in STAT_KEYS:
+        entry = stats.get(key, {"seconds": 0.0, "count": 0})
+        seconds = entry.get("seconds", 0.0)
+        pct = (seconds / total * 100.0) if total else 0.0
+        lines.append(
+            f"- {key}: {format_duration(seconds)}, "
+            f"{pct:.0f}%, {entry.get('count', 0)} occurrences"
+        )
+    lines += [
+        "",
+        "Hourly activity (tracked time per hour of day):",
+        _format_hourly_durations(hourly_activity),
+        "",
+        "Per-emotion breakdown by hour of day:",
+    ]
+    for key in STAT_KEYS:
+        row = hourly_emotion.get(key)
+        if row and any(v > 0 for v in row):
+            lines.append(f"- {key}: {_format_hourly_durations(row)}")
+    lines += [
+        "",
+        "Using the full details above, write a detailed yet friendly report on "
+        "this person's mood and emotional patterns over the period. Cover the "
+        "dominant emotions, how their mood shifted across the day, the balance "
+        "of positive versus negative states, and any notable patterns. Finish "
+        "with a few gentle, practical wellbeing suggestions. Reply in plain "
+        "text without markdown.",
+    ]
+    return "\n".join(lines)
 
 
 # Cached ObjC handler class for the in-dialog "Test" button (defined lazily so
@@ -1159,8 +1217,8 @@ class MooditoApp(rumps.App):
         self._ai_provider_menu = rumps.MenuItem(
             "AI Provider…", callback=self.open_ai_provider_window
         )
-        # Mood Tip asks the configured AI provider for a quick wellbeing tip
-        # based on the current emotion (network call runs off the main thread).
+        # Mood Tip asks the configured AI provider for a detailed report based
+        # on the raw data collected within the selected date range.
         self._mood_tip_menu = rumps.MenuItem("Mood Tip…", callback=self.mood_tip)
 
         self.menu = [
@@ -1170,6 +1228,7 @@ class MooditoApp(rumps.App):
             self._stats_range_item,
             self._stats_live_item,
             self._stats_menu,
+            self._mood_tip_menu,
             self._stats_export_item,
             self._stats_reset_item,
             None,
@@ -1178,7 +1237,6 @@ class MooditoApp(rumps.App):
             rumps.MenuItem("Camera Grant Access", callback=self.grant_camera),
             self._sensitivity_menu,
             self._ai_provider_menu,
-            self._mood_tip_menu,
             rumps.MenuItem("Pause", callback=self.toggle_pause),
             None,
             self._license_menu,
@@ -1879,6 +1937,7 @@ class MooditoApp(rumps.App):
             NSBezelStyleRounded,
             NSButton,
             NSFont,
+            NSLineBreakByWordWrapping,
             NSSecureTextField,
             NSTextField,
             NSView,
@@ -1892,8 +1951,11 @@ class MooditoApp(rumps.App):
         field_w = 260.0
         row_h = 30.0
         width = label_w + gap + field_w
-        # One row per field, plus a final row for the connection test.
-        height = (len(keys) + 1) * row_h
+        # A row per field, the connection (label + Test button) row, then a
+        # multi-line area below it that wraps long status / error messages.
+        conn_row_h = row_h
+        status_h = 60.0
+        height = len(keys) * row_h + conn_row_h + status_h
 
         view = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, width, height))
         fields: dict[str, object] = {}
@@ -1919,9 +1981,10 @@ class MooditoApp(rumps.App):
             view.addSubview_(field)
             fields[key] = field
 
-        # Connection row: "Connection" label + rectangular Test button + status.
+        # Connection row: "Connection" label + rectangular Test button.
+        conn_y = status_h
         conn_label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(0.0, 4.0, label_w, 22.0)
+            NSMakeRect(0.0, conn_y + 4.0, label_w, 22.0)
         )
         conn_label.setStringValue_("Connection")
         conn_label.setBezeled_(False)
@@ -1933,21 +1996,26 @@ class MooditoApp(rumps.App):
 
         button_w = 70.0
         button = NSButton.alloc().initWithFrame_(
-            NSMakeRect(label_w + gap, 1.0, button_w, 26.0)
+            NSMakeRect(label_w + gap, conn_y + 1.0, button_w, 26.0)
         )
         button.setTitle_("Test")
         button.setBezelStyle_(NSBezelStyleRounded)
         view.addSubview_(button)
 
+        # Full-width multi-line status area so long errors wrap and stay visible.
         status = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(label_w + gap + button_w + 8.0, 4.0, field_w - button_w - 8.0, 22.0)
+            NSMakeRect(0.0, 0.0, width, status_h)
         )
         status.setStringValue_("")
         status.setBezeled_(False)
         status.setDrawsBackground_(False)
         status.setEditable_(False)
-        status.setSelectable_(False)
+        status.setSelectable_(True)
         status.setFont_(NSFont.systemFontOfSize_(12.0))
+        status.setUsesSingleLineMode_(False)
+        status.setMaximumNumberOfLines_(0)
+        status.cell().setWraps_(True)
+        status.cell().setLineBreakMode_(NSLineBreakByWordWrapping)
         view.addSubview_(status)
 
         # Wire the button to a retained ObjC handler that runs the test in place.
@@ -1964,10 +2032,11 @@ class MooditoApp(rumps.App):
         return view, fields
 
     def mood_tip(self, _sender) -> None:
-        """Ask the configured AI provider for a quick tip for the current mood.
+        """Generate a detailed mood report from the selected range's raw data.
 
-        The network call runs on a background thread (it can take seconds);
-        the result is shown by refresh() via _consume_llm_updates.
+        The prompt is built on the main thread (it reads the raw log), then the
+        LLM network call runs on a background thread; the result is shown by
+        refresh() via _consume_llm_updates.
         """
         if self._llm_busy.is_set():
             return
@@ -1981,22 +2050,32 @@ class MooditoApp(rumps.App):
                 "Use the “AI Provider…” menu to configure it.",
             )
             return
-        emotion = self._worker.result.label
+        prompt = self._build_mood_report_prompt()
         self._llm_busy.set()
         self._mood_tip_menu.title = "Mood Tip… (thinking)"
         threading.Thread(
             target=self._mood_tip_worker,
-            args=(provider, config, emotion),
+            args=(provider, config, prompt),
             daemon=True,
         ).start()
 
-    def _mood_tip_worker(self, provider: str, config: dict, emotion: str) -> None:
+    def _build_mood_report_prompt(self) -> str:
+        """Recompute the selected range and build the mood-report prompt."""
+        self._recompute_range_stats()
+        return build_mood_report_prompt(
+            self._stats_range_start,
+            self._stats_range_end,
+            self._range_stats,
+            self._hourly_activity,
+            self._hourly_emotion,
+        )
+
+    def _mood_tip_worker(self, provider: str, config: dict, prompt: str) -> None:
         """Background: call the LLM and stage the result for the UI thread."""
         try:
-            tip = call_llm(provider, config, build_mood_tip_prompt(emotion))
-            message = tip
+            message = call_llm(provider, config, prompt)
         except (OSError, ValueError) as exc:
-            message = f"Could not get a mood tip:\n{exc}"
+            message = f"Could not get a mood report:\n{exc}"
         with self._llm_lock:
             self._llm_alert = message
         self._llm_busy.clear()
