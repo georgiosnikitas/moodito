@@ -18,7 +18,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import cv2
 import mediapipe as mp
@@ -276,14 +276,78 @@ def save_stats(stats: dict, started_at: str | None) -> None:
         pass
 
 
+def format_datetime(value: datetime) -> str:
+    """Format a datetime as 'Jun 21, 2026 22:10'."""
+    return value.strftime("%b %d, %Y %H:%M")
+
+
 def format_timestamp(iso: str | None) -> str:
-    """Format an ISO timestamp as 'Jun 21, 2026 · 22:10' (best-effort)."""
+    """Format an ISO timestamp as 'Jun 21, 2026 22:10' (best-effort)."""
     if not iso:
         return "—"
     try:
-        return datetime.fromisoformat(iso).strftime("%b %d, %Y · %H:%M")
+        return format_datetime(datetime.fromisoformat(iso))
     except ValueError:
         return iso
+
+
+def parse_iso_datetime(text: str | None) -> datetime | None:
+    """Parse an ISO timestamp into a datetime, or None if it is invalid."""
+    try:
+        return datetime.fromisoformat(text)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_datetime_input(text: str | None) -> datetime | None:
+    """Parse a user-entered date/time into a datetime, or None if invalid.
+
+    Accepts 'YYYY-MM-DD HH:MM[:SS]' (space or 'T' separator) and 'YYYY-MM-DD'.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return None
+    candidate = cleaned.replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(candidate, fmt)
+        except ValueError:
+            continue
+    return parse_iso_datetime(cleaned)
+
+
+def parse_datetime_range(
+    text: str | None,
+) -> tuple[datetime | None, datetime | None] | None:
+    """Parse a 'START to END' range into (start, end), or None if invalid.
+
+    The two ends may be separated by ' to ', '→', '–', '—' or '..'. A start of
+    'begin' yields ``None``, meaning the "Since" (data start) datetime. An end
+    of 'now' (or an empty end) yields ``None``, meaning a live window.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return None
+    for sep in (" to ", "→", "–", "—", ".."):
+        if sep in cleaned:
+            left, right = cleaned.split(sep, 1)
+            break
+    else:
+        return None
+    left = left.strip()
+    if left.lower() == "begin":
+        start: datetime | None = None
+    else:
+        start = parse_datetime_input(left)
+        if start is None:
+            return None
+    right = right.strip()
+    if right.lower() in ("", "now"):
+        return start, None
+    end = parse_datetime_input(right)
+    if end is None:
+        return None
+    return start, end
 
 
 def format_bytes(num: int) -> str:
@@ -540,6 +604,9 @@ class MooditoApp(rumps.App):
         legacy_icon_only = bool(self._settings.get("icon_only", False))
         self._show_emojis = bool(self._settings.get("show_emojis", not legacy_icon_only))
         self._show_labels = bool(self._settings.get("show_labels", not legacy_icon_only))
+        # When on, the statistics range is pinned to a live, sliding
+        # last-24-hours window and the manual Range control is locked.
+        self._stats_live_24h = bool(self._settings.get("stats_live_24h", True))
         # Last (icon_path, title) applied to the menu bar; skips redundant
         # updates so the status item doesn't flicker every refresh tick.
         self._last_render: tuple[str | None, str | None] | None = None
@@ -554,6 +621,16 @@ class MooditoApp(rumps.App):
         self._ticks_since_save = 0
         # Buffered raw detection samples awaiting flush to RAW_PATH.
         self._raw_buffer: list[tuple] = []
+        # Statistics are shown for a user-selectable datetime range. The end may
+        # be None, meaning "now" (a live window that keeps updating). The range
+        # defaults to the last 24 hours (clamped to when tracking began).
+        self._stats_range_start: datetime = datetime.now()
+        self._stats_range_end: datetime | None = None
+        self._range_stats: dict[str, dict] = {
+            key: {"seconds": 0.0, "count": 0} for key in STAT_KEYS
+        }
+        self._range_last_state: str | None = None
+        self._set_default_range()
         # Persisted Lemon Squeezy license activation (if any).
         self._license = load_license()
         self._license_active = is_license_active(self._license)
@@ -570,8 +647,23 @@ class MooditoApp(rumps.App):
 
         # Build the live Statistics submenu (one row per tracked state).
         self._stats_menu = rumps.MenuItem("Statistics")
+        # Non-clickable label showing when tracking began.
         self._stats_since_item = rumps.MenuItem("Since …", callback=None)
         self._stats_menu.add(self._stats_since_item)
+        # Single control to pick the start and end of the window the statistics
+        # are computed over (defaults to the last 24 hours).
+        self._stats_range_item = rumps.MenuItem(
+            "Range …", callback=self.set_stats_range
+        )
+        self._stats_menu.add(self._stats_range_item)
+        # Toggle: when on, the range is pinned to a live, sliding last-24-hours
+        # window and the manual Range control is locked; when off, the user can
+        # edit the Range freely.
+        self._stats_live_item = rumps.MenuItem(
+            "Last 24 Hours", callback=self.toggle_live_24h
+        )
+        self._stats_live_item.state = self._stats_live_24h
+        self._stats_menu.add(self._stats_live_item)
         self._stats_menu.add(None)
         self._stats_header_item = rumps.MenuItem("Header", callback=None)
         self._stats_menu.add(self._stats_header_item)
@@ -585,11 +677,11 @@ class MooditoApp(rumps.App):
         self._stats_menu.add(self._stats_total_item)
         self._stats_menu.add(None)
         self._stats_export_item = rumps.MenuItem(
-            "Download Raw Data (CSV)", callback=self.export_csv
+            "Download (csv)", callback=self.export_csv
         )
         self._stats_menu.add(self._stats_export_item)
         self._stats_reset_item = rumps.MenuItem(
-            "Reset Statistics", callback=self.reset_stats
+            "Erase", callback=self.reset_stats
         )
         self._stats_menu.add(self._stats_reset_item)
 
@@ -654,8 +746,10 @@ class MooditoApp(rumps.App):
         # Give each actionable menu option a monochrome SF Symbol icon.
         set_symbol_icon(self._detected_item, "magnifyingglass")
         set_symbol_icon(self._stats_menu, "chart.bar")
+        set_symbol_icon(self._stats_range_item, "calendar")
+        set_symbol_icon(self._stats_live_item, "clock.arrow.circlepath")
         set_symbol_icon(self._stats_export_item, "square.and.arrow.down")
-        set_symbol_icon(self._stats_reset_item, "arrow.counterclockwise")
+        set_symbol_icon(self._stats_reset_item, "trash")
         set_symbol_icon(self._emojis_item, "face.smiling")
         set_symbol_icon(self._labels_item, "textformat")
         set_symbol_icon(self._camera_item, "camera")
@@ -671,6 +765,11 @@ class MooditoApp(rumps.App):
         # Reflect the restored display options in the menu items' checkmarks.
         self._emojis_item.state = self._show_emojis
         self._labels_item.state = self._show_labels
+        # Lock the manual Range control when the live last-24-hours toggle is on.
+        if self._stats_live_24h:
+            self._set_default_range()
+        self._apply_range_lock()
+        self._recompute_range_stats()
         self._update_stats_menu()
         self._apply_license_visibility()
 
@@ -739,7 +838,8 @@ class MooditoApp(rumps.App):
     def _accumulate_stats(self, label: str, score: float | None = None) -> None:
         """Add elapsed time to the current emotion and persist periodically."""
         # Record the raw per-sample reading for the raw data export.
-        timestamp = datetime.now().isoformat(timespec="milliseconds")
+        now = datetime.now()
+        timestamp = now.isoformat(timespec="milliseconds")
         self._raw_buffer.append(
             (timestamp, label, "" if score is None else f"{score:.4f}")
         )
@@ -748,8 +848,16 @@ class MooditoApp(rumps.App):
             # Count a new occurrence each time the emotion changes.
             if label != self._last_emotion:
                 self._stats[label]["count"] += 1
-            self._update_stats_menu()
         self._last_emotion = label
+        # Keep the displayed range stats current without re-reading the raw log
+        # every tick. When the live last-24-hours toggle is on, pin the window
+        # to the last 24 hours; otherwise only a live ("now") window updates.
+        if self._stats_live_24h:
+            self._set_default_range()
+            self._add_to_range_stats(label)
+        elif self._stats_range_end is None and now >= self._stats_range_start:
+            self._add_to_range_stats(label)
+        self._update_stats_menu()
 
         # Flush to disk roughly every 10 seconds to limit write frequency.
         self._ticks_since_save += 1
@@ -758,6 +866,66 @@ class MooditoApp(rumps.App):
             save_stats(self._stats, self._stats_started_at)
             append_raw_samples(self._raw_buffer)
             self._raw_buffer.clear()
+            if self._stats_live_24h:
+                # Re-aggregate so samples older than 24h drop out of the window.
+                self._recompute_range_stats()
+
+    def _add_to_range_stats(self, label: str) -> None:
+        """Add one sample tick to the range stats, counting state changes."""
+        if label not in self._range_stats:
+            self._range_last_state = label
+            return
+        self._range_stats[label]["seconds"] += UI_REFRESH_INTERVAL
+        if label != self._range_last_state:
+            self._range_stats[label]["count"] += 1
+        self._range_last_state = label
+
+    def _iter_raw_states(self):
+        """Yield (timestamp, state) pairs from the raw log and pending buffer."""
+        try:
+            with open(RAW_PATH, newline="", encoding="utf-8") as fh:
+                reader = csv.reader(fh)
+                next(reader, None)  # skip the header row
+                for row in reader:
+                    if len(row) < 2:
+                        continue
+                    ts = parse_iso_datetime(row[0])
+                    if ts is not None:
+                        yield ts, row[1]
+        except OSError:
+            pass
+        for row in self._raw_buffer:
+            ts = parse_iso_datetime(row[0])
+            if ts is not None:
+                yield ts, row[1]
+
+    def _recompute_range_stats(self) -> None:
+        """Aggregate the raw log over the selected range into ``_range_stats``."""
+        start = self._stats_range_start
+        end = self._stats_range_end if self._stats_range_end is not None else datetime.now()
+        stats = {key: {"seconds": 0.0, "count": 0} for key in STAT_KEYS}
+        previous: str | None = None
+        for ts, state in self._iter_raw_states():
+            if ts < start or ts > end:
+                continue
+            if state in stats:
+                stats[state]["seconds"] += UI_REFRESH_INTERVAL
+                if state != previous:
+                    stats[state]["count"] += 1
+            previous = state
+        self._range_stats = stats
+        self._range_last_state = previous
+
+    def _set_default_range(self) -> None:
+        """Reset the statistics window to the last 24 hours (live, ending now)."""
+        now = datetime.now()
+        tracking_start = parse_iso_datetime(self._stats_started_at) or now
+        start = now - timedelta(hours=24)
+        if start < tracking_start:
+            start = tracking_start
+        self._stats_range_start = start
+        self._stats_range_end = None
+
 
     def _update_stats_menu(self) -> None:
         """Refresh the Statistics submenu rows as an aligned table."""
@@ -769,10 +937,10 @@ class MooditoApp(rumps.App):
             f"{'Count':>7}"
         )
         set_monospaced_title(self._stats_header_item, header)
-        total = sum(entry["seconds"] for entry in self._stats.values())
-        total_count = sum(entry["count"] for entry in self._stats.values())
+        total = sum(entry["seconds"] for entry in self._range_stats.values())
+        total_count = sum(entry["count"] for entry in self._range_stats.values())
         for key, item in self._stats_items.items():
-            entry = self._stats[key]
+            entry = self._range_stats[key]
             pct = (entry["seconds"] / total * 100.0) if total else 0.0
             emoji = STAT_EMOJI.get(key, "")
             # Fixed-width columns: name | percent | duration | count.
@@ -793,9 +961,111 @@ class MooditoApp(rumps.App):
             f"{'×' + str(total_count):>7}"
         )
         set_monospaced_title(self._stats_total_item, total_row)
-        self._stats_since_item.title = f"Since {format_timestamp(self._stats_started_at)}"
-        self._stats_reset_item.title = (
-            f"Reset Statistics ({format_bytes(raw_file_size())})"
+        # "Since" shows when data collection began (not the range start),
+        # alongside the raw data size.
+        self._stats_since_item.title = (
+            f"Since {format_timestamp(self._stats_started_at)}"
+            f" · {format_bytes(raw_file_size())}"
+        )
+        end_text = (
+            "Now"
+            if self._stats_range_end is None
+            else format_datetime(self._stats_range_end)
+        )
+        self._stats_range_item.title = (
+            f"Range: {format_datetime(self._stats_range_start)} → {end_text}"
+        )
+        self._stats_reset_item.title = "Erase"
+
+
+    def set_stats_range(self, _sender) -> None:
+        """Prompt for the statistics date/time range and apply it.
+
+        The start cannot be earlier than the "Since" (tracking) start, the end
+        cannot be later than now, and the start must be strictly before the end;
+        an end of 'now' keeps the window live.
+        """
+        # The range is locked while the live last-24-hours window is on.
+        if self._stats_live_24h:
+            return
+        now = datetime.now()
+        tracking_start = parse_iso_datetime(self._stats_started_at) or now
+        # Pre-fill the prompt with the last applied range so the user's
+        # previously entered datetimes are kept.
+        start = self._stats_range_start
+        end_text = (
+            "now"
+            if self._stats_range_end is None
+            else self._stats_range_end.strftime("%Y-%m-%d %H:%M")
+        )
+        window = rumps.Window(
+            title="Datetime Range",
+            message=(
+                "Datetime format YYYY-MM-DD HH:MM\n\n"
+                "Use 'begin' as the start for the Since datetime, "
+                "and 'now' as the end for a live window."
+            ),
+            default_text=f"{start.strftime('%Y-%m-%d %H:%M')} to {end_text}",
+            ok="Apply",
+            cancel="Cancel",
+            dimensions=(260, 24),
+        )
+        response = window.run()
+        if not response.clicked:
+            return
+        parsed = parse_datetime_range(response.text)
+        if parsed is None:
+            rumps.alert(
+                "Datetime Range",
+                "Could not understand that range.\n"
+                "Use the format START to END (YYYY-MM-DD HH:MM).",
+            )
+            return
+        start_val, end_val = parsed
+        # A 'begin' start resolves to the "Since" (data start) datetime.
+        if start_val is None:
+            start_val = tracking_start
+        # The start cannot be before the "Since" (tracking) start.
+        start_val = max(start_val, tracking_start)
+        if end_val is not None:
+            # The end cannot be after now.
+            end_val = min(end_val, now)
+        # The start cannot equal or come after the end. A live end ("now")
+        # is treated as the current time for this comparison.
+        effective_end = end_val if end_val is not None else now
+        if start_val >= effective_end:
+            rumps.alert(
+                "Datetime Range",
+                "The start must be before the end.",
+            )
+            return
+        self._stats_range_start = start_val
+        self._stats_range_end = end_val
+        self._recompute_range_stats()
+        self._update_stats_menu()
+
+    def toggle_live_24h(self, sender) -> None:
+        """Toggle the live last-24-hours window on or off.
+
+        When on, the range is pinned to a sliding last-24-hours window and the
+        manual Range control is locked. When off, the Range becomes editable
+        and keeps whatever window was last shown.
+        """
+        self._stats_live_24h = not self._stats_live_24h
+        sender.state = self._stats_live_24h
+        # Persist the choice so it is restored on the next launch.
+        self._settings["stats_live_24h"] = self._stats_live_24h
+        save_settings(self._settings)
+        if self._stats_live_24h:
+            self._set_default_range()
+        self._apply_range_lock()
+        self._recompute_range_stats()
+        self._update_stats_menu()
+
+    def _apply_range_lock(self) -> None:
+        """Enable or disable the manual Range control based on the live toggle."""
+        self._stats_range_item.set_callback(
+            None if self._stats_live_24h else self.set_stats_range
         )
 
     def toggle_emojis(self, sender) -> None:
@@ -1017,6 +1287,8 @@ class MooditoApp(rumps.App):
             pass
         self._stats_started_at = datetime.now().isoformat(timespec="seconds")
         save_stats(self._stats, self._stats_started_at)
+        self._set_default_range()
+        self._recompute_range_stats()
         self._update_stats_menu()
 
     def quit_app(self, _sender) -> None:

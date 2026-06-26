@@ -130,7 +130,7 @@ class TestFormatTimestamp:
         assert app.format_timestamp(None) == "—"
 
     def test_valid_iso_is_formatted(self) -> None:
-        assert app.format_timestamp("2026-06-21T22:10:00") == "Jun 21, 2026 · 22:10"
+        assert app.format_timestamp("2026-06-21T22:10:00") == "Jun 21, 2026 22:10"
 
     def test_invalid_string_is_returned_unchanged(self) -> None:
         assert app.format_timestamp("not-a-date") == "not-a-date"
@@ -347,10 +347,18 @@ def _bare_app():
     inst._ticks_since_save = 0
     inst._raw_buffer = []
     inst._stats_started_at = "2026-06-21T22:00:00"
+    inst._stats_range_start = app.datetime(2026, 6, 21, 22, 0, 0)
+    inst._stats_range_end = None
+    inst._stats_live_24h = False
+    inst._settings = {}
+    inst._range_stats = {k: {"seconds": 0.0, "count": 0} for k in app.STAT_KEYS}
+    inst._range_last_state = None
     inst._stats_items = {k: rumps.MenuItem(k) for k in app.STAT_KEYS}
     inst._stats_header_item = rumps.MenuItem("header")
     inst._stats_total_item = rumps.MenuItem("total")
     inst._stats_since_item = rumps.MenuItem("since")
+    inst._stats_range_item = rumps.MenuItem("range", callback=inst.set_stats_range)
+    inst._stats_live_item = rumps.MenuItem("live")
     inst._stats_reset_item = rumps.MenuItem("reset")
     return inst
 
@@ -387,10 +395,11 @@ class TestStatsAccumulation:
 
     def test_update_stats_menu_sets_titles(self) -> None:
         inst = _bare_app()
-        inst._stats["happy"] = {"seconds": 30.0, "count": 2}
+        inst._range_stats["happy"] = {"seconds": 30.0, "count": 2}
         inst._update_stats_menu()
         assert "Since" in inst._stats_since_item.title
-        assert "Reset Statistics" in inst._stats_reset_item.title
+        assert "Now" in inst._stats_range_item.title
+        assert inst._stats_reset_item.title == "Erase"
 
 
 class TestRawRecording:
@@ -423,6 +432,249 @@ class TestRawRecording:
             inst._accumulate_stats("happy", 0.5)
         assert flushed  # raw samples were flushed
         assert inst._raw_buffer == []  # buffer cleared after flush
+
+
+class TestStatsRange:
+    def test_parse_datetime_input_accepts_common_formats(self) -> None:
+        assert app.parse_datetime_input("2026-06-21 22:10") == app.datetime(
+            2026, 6, 21, 22, 10
+        )
+        assert app.parse_datetime_input("2026-06-21T22:10:05") == app.datetime(
+            2026, 6, 21, 22, 10, 5
+        )
+        assert app.parse_datetime_input("2026-06-21") == app.datetime(
+            2026, 6, 21, 0, 0
+        )
+
+    def test_parse_datetime_input_rejects_garbage(self) -> None:
+        assert app.parse_datetime_input("not a date") is None
+        assert app.parse_datetime_input("") is None
+        assert app.parse_datetime_input(None) is None
+
+    def test_parse_datetime_range_accepts_now_end(self) -> None:
+        start, end = app.parse_datetime_range("2026-06-21 22:00 to now")
+        assert start == app.datetime(2026, 6, 21, 22, 0)
+        assert end is None
+
+    def test_parse_datetime_range_accepts_fixed_end(self) -> None:
+        start, end = app.parse_datetime_range(
+            "2026-06-21 22:00 to 2026-06-22 08:00"
+        )
+        assert start == app.datetime(2026, 6, 21, 22, 0)
+        assert end == app.datetime(2026, 6, 22, 8, 0)
+
+    def test_parse_datetime_range_accepts_begin_start(self) -> None:
+        start, end = app.parse_datetime_range("begin to 2026-06-22 08:00")
+        assert start is None  # 'begin' resolves to the Since datetime
+        assert end == app.datetime(2026, 6, 22, 8, 0)
+
+    def test_parse_datetime_range_accepts_begin_to_now(self) -> None:
+        start, end = app.parse_datetime_range("begin to now")
+        assert start is None
+        assert end is None
+
+    def test_parse_datetime_range_rejects_garbage(self) -> None:
+        assert app.parse_datetime_range("garbage") is None
+        assert app.parse_datetime_range("2026-06-21 to bad") is None
+        assert app.parse_datetime_range("") is None
+
+    def test_set_range_begin_resolves_to_since(
+        self, data_dir, monkeypatch
+    ) -> None:
+        _patch_window(monkeypatch, clicked=1, text="begin to now")
+        inst = _bare_app()
+        inst._stats_started_at = "2026-06-21T22:00:00"
+        inst.set_stats_range(None)
+        assert inst._stats_range_start == app.datetime(2026, 6, 21, 22, 0)
+        assert inst._stats_range_end is None
+
+    def test_set_default_range_is_last_24h_live(self) -> None:
+        inst = _bare_app()
+        inst._stats_started_at = "2020-01-01T00:00:00"
+        inst._set_default_range()
+        assert inst._stats_range_end is None  # live ("now")
+        expected = app.datetime.now() - app.timedelta(hours=24)
+        assert abs((inst._stats_range_start - expected).total_seconds()) < 5
+
+    def test_set_default_range_clamps_to_tracking_start(self) -> None:
+        inst = _bare_app()
+        recent = (app.datetime.now() - app.timedelta(hours=1)).isoformat(
+            timespec="seconds"
+        )
+        inst._stats_started_at = recent
+        inst._set_default_range()
+        # Tracking only began 1h ago, so the window cannot start 24h ago.
+        assert inst._stats_range_start == app.datetime.fromisoformat(recent)
+
+    def test_recompute_aggregates_only_in_range_rows(self, data_dir) -> None:
+        (data_dir / "raw_data.csv").write_text(
+            "timestamp,state,score\n"
+            "2026-06-21T22:00:00,happy,0.9\n"
+            "2026-06-21T22:00:01,happy,0.9\n"
+            "2026-06-21T22:00:02,sad,0.5\n"
+            "2026-06-20T10:00:00,happy,0.9\n"  # before range
+            "2026-06-30T10:00:00,happy,0.9\n"  # after range
+        )
+        inst = _bare_app()
+        inst._stats_range_start = app.datetime(2026, 6, 21, 0, 0)
+        inst._stats_range_end = app.datetime(2026, 6, 22, 0, 0)
+        inst._recompute_range_stats()
+        assert inst._range_stats["happy"]["count"] == 1
+        assert inst._range_stats["happy"]["seconds"] == pytest.approx(
+            2 * app.UI_REFRESH_INTERVAL
+        )
+        assert inst._range_stats["sad"]["count"] == 1
+        assert inst._range_stats["sad"]["seconds"] == pytest.approx(
+            app.UI_REFRESH_INTERVAL
+        )
+
+    def test_recompute_includes_buffered_rows(self, data_dir) -> None:
+        inst = _bare_app()
+        inst._stats_range_start = app.datetime(2026, 6, 21, 0, 0)
+        inst._stats_range_end = app.datetime(2026, 6, 22, 0, 0)
+        inst._raw_buffer = [("2026-06-21T23:00:00.000", "happy", "0.9")]
+        inst._recompute_range_stats()
+        assert inst._range_stats["happy"]["count"] == 1
+
+    def test_live_accumulate_updates_range_stats(self, monkeypatch) -> None:
+        monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
+        inst = _bare_app()
+        inst._stats_range_start = app.datetime(2020, 1, 1)
+        inst._stats_range_end = None  # live window
+        inst._accumulate_stats("happy", 0.9)
+        assert inst._range_stats["happy"]["seconds"] == pytest.approx(
+            app.UI_REFRESH_INTERVAL
+        )
+        assert inst._range_stats["happy"]["count"] == 1
+
+    def test_fixed_end_range_ignores_live_samples(self, monkeypatch) -> None:
+        monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
+        inst = _bare_app()
+        inst._stats_range_start = app.datetime(2020, 1, 1)
+        inst._stats_range_end = app.datetime(2020, 1, 2)  # fixed, in the past
+        inst._accumulate_stats("happy", 0.9)
+        assert inst._range_stats["happy"]["seconds"] == pytest.approx(0.0)
+
+    def test_set_range_clamps_start_before_tracking_start(
+        self, data_dir, monkeypatch
+    ) -> None:
+        _patch_window(monkeypatch, clicked=1, text="2020-01-01 00:00 to now")
+        inst = _bare_app()
+        inst._stats_started_at = "2026-06-21T22:00:00"
+        inst.set_stats_range(None)
+        assert inst._stats_range_start == app.datetime(2026, 6, 21, 22, 0)
+        assert inst._stats_range_end is None
+
+    def test_set_range_clamps_end_to_now(self, data_dir, monkeypatch) -> None:
+        _patch_window(
+            monkeypatch, clicked=1, text="2026-06-21 22:00 to 2099-01-01 00:00"
+        )
+        inst = _bare_app()
+        inst.set_stats_range(None)
+        assert inst._stats_range_end is not None
+        assert inst._stats_range_end <= app.datetime.now()
+
+    def test_set_range_rejects_start_equal_end(
+        self, data_dir, monkeypatch
+    ) -> None:
+        _patch_window(
+            monkeypatch, clicked=1, text="2026-06-21 22:00 to 2026-06-21 22:00"
+        )
+        alerts = []
+        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: alerts.append(a))
+        inst = _bare_app()
+        before_start = inst._stats_range_start
+        before_end = inst._stats_range_end
+        inst.set_stats_range(None)
+        assert alerts  # user was warned
+        assert inst._stats_range_start == before_start  # unchanged
+        assert inst._stats_range_end == before_end
+
+    def test_set_range_rejects_start_after_end(
+        self, data_dir, monkeypatch
+    ) -> None:
+        _patch_window(
+            monkeypatch, clicked=1, text="2026-06-21 23:00 to 2026-06-21 22:00"
+        )
+        alerts = []
+        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: alerts.append(a))
+        inst = _bare_app()
+        before_start = inst._stats_range_start
+        inst.set_stats_range(None)
+        assert alerts  # user was warned
+        assert inst._stats_range_start == before_start  # unchanged
+
+    def test_set_range_rejects_start_after_now_with_live_end(
+        self, data_dir, monkeypatch
+    ) -> None:
+        # A live ("now") end must still reject a start that is after now.
+        _patch_window(monkeypatch, clicked=1, text="2099-01-01 00:00 to now")
+        alerts = []
+        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: alerts.append(a))
+        inst = _bare_app()
+        before_start = inst._stats_range_start
+        inst.set_stats_range(None)
+        assert alerts  # user was warned
+        assert inst._stats_range_start == before_start  # unchanged
+
+    def test_set_range_invalid_input_shows_alert(
+        self, data_dir, monkeypatch
+    ) -> None:
+        _patch_window(monkeypatch, clicked=1, text="garbage")
+        alerts = []
+        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: alerts.append(a))
+        inst = _bare_app()
+        before = inst._stats_range_start
+        inst.set_stats_range(None)
+        assert alerts  # user was warned
+        assert inst._stats_range_start == before  # unchanged
+
+    def test_set_range_cancel_keeps_range(self, data_dir, monkeypatch) -> None:
+        _patch_window(
+            monkeypatch, clicked=0, text="2026-06-21 23:00 to now"
+        )
+        inst = _bare_app()
+        before = inst._stats_range_start
+        inst.set_stats_range(None)
+        assert inst._stats_range_start == before
+
+    def test_toggle_live_24h_on_pins_window_and_locks_range(
+        self, data_dir, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda *a, **k: None)
+        inst = _bare_app()
+        inst._stats_started_at = "2020-01-01T00:00:00"
+        inst._stats_range_end = app.datetime(2021, 1, 1)
+        assert inst._stats_live_24h is False
+        inst.toggle_live_24h(inst._stats_live_item)
+        assert inst._stats_live_24h is True
+        assert inst._stats_live_item.state == 1
+        # Window pinned to the live last 24 hours.
+        assert inst._stats_range_end is None
+        expected = app.datetime.now() - app.timedelta(hours=24)
+        assert abs((inst._stats_range_start - expected).total_seconds()) < 5
+        # Manual Range control is locked (no callback).
+        assert inst._stats_range_item.callback is None
+
+    def test_toggle_live_24h_off_unlocks_range(
+        self, data_dir, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda *a, **k: None)
+        inst = _bare_app()
+        inst._stats_live_24h = True
+        inst.toggle_live_24h(inst._stats_live_item)
+        assert inst._stats_live_24h is False
+        assert inst._stats_live_item.state == 0
+        # Manual Range control is editable again.
+        assert inst._stats_range_item.callback is not None
+
+    def test_set_range_ignored_while_live(self, data_dir, monkeypatch) -> None:
+        _patch_window(monkeypatch, clicked=1, text="2026-06-21 22:00 to now")
+        inst = _bare_app()
+        inst._stats_live_24h = True
+        before = inst._stats_range_start
+        inst.set_stats_range(None)
+        assert inst._stats_range_start == before  # unchanged while locked
 
 
 class TestExportCsv:
@@ -965,7 +1217,7 @@ class TestMooditoAppInit:
     def test_builds_menu_and_records_start_time(self, full_app) -> None:
         assert full_app._stats_started_at is not None
         assert full_app._raw_buffer == []
-        assert "Download Raw Data (CSV)" in full_app._stats_export_item.title
+        assert "Download (csv)" in full_app._stats_export_item.title
         assert set(full_app._stats_items) == set(app.STAT_KEYS)
 
     def test_restores_display_settings(self, data_dir, monkeypatch) -> None:
