@@ -1580,6 +1580,357 @@ class TestSensitivity:
         assert inst._sensitivity["sad"] == app.DEFAULT_SENSITIVITY
 
 
+class TestAIProvider:
+    def test_defaults_to_default_provider_with_no_values(self, full_app) -> None:
+        assert full_app._ai_provider["provider"] == app.DEFAULT_AI_PROVIDER
+        assert full_app._ai_provider["providers"] == {}
+
+    def test_menu_item_is_a_single_window_opener(self, full_app) -> None:
+        assert full_app._ai_provider_menu.title.startswith("AI Provider")
+
+    def test_apply_provider_persists_only_relevant_fields(
+        self, full_app, monkeypatch
+    ) -> None:
+        saved = []
+        monkeypatch.setattr(app, "save_settings", lambda s: saved.append(s))
+        full_app._apply_ai_provider(
+            "Anthropic", {"api_key": "sk-123", "model": "claude", "url": "ignored"}
+        )
+        assert full_app._ai_provider["provider"] == "Anthropic"
+        stored = full_app._ai_provider["providers"]["Anthropic"]
+        assert stored == {"api_key": "sk-123", "model": "claude"}
+        assert "url" not in stored  # Anthropic has no URL field
+        assert saved and saved[-1]["ai_provider"]["provider"] == "Anthropic"
+
+    def test_apply_provider_trims_whitespace(self, full_app, monkeypatch) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda s: None)
+        full_app._apply_ai_provider(
+            "Ollama", {"url": "  http://localhost:11434  ", "model": " llama3 "}
+        )
+        stored = full_app._ai_provider["providers"]["Ollama"]
+        assert stored == {"url": "http://localhost:11434", "model": "llama3"}
+
+    def test_apply_provider_ignores_unknown_provider(
+        self, full_app, monkeypatch
+    ) -> None:
+        saved = []
+        monkeypatch.setattr(app, "save_settings", lambda s: saved.append(s))
+        before = dict(full_app._ai_provider)
+        full_app._apply_ai_provider("Nope", {"api_key": "x"})
+        assert full_app._ai_provider == before
+        assert saved == []
+
+    def test_apply_provider_keeps_each_provider_config(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda s: None)
+        full_app._apply_ai_provider("OpenAI", {"api_key": "sk-a", "model": "gpt"})
+        full_app._apply_ai_provider(
+            "OpenAI Compatible",
+            {"url": "https://x", "api_key": "sk-b", "model": "m"},
+        )
+        # The earlier OpenAI config is still preserved.
+        assert full_app._ai_provider["providers"]["OpenAI"]["api_key"] == "sk-a"
+        assert full_app._ai_provider["provider"] == "OpenAI Compatible"
+
+    def test_provider_values_returns_stored_fields(self, full_app, monkeypatch) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda s: None)
+        full_app._apply_ai_provider("Gemini", {"api_key": "g-key", "model": "pro"})
+        assert full_app._ai_provider_values("Gemini") == {
+            "api_key": "g-key",
+            "model": "pro",
+        }
+
+    def test_provider_values_empty_when_unset(self, full_app) -> None:
+        assert full_app._ai_provider_values("OpenAI") == {
+            "api_key": "",
+            "model": "",
+        }
+
+    def test_load_provider_restores_valid_config(
+        self, data_dir, monkeypatch
+    ) -> None:
+        app.save_settings(
+            {
+                "ai_provider": {
+                    "provider": "Ollama",
+                    "providers": {
+                        "Ollama": {"url": "http://host", "model": "llama"},
+                        "Bogus": {"x": 1},  # unknown provider, dropped
+                    },
+                }
+            }
+        )
+        monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+        inst = app.MooditoApp()
+        assert inst._ai_provider["provider"] == "Ollama"
+        assert inst._ai_provider["providers"]["Ollama"] == {
+            "url": "http://host",
+            "model": "llama",
+        }
+        assert "Bogus" not in inst._ai_provider["providers"]
+
+    def test_load_provider_ignores_invalid_selection(
+        self, data_dir, monkeypatch
+    ) -> None:
+        app.save_settings({"ai_provider": {"provider": "Nope"}})
+        monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+        inst = app.MooditoApp()
+        assert inst._ai_provider["provider"] == app.DEFAULT_AI_PROVIDER
+
+    def test_build_provider_accessory_lists_all_providers(self, full_app) -> None:
+        _view, popup = full_app._build_ai_provider_accessory()
+        assert popup.numberOfItems() == len(app.AI_PROVIDERS)
+        # The pop-up starts on the currently selected provider.
+        assert popup.indexOfSelectedItem() == app.AI_PROVIDERS.index(
+            full_app._ai_provider["provider"]
+        )
+
+    def test_build_fields_accessory_has_provider_fields(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda s: None)
+        full_app._apply_ai_provider(
+            "OpenAI Compatible",
+            {"url": "https://x", "api_key": "sk", "model": "m"},
+        )
+        _view, fields = full_app._build_ai_fields_accessory("OpenAI Compatible")
+        assert set(fields) == set(app.AI_PROVIDER_FIELDS["OpenAI Compatible"])
+        # Fields start pre-filled with their stored values.
+        assert str(fields["url"].stringValue()) == "https://x"
+        assert str(fields["model"].stringValue()) == "m"
+
+
+class TestLLMConfigError:
+    def test_unknown_provider(self) -> None:
+        assert app.ai_provider_config_error("Nope", {}) == "unknown AI provider"
+
+    def test_missing_api_key(self) -> None:
+        assert (
+            app.ai_provider_config_error("OpenAI", {"model": "gpt"})
+            == "no API key configured"
+        )
+
+    def test_missing_url_for_compatible(self) -> None:
+        assert (
+            app.ai_provider_config_error(
+                "OpenAI Compatible", {"api_key": "k", "model": "m"}
+            )
+            == "no URL configured"
+        )
+
+    def test_missing_model(self) -> None:
+        assert (
+            app.ai_provider_config_error("Anthropic", {"api_key": "k"})
+            == "no model configured"
+        )
+
+    def test_ollama_needs_no_api_key(self) -> None:
+        assert app.ai_provider_config_error(
+            "Ollama", {"url": "http://h", "model": "m"}
+        ) == ""
+
+    def test_complete_config_is_valid(self) -> None:
+        assert app.ai_provider_config_error(
+            "OpenAI", {"api_key": "k", "model": "m"}
+        ) == ""
+
+
+class TestLLMHelpers:
+    def test_openai_chat_url_appends_path(self) -> None:
+        assert app._openai_chat_url("https://x/v1") == "https://x/v1/chat/completions"
+        assert app._openai_chat_url("https://x/v1/") == "https://x/v1/chat/completions"
+
+    def test_openai_chat_url_keeps_full_path(self) -> None:
+        url = "https://x/v1/chat/completions"
+        assert app._openai_chat_url(url) == url
+
+    def test_ollama_chat_url_appends_path(self) -> None:
+        assert app._ollama_chat_url("http://h:11434") == "http://h:11434/api/chat"
+        assert app._ollama_chat_url("http://h:11434/") == "http://h:11434/api/chat"
+
+    def test_error_detail_from_dict(self) -> None:
+        assert app._llm_error_detail({"error": {"message": "boom"}}) == "boom"
+
+    def test_error_detail_from_string(self) -> None:
+        assert app._llm_error_detail({"error": "nope"}) == "nope"
+
+    def test_error_detail_missing(self) -> None:
+        assert app._llm_error_detail({}) == ""
+
+    def test_llm_text_extracts_and_strips(self) -> None:
+        data = {"choices": [{"message": {"content": "  hi  "}}]}
+        assert app._llm_text(data, lambda d: d["choices"][0]["message"]["content"]) == "hi"
+
+    def test_llm_text_rejects_bad_shape(self) -> None:
+        with pytest.raises(ValueError):
+            app._llm_text({}, lambda d: d["choices"][0]["message"]["content"])
+
+    def test_llm_text_rejects_empty(self) -> None:
+        with pytest.raises(ValueError):
+            app._llm_text({"t": "   "}, lambda d: d["t"])
+
+    def test_build_mood_tip_prompt_mentions_emotion(self) -> None:
+        prompt = app.build_mood_tip_prompt("happy")
+        assert "happy" in prompt
+
+    def test_build_mood_tip_prompt_defaults_to_neutral(self) -> None:
+        assert "neutral" in app.build_mood_tip_prompt("")
+
+
+class TestCallLLM:
+    @staticmethod
+    def _capture(monkeypatch, response):
+        calls = {}
+
+        def fake_post(url, payload, headers=None):
+            calls["url"] = url
+            calls["payload"] = payload
+            calls["headers"] = headers or {}
+            return response
+
+        monkeypatch.setattr(app, "_llm_post_json", fake_post)
+        return calls
+
+    def test_anthropic_request_and_reply(self, monkeypatch) -> None:
+        calls = self._capture(monkeypatch, {"content": [{"text": "be kind"}]})
+        out = app.call_llm("Anthropic", {"api_key": "k", "model": "claude"}, "hi")
+        assert out == "be kind"
+        assert calls["url"] == app.ANTHROPIC_API_URL
+        assert calls["headers"]["x-api-key"] == "k"
+        assert calls["headers"]["anthropic-version"] == app.ANTHROPIC_VERSION
+        assert calls["payload"]["model"] == "claude"
+
+    def test_openai_request_and_reply(self, monkeypatch) -> None:
+        calls = self._capture(
+            monkeypatch, {"choices": [{"message": {"content": "smile"}}]}
+        )
+        out = app.call_llm("OpenAI", {"api_key": "k", "model": "gpt"}, "hi")
+        assert out == "smile"
+        assert calls["url"] == app.OPENAI_API_URL
+        assert calls["headers"]["Authorization"] == "Bearer k"
+
+    def test_openai_compatible_uses_custom_url(self, monkeypatch) -> None:
+        calls = self._capture(
+            monkeypatch, {"choices": [{"message": {"content": "ok"}}]}
+        )
+        app.call_llm(
+            "OpenAI Compatible",
+            {"url": "https://host/v1", "api_key": "k", "model": "m"},
+            "hi",
+        )
+        assert calls["url"] == "https://host/v1/chat/completions"
+
+    def test_openai_falls_back_to_max_completion_tokens(self, monkeypatch) -> None:
+        attempts = []
+
+        def fake_post(url, payload, headers=None):
+            token_param = "max_tokens" if "max_tokens" in payload else (
+                "max_completion_tokens"
+            )
+            attempts.append(token_param)
+            if token_param == "max_tokens":
+                raise ValueError(
+                    "Unsupported parameter: 'max_tokens' is not supported with this "
+                    "model. Use 'max_completion_tokens' instead"
+                )
+            return {"choices": [{"message": {"content": "done"}}]}
+
+        monkeypatch.setattr(app, "_llm_post_json", fake_post)
+        out = app.call_llm("OpenAI", {"api_key": "k", "model": "gpt-5"}, "hi")
+        assert out == "done"
+        assert attempts == ["max_tokens", "max_completion_tokens"]
+
+    def test_openai_other_errors_are_not_retried(self, monkeypatch) -> None:
+        attempts = []
+
+        def fake_post(url, payload, headers=None):
+            attempts.append(payload)
+            raise ValueError("invalid api key")
+
+        monkeypatch.setattr(app, "_llm_post_json", fake_post)
+        with pytest.raises(ValueError, match="invalid api key"):
+            app.call_llm("OpenAI", {"api_key": "k", "model": "gpt"}, "hi")
+        assert len(attempts) == 1  # no retry on unrelated errors
+
+    def test_gemini_request_and_reply(self, monkeypatch) -> None:
+        calls = self._capture(
+            monkeypatch,
+            {"candidates": [{"content": {"parts": [{"text": "breathe"}]}}]},
+        )
+        out = app.call_llm("Gemini", {"api_key": "k", "model": "pro"}, "hi")
+        assert out == "breathe"
+        assert "models/pro:generateContent" in calls["url"]
+        assert "key=k" in calls["url"]
+
+    def test_ollama_request_and_reply(self, monkeypatch) -> None:
+        calls = self._capture(monkeypatch, {"message": {"content": "rest"}})
+        out = app.call_llm(
+            "Ollama", {"url": "http://h:11434", "model": "llama"}, "hi"
+        )
+        assert out == "rest"
+        assert calls["url"] == "http://h:11434/api/chat"
+
+    def test_incomplete_config_raises(self, monkeypatch) -> None:
+        self._capture(monkeypatch, {})
+        with pytest.raises(ValueError):
+            app.call_llm("OpenAI", {"model": "gpt"}, "hi")
+
+
+class TestMoodTip:
+    def test_unconfigured_shows_alert_and_stays_idle(
+        self, full_app, monkeypatch
+    ) -> None:
+        alerts = []
+        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: alerts.append(a))
+        full_app.mood_tip(None)
+        assert alerts  # told the user to configure a provider
+        assert not full_app._llm_busy.is_set()
+
+    def test_busy_guard_blocks_second_call(self, full_app, monkeypatch) -> None:
+        started = []
+        monkeypatch.setattr(
+            app.threading, "Thread", lambda *a, **k: started.append(k)
+        )
+        full_app._llm_busy.set()
+        full_app.mood_tip(None)
+        assert started == []  # no new thread while busy
+
+    def test_success_stages_tip_and_consume_shows_it(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda s: None)
+        full_app._apply_ai_provider("OpenAI", {"api_key": "k", "model": "gpt"})
+        monkeypatch.setattr(app, "call_llm", lambda *a, **k: "you've got this")
+        _patch_sync_threads(monkeypatch)
+        full_app.mood_tip(None)
+        assert not full_app._llm_busy.is_set()
+        with full_app._llm_lock:
+            assert full_app._llm_alert == "you've got this"
+        # The UI thread picks it up on the next refresh tick.
+        alerts = []
+        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: alerts.append(a))
+        full_app._consume_llm_updates()
+        assert alerts and alerts[0][1] == "you've got this"
+        assert full_app._mood_tip_menu.title == "Mood Tip…"
+
+    def test_error_is_staged_as_message(self, full_app, monkeypatch) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda s: None)
+        full_app._apply_ai_provider("OpenAI", {"api_key": "k", "model": "gpt"})
+
+        def boom(*a, **k):
+            raise OSError("offline")
+
+        monkeypatch.setattr(app, "call_llm", boom)
+        _patch_sync_threads(monkeypatch)
+        full_app.mood_tip(None)
+        with full_app._llm_lock:
+            assert "Could not get a mood tip" in full_app._llm_alert
+            assert "offline" in full_app._llm_alert
+
+
 class TestGrantCamera:
     def test_unavailable_shows_alert(self, full_app, monkeypatch) -> None:
         monkeypatch.setattr(app, "camera_authorization_status", lambda: None)

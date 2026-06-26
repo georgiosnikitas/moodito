@@ -86,6 +86,40 @@ STAT_EMOJI = {**EMOTION_EMOJI, "paused": "⏸️", "error": "⚠️"}
 # Title shown on the statistics datetime-range prompt and its error alerts.
 STATS_RANGE_TITLE = "Datetime Range"
 
+# AI providers offered in the "AI Provider" dialog, in display order.
+AI_PROVIDERS = ("Anthropic", "Gemini", "OpenAI", "OpenAI Compatible", "Ollama")
+# Provider selected by default until the user picks one.
+DEFAULT_AI_PROVIDER = "Anthropic"
+# Credential fields each provider requires, in the order they are shown.
+AI_PROVIDER_FIELDS = {
+    "Anthropic": ("api_key", "model"),
+    "Gemini": ("api_key", "model"),
+    "OpenAI": ("api_key", "model"),
+    "OpenAI Compatible": ("url", "api_key", "model"),
+    "Ollama": ("url", "model"),
+}
+# Human-readable label for each credential field key.
+AI_FIELD_LABELS = {"url": "URL", "api_key": "API Key", "model": "Model"}
+# Placeholder text shown in each empty credential field.
+AI_FIELD_PLACEHOLDERS = {
+    "url": "https://…",
+    "api_key": "Your API key",
+    "model": "Model name",
+}
+# Network timeout (seconds) for LLM API calls.
+LLM_API_TIMEOUT = 30
+# Upper bound on tokens requested from the LLM (keeps replies short + cheap).
+LLM_MAX_TOKENS = 300
+# Anthropic Messages API endpoint + required version header.
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+# OpenAI chat-completions endpoint (also the shape used by compatible servers).
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+# Google Gemini generateContent base (model + API key are appended per request).
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+# Title shown on every Mood Tip alert dialog.
+MOOD_TIP_TITLE = "Moodito Mood Tip"
+
 # How often (seconds) the menu bar title is refreshed from the latest result.
 UI_REFRESH_INTERVAL = 0.3
 # Target webcam sampling rate (seconds between processed frames).
@@ -255,6 +289,172 @@ def deactivate_license(key: str, instance_id: str) -> tuple[bool, str]:
     if data.get("deactivated"):
         return True, "deactivated"
     return False, str(data.get("error") or "deactivation failed")
+
+
+def ai_provider_config_error(provider: str, config: dict) -> str:
+    """Return a human-readable reason if ``config`` is incomplete, else ``""``.
+
+    Validates that the provider is known and that every credential field it
+    requires (per ``AI_PROVIDER_FIELDS``) is filled in.
+    """
+    if provider not in AI_PROVIDERS:
+        return "unknown AI provider"
+    fields = AI_PROVIDER_FIELDS[provider]
+    if "api_key" in fields and not str(config.get("api_key", "")).strip():
+        return "no API key configured"
+    if "url" in fields and not str(config.get("url", "")).strip():
+        return "no URL configured"
+    if "model" in fields and not str(config.get("model", "")).strip():
+        return "no model configured"
+    return ""
+
+
+def _llm_error_detail(data: dict) -> str:
+    """Pull a human-readable message out of an error response body."""
+    if not isinstance(data, dict):
+        return ""
+    err = data.get("error")
+    if isinstance(err, dict):
+        return str(err.get("message") or "")
+    if isinstance(err, str):
+        return err
+    return ""
+
+
+def _llm_post_json(url: str, payload: dict, headers: dict | None = None) -> dict:
+    """POST ``payload`` as JSON and return the parsed JSON response.
+
+    Raises ``ValueError`` on an HTTP error response (with the provider's error
+    message when available); network failures surface as ``OSError``.
+    """
+    body = json.dumps(payload).encode("utf-8")
+    request_headers = {"Content-Type": "application/json"}
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(
+        url, data=body, method="POST", headers=request_headers
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=LLM_API_TIMEOUT) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = _llm_error_detail(json.load(exc))
+        except ValueError:
+            detail = ""
+        raise ValueError(detail or f"HTTP error {exc.code}") from exc
+
+
+def _llm_text(data: dict, getter) -> str:
+    """Extract the reply text from ``data`` via ``getter``, validating it."""
+    try:
+        text = getter(data)
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError("unexpected response from provider") from exc
+    text = str(text).strip()
+    if not text:
+        raise ValueError("provider returned an empty response")
+    return text
+
+
+def _openai_chat_url(base: str) -> str:
+    """Return the chat-completions endpoint for an OpenAI-compatible base URL."""
+    base = base.rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base
+    return f"{base}/chat/completions"
+
+
+def _ollama_chat_url(base: str) -> str:
+    """Return the /api/chat endpoint for an Ollama server base URL."""
+    base = base.rstrip("/")
+    if base.endswith("/api/chat"):
+        return base
+    return f"{base}/api/chat"
+
+
+def call_llm(provider: str, config: dict, prompt: str) -> str:
+    """Send ``prompt`` to the configured provider and return its text reply.
+
+    ``config`` is the per-provider field dict (url/api_key/model). Raises
+    ``ValueError`` on misconfiguration or an error/unknown response, and
+    ``OSError`` on a network failure.
+    """
+    error = ai_provider_config_error(provider, config)
+    if error:
+        raise ValueError(error)
+    api_key = str(config.get("api_key", "")).strip()
+    model = str(config.get("model", "")).strip()
+    url = str(config.get("url", "")).strip()
+
+    if provider == "Anthropic":
+        data = _llm_post_json(
+            ANTHROPIC_API_URL,
+            {
+                "model": model,
+                "max_tokens": LLM_MAX_TOKENS,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            {"x-api-key": api_key, "anthropic-version": ANTHROPIC_VERSION},
+        )
+        return _llm_text(data, lambda d: d["content"][0]["text"])
+
+    if provider == "Gemini":
+        endpoint = (
+            f"{GEMINI_API_BASE}/{urllib.parse.quote(model)}:generateContent"
+            f"?key={urllib.parse.quote(api_key)}"
+        )
+        data = _llm_post_json(endpoint, {"contents": [{"parts": [{"text": prompt}]}]})
+        return _llm_text(
+            data, lambda d: d["candidates"][0]["content"]["parts"][0]["text"]
+        )
+
+    if provider == "Ollama":
+        data = _llm_post_json(
+            _ollama_chat_url(url),
+            {
+                "model": model,
+                "stream": False,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+        return _llm_text(data, lambda d: d["message"]["content"])
+
+    # OpenAI and OpenAI Compatible share the chat-completions API. Newer OpenAI
+    # models reject "max_tokens" and require "max_completion_tokens"; fall back
+    # to that automatically when the server reports it.
+    endpoint = OPENAI_API_URL if provider == "OpenAI" else _openai_chat_url(url)
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    def _openai_request(token_param: str) -> dict:
+        return _llm_post_json(
+            endpoint,
+            {
+                "model": model,
+                token_param: LLM_MAX_TOKENS,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            headers,
+        )
+
+    try:
+        data = _openai_request("max_tokens")
+    except ValueError as exc:
+        if "max_completion_tokens" not in str(exc):
+            raise
+        data = _openai_request("max_completion_tokens")
+    return _llm_text(data, lambda d: d["choices"][0]["message"]["content"])
+
+
+def build_mood_tip_prompt(emotion: str) -> str:
+    """Build the prompt asking the LLM for a short tip for ``emotion``."""
+    emotion = (emotion or "neutral").strip() or "neutral"
+    return (
+        "You are Moodito, a friendly menu-bar companion that reads a person's "
+        f"facial expression. Their expression currently reads as '{emotion}'. "
+        "In one or two short, warm sentences, offer a gentle, uplifting tip "
+        "suited to feeling this way. Reply in plain text without markdown."
+    )
 
 
 def load_stats() -> tuple[dict, str | None]:
@@ -742,6 +942,15 @@ class MooditoApp(rumps.App):
         # with the worker thread that runs inference.
         self._sensitivity = self._load_sensitivity()
         self._worker.sensitivity = self._sensitivity
+        # AI provider configuration (selected service + its credentials),
+        # restored from settings.
+        self._ai_provider = self._load_ai_provider()
+        # Mood Tip runs the LLM network call off the main thread; results are
+        # staged here and shown by refresh() on the UI thread (like licensing).
+        self._llm_busy = threading.Event()
+        self._llm_lock = threading.Lock()
+        self._llm_alert: str | None = None
+        self._llm_dirty = threading.Event()
         # The statistics range always starts pinned to the live, sliding
         # last-24-hours window (the manual range is not persisted across runs).
         self._stats_live_24h = True
@@ -903,6 +1112,14 @@ class MooditoApp(rumps.App):
         self._sensitivity_menu = rumps.MenuItem(
             "Sensitivity…", callback=self.open_sensitivity_window
         )
+        # AI provider is configured in a native NSAlert dialog (built each time
+        # it is opened) — see open_ai_provider_window.
+        self._ai_provider_menu = rumps.MenuItem(
+            "AI Provider…", callback=self.open_ai_provider_window
+        )
+        # Mood Tip asks the configured AI provider for a quick wellbeing tip
+        # based on the current emotion (network call runs off the main thread).
+        self._mood_tip_menu = rumps.MenuItem("Mood Tip…", callback=self.mood_tip)
 
         self.menu = [
             rumps.MenuItem("Detected: …", callback=None),
@@ -918,6 +1135,8 @@ class MooditoApp(rumps.App):
             rumps.MenuItem("Show Labels", callback=self.toggle_labels),
             rumps.MenuItem("Camera Grant Access", callback=self.grant_camera),
             self._sensitivity_menu,
+            self._ai_provider_menu,
+            self._mood_tip_menu,
             rumps.MenuItem("Pause", callback=self.toggle_pause),
             None,
             self._license_menu,
@@ -952,6 +1171,8 @@ class MooditoApp(rumps.App):
         set_symbol_icon(self._labels_item, "textformat")
         set_symbol_icon(self._camera_item, "camera")
         set_symbol_icon(self._sensitivity_menu, "slider.horizontal.3")
+        set_symbol_icon(self._ai_provider_menu, "sparkles")
+        set_symbol_icon(self._mood_tip_menu, "text.bubble")
         set_symbol_icon(self._pause_item, "pause.fill")
         set_symbol_icon(self._bmc_menu, "cup.and.saucer.fill")
         set_symbol_icon(self._bmc_open_item, "globe")
@@ -1018,6 +1239,9 @@ class MooditoApp(rumps.App):
 
         # Apply any license state change made by a background license thread.
         self._consume_license_updates()
+
+        # Show any Mood Tip result produced by a background LLM thread.
+        self._consume_llm_updates()
 
         if self._paused:
             self._accumulate_stats("paused")
@@ -1453,6 +1677,238 @@ class MooditoApp(rumps.App):
             controls[emotion] = segmented
 
         return view, controls
+
+    def _load_ai_provider(self) -> dict:
+        """Return the AI provider config, restored from settings.
+
+        Shape: ``{"provider": <name>, "providers": {<name>: {<field>: str}}}``.
+        Unknown providers/fields are dropped so a stale or hand-edited settings
+        file can never break the dialog.
+        """
+        stored = self._settings.get("ai_provider")
+        config: dict = {"provider": DEFAULT_AI_PROVIDER, "providers": {}}
+        if isinstance(stored, dict):
+            provider = stored.get("provider")
+            if provider in AI_PROVIDERS:
+                config["provider"] = provider
+            providers = stored.get("providers")
+            if isinstance(providers, dict):
+                for name in AI_PROVIDERS:
+                    values = providers.get(name)
+                    if isinstance(values, dict):
+                        config["providers"][name] = {
+                            key: str(values.get(key, ""))
+                            for key in AI_PROVIDER_FIELDS[name]
+                        }
+        return config
+
+    def _ai_provider_values(self, provider: str) -> dict[str, str]:
+        """Return the stored field values for ``provider`` (empty if none)."""
+        stored = self._ai_provider.get("providers", {}).get(provider, {})
+        return {key: str(stored.get(key, "")) for key in AI_PROVIDER_FIELDS.get(provider, ())}
+
+    def _apply_ai_provider(self, provider: str, values: dict[str, str]) -> None:
+        """Record the selected provider and its credentials, then persist them.
+
+        Validates the provider so callers can never store a bogus value; only
+        the fields that apply to the provider are kept.
+        """
+        if provider not in AI_PROVIDERS:
+            return
+        cleaned = {
+            key: str(values.get(key, "")).strip() for key in AI_PROVIDER_FIELDS[provider]
+        }
+        self._ai_provider["provider"] = provider
+        self._ai_provider.setdefault("providers", {})[provider] = cleaned
+        self._settings["ai_provider"] = self._ai_provider
+        save_settings(self._settings)
+
+    def open_ai_provider_window(self, _sender) -> None:
+        """Show the AI Provider dialog (a native NSAlert, like Sensitivity).
+
+        The user first picks a provider; clicking Continue opens a second dialog
+        with exactly the credential fields that provider needs. Cancel discards.
+        """
+        try:
+            from AppKit import NSAlert, NSAlertFirstButtonReturn, NSApp, NSImage
+
+            view, popup = self._build_ai_provider_accessory()
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("AI Provider")
+            alert.setInformativeText_("Choose which AI service Moodito should use.")
+            alert.addButtonWithTitle_("Continue")
+            alert.addButtonWithTitle_("Cancel")
+            icon = NSImage.alloc().initByReferencingFile_(resource_path(MENUBAR_ICON))
+            if icon is not None and icon.isValid():
+                alert.setIcon_(icon)
+            alert.setAccessoryView_(view)
+            NSApp.activateIgnoringOtherApps_(True)
+            if alert.runModal() == NSAlertFirstButtonReturn:
+                index = int(popup.indexOfSelectedItem())
+                if 0 <= index < len(AI_PROVIDERS):
+                    self._open_ai_provider_fields(AI_PROVIDERS[index])
+        except Exception:  # noqa: BLE001 - never let a UI glitch crash the menu
+            pass
+
+    def _open_ai_provider_fields(self, provider: str) -> None:
+        """Show the credential dialog for ``provider`` and commit on Apply."""
+        try:
+            from AppKit import NSAlert, NSAlertFirstButtonReturn, NSApp, NSImage
+
+            view, fields = self._build_ai_fields_accessory(provider)
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_(f"{provider} Settings")
+            alert.setInformativeText_("Enter the details for this provider.")
+            alert.addButtonWithTitle_("Apply")
+            alert.addButtonWithTitle_("Cancel")
+            icon = NSImage.alloc().initByReferencingFile_(resource_path(MENUBAR_ICON))
+            if icon is not None and icon.isValid():
+                alert.setIcon_(icon)
+            alert.setAccessoryView_(view)
+            NSApp.activateIgnoringOtherApps_(True)
+            if alert.runModal() == NSAlertFirstButtonReturn:
+                values = {key: str(field.stringValue()) for key, field in fields.items()}
+                self._apply_ai_provider(provider, values)
+        except Exception:  # noqa: BLE001 - never let a UI glitch crash the menu
+            pass
+
+    def _build_ai_provider_accessory(self):
+        """Build the provider-selection accessory view: a labelled pop-up.
+
+        Returns ``(view, NSPopUpButton)``; the pop-up starts on the currently
+        selected provider.
+        """
+        from AppKit import NSFont, NSPopUpButton, NSTextField, NSView
+        from Foundation import NSMakeRect
+
+        label_w = 80.0
+        gap = 10.0
+        control_w = 200.0
+        width = label_w + gap + control_w
+        height = 32.0
+
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, width, height))
+        label = NSTextField.alloc().initWithFrame_(NSMakeRect(0.0, 5.0, label_w, 22.0))
+        label.setStringValue_("Provider")
+        label.setBezeled_(False)
+        label.setDrawsBackground_(False)
+        label.setEditable_(False)
+        label.setSelectable_(False)
+        label.setFont_(NSFont.systemFontOfSize_(13.0))
+        view.addSubview_(label)
+
+        popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(label_w + gap, 3.0, control_w, 26.0), False
+        )
+        for name in AI_PROVIDERS:
+            popup.addItemWithTitle_(name)
+        current = self._ai_provider.get("provider", DEFAULT_AI_PROVIDER)
+        if current in AI_PROVIDERS:
+            popup.selectItemAtIndex_(AI_PROVIDERS.index(current))
+        view.addSubview_(popup)
+
+        return view, popup
+
+    def _build_ai_fields_accessory(self, provider: str):
+        """Build the credential accessory view for ``provider``.
+
+        Returns ``(view, {field_key: NSTextField})`` with one labelled text
+        field per credential the provider needs (the API key uses a secure
+        field). Each field starts pre-filled with its stored value.
+        """
+        from AppKit import (
+            NSFont,
+            NSSecureTextField,
+            NSTextField,
+            NSView,
+        )
+        from Foundation import NSMakeRect
+
+        keys = AI_PROVIDER_FIELDS.get(provider, ())
+        stored = self._ai_provider_values(provider)
+        label_w = 80.0
+        gap = 10.0
+        field_w = 260.0
+        row_h = 30.0
+        width = label_w + gap + field_w
+        height = max(len(keys), 1) * row_h
+
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, width, height))
+        fields: dict[str, object] = {}
+        for i, key in enumerate(keys):
+            row_y = height - (i + 1) * row_h
+            label = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(0.0, row_y + 4.0, label_w, 22.0)
+            )
+            label.setStringValue_(AI_FIELD_LABELS.get(key, key))
+            label.setBezeled_(False)
+            label.setDrawsBackground_(False)
+            label.setEditable_(False)
+            label.setSelectable_(False)
+            label.setFont_(NSFont.systemFontOfSize_(13.0))
+            view.addSubview_(label)
+
+            field_cls = NSSecureTextField if key == "api_key" else NSTextField
+            field = field_cls.alloc().initWithFrame_(
+                NSMakeRect(label_w + gap, row_y + 2.0, field_w, 24.0)
+            )
+            field.setStringValue_(stored.get(key, ""))
+            field.setPlaceholderString_(AI_FIELD_PLACEHOLDERS.get(key, ""))
+            view.addSubview_(field)
+            fields[key] = field
+
+        return view, fields
+
+    def mood_tip(self, _sender) -> None:
+        """Ask the configured AI provider for a quick tip for the current mood.
+
+        The network call runs on a background thread (it can take seconds);
+        the result is shown by refresh() via _consume_llm_updates.
+        """
+        if self._llm_busy.is_set():
+            return
+        provider = self._ai_provider.get("provider", DEFAULT_AI_PROVIDER)
+        config = self._ai_provider_values(provider)
+        error = ai_provider_config_error(provider, config)
+        if error:
+            rumps.alert(
+                MOOD_TIP_TITLE,
+                f"Please set up your AI provider first ({error}).\n"
+                "Use the “AI Provider…” menu to configure it.",
+            )
+            return
+        emotion = self._worker.result.label
+        self._llm_busy.set()
+        self._mood_tip_menu.title = "Mood Tip… (thinking)"
+        threading.Thread(
+            target=self._mood_tip_worker,
+            args=(provider, config, emotion),
+            daemon=True,
+        ).start()
+
+    def _mood_tip_worker(self, provider: str, config: dict, emotion: str) -> None:
+        """Background: call the LLM and stage the result for the UI thread."""
+        try:
+            tip = call_llm(provider, config, build_mood_tip_prompt(emotion))
+            message = tip
+        except (OSError, ValueError) as exc:
+            message = f"Could not get a mood tip:\n{exc}"
+        with self._llm_lock:
+            self._llm_alert = message
+        self._llm_busy.clear()
+        self._llm_dirty.set()
+
+    def _consume_llm_updates(self) -> None:
+        """Show any pending Mood Tip result on the main (UI) thread."""
+        if not self._llm_dirty.is_set():
+            return
+        self._llm_dirty.clear()
+        self._mood_tip_menu.title = "Mood Tip…"
+        with self._llm_lock:
+            alert = self._llm_alert
+            self._llm_alert = None
+        if alert:
+            rumps.alert(MOOD_TIP_TITLE, alert)
 
     def toggle_pause(self, _sender) -> None:
         self._paused = not self._paused
