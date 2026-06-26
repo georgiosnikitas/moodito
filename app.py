@@ -446,6 +446,22 @@ def call_llm(provider: str, config: dict, prompt: str) -> str:
     return _llm_text(data, lambda d: d["choices"][0]["message"]["content"])
 
 
+def test_ai_connection(provider: str, config: dict) -> tuple[bool, str]:
+    """Verify the provider config by making a tiny live request.
+
+    Returns ``(ok, message)``: on success ``ok`` is True with a friendly note;
+    on failure ``ok`` is False with the reason (config or network/API error).
+    """
+    error = ai_provider_config_error(provider, config)
+    if error:
+        return False, error
+    try:
+        call_llm(provider, config, "Reply with the single word: OK")
+    except (OSError, ValueError) as exc:
+        return False, str(exc)
+    return True, "Connection successful."
+
+
 def build_mood_tip_prompt(emotion: str) -> str:
     """Build the prompt asking the LLM for a short tip for ``emotion``."""
     emotion = (emotion or "neutral").strip() or "neutral"
@@ -455,6 +471,32 @@ def build_mood_tip_prompt(emotion: str) -> str:
         "In one or two short, warm sentences, offer a gentle, uplifting tip "
         "suited to feeling this way. Reply in plain text without markdown."
     )
+
+
+# Cached ObjC handler class for the in-dialog "Test" button (defined lazily so
+# AppKit is only imported when the GUI is actually used, and only registered
+# with the Objective-C runtime once).
+_AI_TEST_HANDLER_CLASS = None
+
+
+def _ai_test_handler_class():
+    """Return (creating once) the NSObject subclass backing the Test button."""
+    global _AI_TEST_HANDLER_CLASS
+    if _AI_TEST_HANDLER_CLASS is not None:
+        return _AI_TEST_HANDLER_CLASS
+    from AppKit import NSObject
+
+    class _AITestHandler(NSObject):
+        def runTest_(self, _sender) -> None:
+            try:
+                self.app._run_ai_connection_test(
+                    self.provider, self.fields, self.status
+                )
+            except Exception:  # noqa: BLE001 - never let a UI glitch crash
+                pass
+
+    _AI_TEST_HANDLER_CLASS = _AITestHandler
+    return _AITestHandler
 
 
 def load_stats() -> tuple[dict, str | None]:
@@ -1751,7 +1793,12 @@ class MooditoApp(rumps.App):
             pass
 
     def _open_ai_provider_fields(self, provider: str) -> None:
-        """Show the credential dialog for ``provider`` and commit on Apply."""
+        """Show the credential dialog for ``provider`` and commit on Apply.
+
+        The accessory view carries a "Connection" row with a Test button that
+        verifies the entered details in place; the dialog keeps the standard
+        Apply / Cancel buttons.
+        """
         try:
             from AppKit import NSAlert, NSAlertFirstButtonReturn, NSApp, NSImage
 
@@ -1771,6 +1818,17 @@ class MooditoApp(rumps.App):
                 self._apply_ai_provider(provider, values)
         except Exception:  # noqa: BLE001 - never let a UI glitch crash the menu
             pass
+
+    def _run_ai_connection_test(self, provider: str, fields: dict, status) -> None:
+        """Test the credentials currently typed in ``fields`` and show the result.
+
+        Updates the ``status`` label in the dialog in place (✅/❌ + message);
+        the full message is also set as its tooltip for long errors.
+        """
+        values = {key: str(field.stringValue()) for key, field in fields.items()}
+        ok, message = test_ai_connection(provider, values)
+        status.setStringValue_(("✅ " if ok else "❌ ") + message)
+        status.setToolTip_(message)
 
     def _build_ai_provider_accessory(self):
         """Build the provider-selection accessory view: a labelled pop-up.
@@ -1814,9 +1872,12 @@ class MooditoApp(rumps.App):
 
         Returns ``(view, {field_key: NSTextField})`` with one labelled text
         field per credential the provider needs (the API key uses a secure
-        field). Each field starts pre-filled with its stored value.
+        field), plus a "Connection" row holding a rectangular Test button and a
+        status label. Each field starts pre-filled with its stored value.
         """
         from AppKit import (
+            NSBezelStyleRounded,
+            NSButton,
             NSFont,
             NSSecureTextField,
             NSTextField,
@@ -1831,7 +1892,8 @@ class MooditoApp(rumps.App):
         field_w = 260.0
         row_h = 30.0
         width = label_w + gap + field_w
-        height = max(len(keys), 1) * row_h
+        # One row per field, plus a final row for the connection test.
+        height = (len(keys) + 1) * row_h
 
         view = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, width, height))
         fields: dict[str, object] = {}
@@ -1856,6 +1918,48 @@ class MooditoApp(rumps.App):
             field.setPlaceholderString_(AI_FIELD_PLACEHOLDERS.get(key, ""))
             view.addSubview_(field)
             fields[key] = field
+
+        # Connection row: "Connection" label + rectangular Test button + status.
+        conn_label = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(0.0, 4.0, label_w, 22.0)
+        )
+        conn_label.setStringValue_("Connection")
+        conn_label.setBezeled_(False)
+        conn_label.setDrawsBackground_(False)
+        conn_label.setEditable_(False)
+        conn_label.setSelectable_(False)
+        conn_label.setFont_(NSFont.systemFontOfSize_(13.0))
+        view.addSubview_(conn_label)
+
+        button_w = 70.0
+        button = NSButton.alloc().initWithFrame_(
+            NSMakeRect(label_w + gap, 1.0, button_w, 26.0)
+        )
+        button.setTitle_("Test")
+        button.setBezelStyle_(NSBezelStyleRounded)
+        view.addSubview_(button)
+
+        status = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(label_w + gap + button_w + 8.0, 4.0, field_w - button_w - 8.0, 22.0)
+        )
+        status.setStringValue_("")
+        status.setBezeled_(False)
+        status.setDrawsBackground_(False)
+        status.setEditable_(False)
+        status.setSelectable_(False)
+        status.setFont_(NSFont.systemFontOfSize_(12.0))
+        view.addSubview_(status)
+
+        # Wire the button to a retained ObjC handler that runs the test in place.
+        handler = _ai_test_handler_class().alloc().init()
+        handler.app = self
+        handler.provider = provider
+        handler.fields = fields
+        handler.status = status
+        button.setTarget_(handler)
+        button.setAction_("runTest:")
+        # Keep a strong reference so the handler outlives the modal dialog.
+        self._ai_test_handler = handler
 
         return view, fields
 

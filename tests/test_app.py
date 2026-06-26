@@ -1879,6 +1879,104 @@ class TestCallLLM:
             app.call_llm("OpenAI", {"model": "gpt"}, "hi")
 
 
+class _FakeTextField:
+    """Minimal NSTextField stand-in exposing stringValue()."""
+
+    def __init__(self, value: str = "") -> None:
+        self._value = value
+
+    def stringValue(self) -> str:
+        return self._value
+
+
+class _FakeStatusLabel:
+    """Minimal status-label stand-in recording set string/tooltip."""
+
+    def __init__(self) -> None:
+        self.value = ""
+        self.tooltip = ""
+
+    def setStringValue_(self, value: str) -> None:
+        self.value = value
+
+    def setToolTip_(self, value: str) -> None:
+        self.tooltip = value
+
+
+class TestAIConnectionTest:
+    def test_success(self, monkeypatch) -> None:
+        monkeypatch.setattr(app, "call_llm", lambda *a, **k: "OK")
+        ok, message = app.test_ai_connection(
+            "OpenAI", {"api_key": "k", "model": "gpt"}
+        )
+        assert ok is True
+        assert "success" in message.lower()
+
+    def test_incomplete_config_fails_without_network(self, monkeypatch) -> None:
+        called = []
+        monkeypatch.setattr(app, "call_llm", lambda *a, **k: called.append(a))
+        ok, message = app.test_ai_connection("OpenAI", {"model": "gpt"})
+        assert ok is False
+        assert message == "no API key configured"
+        assert called == []  # never attempted a request
+
+    def test_api_error_is_reported(self, monkeypatch) -> None:
+        def boom(*a, **k):
+            raise ValueError("invalid api key")
+
+        monkeypatch.setattr(app, "call_llm", boom)
+        ok, message = app.test_ai_connection(
+            "OpenAI", {"api_key": "bad", "model": "gpt"}
+        )
+        assert ok is False
+        assert "invalid api key" in message
+
+    def test_network_error_is_reported(self, monkeypatch) -> None:
+        def offline(*a, **k):
+            raise OSError("unreachable")
+
+        monkeypatch.setattr(app, "call_llm", offline)
+        ok, message = app.test_ai_connection(
+            "Ollama", {"url": "http://h", "model": "m"}
+        )
+        assert ok is False
+        assert "unreachable" in message
+
+    def test_run_connection_test_updates_status_on_success(
+        self, full_app, monkeypatch
+    ) -> None:
+        captured = {}
+
+        def fake_test(provider, values):
+            captured["provider"] = provider
+            captured["values"] = values
+            return True, "Connection successful."
+
+        monkeypatch.setattr(app, "test_ai_connection", fake_test)
+        status = _FakeStatusLabel()
+        fields = {"api_key": _FakeTextField("sk-1"), "model": _FakeTextField("gpt")}
+        full_app._run_ai_connection_test("OpenAI", fields, status)
+        assert status.value.startswith("✅")
+        assert "successful" in status.tooltip
+        # The currently typed field values are what gets tested.
+        assert captured["provider"] == "OpenAI"
+        assert captured["values"] == {"api_key": "sk-1", "model": "gpt"}
+
+    def test_run_connection_test_shows_error_status(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            app, "test_ai_connection", lambda *a, **k: (False, "invalid api key")
+        )
+        status = _FakeStatusLabel()
+        full_app._run_ai_connection_test(
+            "OpenAI", {"api_key": _FakeTextField("bad")}, status
+        )
+        assert status.value.startswith("❌")
+        assert "invalid api key" in status.value
+        assert status.tooltip == "invalid api key"
+
+
 class TestMoodTip:
     def test_unconfigured_shows_alert_and_stays_idle(
         self, full_app, monkeypatch
