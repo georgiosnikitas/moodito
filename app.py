@@ -433,6 +433,35 @@ def render_activity_sparkline(hourly: list[float], width: int = 24) -> str:
     return "".join(cells)
 
 
+# Emotion heatmap: per-emotion (rows) × hour-of-day (columns) usage intensity.
+# Cells shade from empty → light → solid based on duration within the hour.
+HEAT_SHADES = " ░▒▓█"  # 0 (empty) … 4 (solid)
+
+
+def render_emotion_heatmap(
+    heat: dict[str, list[float]], keys: list[str], width: int = 24
+) -> list[str]:
+    """Render an emotion×hour heatmap as one shaded row string per key.
+
+    Intensities are scaled to the busiest single cell across the whole map so
+    shades are comparable between emotions. Empty cells render as blanks.
+    """
+    peak = max((max(row, default=0.0) for row in heat.values()), default=0.0)
+    rows = []
+    for key in keys:
+        hours = heat.get(key, [])
+        cells = []
+        for i in range(width):
+            v = hours[i] if i < len(hours) else 0.0
+            if v <= 0 or peak <= 0:
+                cells.append(HEAT_SHADES[0])
+            else:
+                level = max(1, min(4, int(round(v / peak * 4))))
+                cells.append(HEAT_SHADES[level])
+        rows.append("".join(cells))
+    return rows
+
+
 def set_monospaced_title(item, text: str) -> None:
     """Set a menu item's title in a monospaced font so columns stay aligned.
 
@@ -470,6 +499,56 @@ def set_symbol_icon(item, symbol_name: str) -> None:
         if image is None:
             return
         image.setTemplate_(True)
+        item._menuitem.setImage_(image)
+    except Exception:  # noqa: BLE001 - optional AppKit dependency
+        pass
+
+
+# Cache of rendered emoji/symbol images so each is drawn only once.
+_EMOJI_IMAGE_CACHE: dict[str, object] = {}
+
+
+def set_emoji_icon(item, text: str, size: float = 14.0) -> None:
+    """Render a short string (emoji) to a small colour image used as the item's
+    icon, so it sits in the menu's image gutter and the title stays aligned.
+
+    Using the image gutter (instead of putting the emoji in the title text)
+    keeps every row's title at the same x regardless of emoji glyph width.
+    Best-effort: a no-op if AppKit is unavailable.
+    """
+    if not text:
+        return
+    try:
+        cached = _EMOJI_IMAGE_CACHE.get(text)
+        if cached is None:
+            from AppKit import NSFont, NSFontAttributeName, NSImage
+            from Foundation import NSAttributedString
+
+            font = NSFont.systemFontOfSize_(size)
+            attributed = NSAttributedString.alloc().initWithString_attributes_(
+                text, {NSFontAttributeName: font}
+            )
+            measured = attributed.size()
+            width = max(1.0, float(measured.width))
+            height = max(1.0, float(measured.height))
+            image = NSImage.alloc().initWithSize_((width, height))
+            image.lockFocus()
+            attributed.drawAtPoint_((0.0, 0.0))
+            image.unlockFocus()
+            _EMOJI_IMAGE_CACHE[text] = image
+            cached = image
+        item._menuitem.setImage_(cached)
+    except Exception:  # noqa: BLE001 - optional AppKit dependency
+        pass
+
+
+def set_spacer_icon(item, width: float = 19.0, height: float = 14.0) -> None:
+    """Give a menu item a transparent image so its title aligns in the image
+    gutter with rows that have a real emoji/symbol icon. Best-effort no-op."""
+    try:
+        from AppKit import NSImage
+
+        image = NSImage.alloc().initWithSize_((width, height))
         item._menuitem.setImage_(image)
     except Exception:  # noqa: BLE001 - optional AppKit dependency
         pass
@@ -630,9 +709,9 @@ class MooditoApp(rumps.App):
         legacy_icon_only = bool(self._settings.get("icon_only", False))
         self._show_emojis = bool(self._settings.get("show_emojis", not legacy_icon_only))
         self._show_labels = bool(self._settings.get("show_labels", not legacy_icon_only))
-        # When on, the statistics range is pinned to a live, sliding
-        # last-24-hours window and the manual Range control is locked.
-        self._stats_live_24h = bool(self._settings.get("stats_live_24h", True))
+        # The statistics range always starts pinned to the live, sliding
+        # last-24-hours window (the manual range is not persisted across runs).
+        self._stats_live_24h = True
         # Last (icon_path, title) applied to the menu bar; skips redundant
         # updates so the status item doesn't flicker every refresh tick.
         self._last_render: tuple[str | None, str | None] | None = None
@@ -658,6 +737,10 @@ class MooditoApp(rumps.App):
         self._range_last_state: str | None = None
         # App-usage seconds bucketed by hour of day (0–23) over the range.
         self._hourly_activity: list[float] = [0.0] * 24
+        # Per-emotion usage seconds bucketed by hour of day, over the range.
+        self._hourly_emotion: dict[str, list[float]] = {
+            key: [0.0] * 24 for key in STAT_KEYS
+        }
         self._set_default_range()
         # Persisted Lemon Squeezy license activation (if any).
         self._license = load_license()
@@ -674,7 +757,7 @@ class MooditoApp(rumps.App):
         self._license_dirty = threading.Event()
 
         # Build the live Statistics submenu (one row per tracked state).
-        self._stats_menu = rumps.MenuItem("Statistics")
+        self._stats_menu = rumps.MenuItem("Insights")
         # Non-clickable label showing when tracking began.
         self._stats_since_item = rumps.MenuItem("Since …", callback=None)
         self._stats_menu.add(self._stats_since_item)
@@ -703,11 +786,31 @@ class MooditoApp(rumps.App):
         self._stats_activity_axis_item = rumps.MenuItem("axis", callback=None)
         self._stats_menu.add(self._stats_activity_axis_item)
         self._stats_menu.add(None)
+        # Emotion heatmap: one row per emotion, columns are hours of day.
+        self._stats_heatmap_header_item = rumps.MenuItem(
+            "Heatmap", callback=None
+        )
+        self._stats_menu.add(self._stats_heatmap_header_item)
+        self._stats_heatmap_items: dict[str, rumps.MenuItem] = {}
+        for key in STAT_KEYS:
+            item = rumps.MenuItem(f"heat-{key}", callback=None)
+            set_emoji_icon(item, STAT_EMOJI.get(key, ""))
+            self._stats_menu.add(item)
+            self._stats_heatmap_items[key] = item
+        self._stats_heatmap_axis_item = rumps.MenuItem("heataxis", callback=None)
+        self._stats_menu.add(self._stats_heatmap_axis_item)
+        self._stats_menu.add(None)
+        # Section label for the per-emotion breakdown table.
+        self._stats_emotions_header_item = rumps.MenuItem(
+            "Statistics", callback=None
+        )
+        self._stats_menu.add(self._stats_emotions_header_item)
         self._stats_header_item = rumps.MenuItem("Header", callback=None)
         self._stats_menu.add(self._stats_header_item)
         self._stats_items: dict[str, rumps.MenuItem] = {}
         for key in STAT_KEYS:
             item = rumps.MenuItem(key, callback=None)
+            set_emoji_icon(item, STAT_EMOJI.get(key, ""))
             self._stats_menu.add(item)
             self._stats_items[key] = item
         self._stats_menu.add(None)
@@ -783,11 +886,20 @@ class MooditoApp(rumps.App):
         self._quit_item = self.menu["Quit"]
         # Give each actionable menu option a monochrome SF Symbol icon.
         set_symbol_icon(self._detected_item, "magnifyingglass")
-        set_symbol_icon(self._stats_menu, "chart.bar")
+        set_symbol_icon(self._stats_menu, "lightbulb")
         set_symbol_icon(self._stats_since_item, "clock")
         set_symbol_icon(self._stats_range_item, "calendar")
         set_symbol_icon(self._stats_live_item, "clock.arrow.circlepath")
         set_symbol_icon(self._stats_activity_header_item, "chart.bar.xaxis")
+        set_symbol_icon(self._stats_heatmap_header_item, "square.grid.3x3.fill")
+        set_symbol_icon(self._stats_emotions_header_item, "chart.bar")
+        set_symbol_icon(self._stats_total_item, "sum")
+        # Transparent spacers so the imageless table/chart rows align in the
+        # image gutter with the emoji/symbol rows.
+        set_spacer_icon(self._stats_header_item)
+        set_emoji_icon(self._stats_activity_item, "⏳")
+        set_spacer_icon(self._stats_activity_axis_item)
+        set_spacer_icon(self._stats_heatmap_axis_item)
         set_symbol_icon(self._stats_export_item, "square.and.arrow.down")
         set_symbol_icon(self._stats_reset_item, "trash")
         set_symbol_icon(self._emojis_item, "face.smiling")
@@ -805,6 +917,7 @@ class MooditoApp(rumps.App):
         # Reflect the restored display options in the menu items' checkmarks.
         self._emojis_item.state = self._show_emojis
         self._labels_item.state = self._show_labels
+        self._stats_live_item.state = self._stats_live_24h
         # Lock the manual Range control when the live last-24-hours toggle is on.
         if self._stats_live_24h:
             self._set_default_range()
@@ -896,9 +1009,13 @@ class MooditoApp(rumps.App):
             self._set_default_range()
             self._add_to_range_stats(label)
             self._hourly_activity[now.hour] += UI_REFRESH_INTERVAL
+            if label in self._hourly_emotion:
+                self._hourly_emotion[label][now.hour] += UI_REFRESH_INTERVAL
         elif self._stats_range_end is None and now >= self._stats_range_start:
             self._add_to_range_stats(label)
             self._hourly_activity[now.hour] += UI_REFRESH_INTERVAL
+            if label in self._hourly_emotion:
+                self._hourly_emotion[label][now.hour] += UI_REFRESH_INTERVAL
         self._update_stats_menu()
 
         # Flush to disk roughly every 10 seconds to limit write frequency.
@@ -947,6 +1064,7 @@ class MooditoApp(rumps.App):
         end = self._stats_range_end if self._stats_range_end is not None else datetime.now()
         stats = {key: {"seconds": 0.0, "count": 0} for key in STAT_KEYS}
         hourly = [0.0] * 24
+        heat = {key: [0.0] * 24 for key in STAT_KEYS}
         previous: str | None = None
         for ts, state in self._iter_raw_states():
             if ts < start or ts > end:
@@ -955,11 +1073,13 @@ class MooditoApp(rumps.App):
             hourly[ts.hour] += UI_REFRESH_INTERVAL
             if state in stats:
                 stats[state]["seconds"] += UI_REFRESH_INTERVAL
+                heat[state][ts.hour] += UI_REFRESH_INTERVAL
                 if state != previous:
                     stats[state]["count"] += 1
             previous = state
         self._range_stats = stats
         self._hourly_activity = hourly
+        self._hourly_emotion = heat
         self._range_last_state = previous
 
     def _set_default_range(self) -> None:
@@ -975,9 +1095,10 @@ class MooditoApp(rumps.App):
 
     def _update_stats_menu(self) -> None:
         """Refresh the Statistics submenu rows as an aligned table."""
-        # Column header (leading spaces account for the emoji column width).
+        # Emojis live in the menu image gutter (set once at build time), so the
+        # titles are plain monospaced text and every row's columns line up.
         header = (
-            f"{'':<4}{'Emotion':<9}"
+            f"{'Emotion':<9}"
             f"{'%':>5}"
             f"{'Time':>9}"
             f"{'Count':>7}"
@@ -988,20 +1109,17 @@ class MooditoApp(rumps.App):
         for key, item in self._stats_items.items():
             entry = self._range_stats[key]
             pct = (entry["seconds"] / total * 100.0) if total else 0.0
-            emoji = STAT_EMOJI.get(key, "")
             # Fixed-width columns: name | percent | duration | count.
             row = (
-                f"{emoji}  {key:<9}"
+                f"{key:<9}"
                 f"{pct:>4.0f}%"
                 f"{format_duration(entry['seconds']):>9}"
                 f"{'×' + str(entry['count']):>7}"
             )
             set_monospaced_title(item, row)
-        # Totals row, aligned with the same columns. Σ is a single-width glyph
-        # whereas the emoji column above is double-width, so pad with an extra
-        # space to keep the name column aligned with the rows above.
+        # Totals row (Σ shown as the item's icon), same columns as above.
         total_row = (
-            f"Σ   {'Total':<9}"
+            f"{'Total':<9}"
             f"{100 if total else 0:>4.0f}%"
             f"{format_duration(total):>9}"
             f"{'×' + str(total_count):>7}"
@@ -1023,6 +1141,7 @@ class MooditoApp(rumps.App):
         )
         self._stats_reset_item.title = "Erase"
         self._update_activity_chart()
+        self._update_emotion_heatmap()
 
     def _update_activity_chart(self) -> None:
         """Refresh the hourly activity sparkline and axis labels."""
@@ -1035,6 +1154,15 @@ class MooditoApp(rumps.App):
             render_activity_sparkline(self._hourly_activity),
         )
         set_monospaced_title(self._stats_activity_axis_item, ACTIVITY_AXIS)
+
+    def _update_emotion_heatmap(self) -> None:
+        """Refresh the emotion×hour heatmap rows and axis labels."""
+        strips = render_emotion_heatmap(self._hourly_emotion, STAT_KEYS)
+        # Emojis are the rows' icons (set at build time), so the strips are
+        # plain monospaced titles that all start at the same gutter x.
+        for key, strip in zip(STAT_KEYS, strips):
+            set_monospaced_title(self._stats_heatmap_items[key], strip)
+        set_monospaced_title(self._stats_heatmap_axis_item, ACTIVITY_AXIS)
 
 
     def set_stats_range(self, _sender) -> None:
@@ -1112,9 +1240,6 @@ class MooditoApp(rumps.App):
         """
         self._stats_live_24h = not self._stats_live_24h
         sender.state = self._stats_live_24h
-        # Persist the choice so it is restored on the next launch.
-        self._settings["stats_live_24h"] = self._stats_live_24h
-        save_settings(self._settings)
         if self._stats_live_24h:
             self._set_default_range()
         self._apply_range_lock()

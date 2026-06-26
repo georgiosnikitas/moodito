@@ -354,6 +354,7 @@ def _bare_app():
     inst._range_stats = {k: {"seconds": 0.0, "count": 0} for k in app.STAT_KEYS}
     inst._range_last_state = None
     inst._hourly_activity = [0.0] * 24
+    inst._hourly_emotion = {k: [0.0] * 24 for k in app.STAT_KEYS}
     inst._stats_items = {k: rumps.MenuItem(k) for k in app.STAT_KEYS}
     inst._stats_header_item = rumps.MenuItem("header")
     inst._stats_total_item = rumps.MenuItem("total")
@@ -363,6 +364,9 @@ def _bare_app():
     inst._stats_activity_header_item = rumps.MenuItem("activity")
     inst._stats_activity_item = rumps.MenuItem("spark")
     inst._stats_activity_axis_item = rumps.MenuItem("axis")
+    inst._stats_heatmap_header_item = rumps.MenuItem("heatmap")
+    inst._stats_heatmap_items = {k: rumps.MenuItem(f"h-{k}") for k in app.STAT_KEYS}
+    inst._stats_heatmap_axis_item = rumps.MenuItem("heataxis")
     inst._stats_reset_item = rumps.MenuItem("reset")
     return inst
 
@@ -508,6 +512,24 @@ class TestStatsRange:
     def test_render_activity_sparkline_all_zero_is_blank(self) -> None:
         assert app.render_activity_sparkline([0.0] * 24) == " " * 24
 
+    def test_render_emotion_heatmap_shapes_and_scaling(self) -> None:
+        heat = {k: [0.0] * 24 for k in app.STAT_KEYS}
+        heat["happy"][9] = 60.0  # busiest cell -> solid
+        heat["sad"][9] = 15.0  # quarter -> light shade
+        rows = app.render_emotion_heatmap(heat, app.STAT_KEYS)
+        assert len(rows) == len(app.STAT_KEYS)
+        assert all(len(r) == 24 for r in rows)
+        happy = rows[app.STAT_KEYS.index("happy")]
+        sad = rows[app.STAT_KEYS.index("sad")]
+        assert happy[9] == "█"  # solid
+        assert sad[9] not in (" ", "█")  # a partial shade
+        assert happy[0] == " "  # empty cell is blank
+
+    def test_render_emotion_heatmap_all_zero_is_blank(self) -> None:
+        heat = {k: [0.0] * 24 for k in app.STAT_KEYS}
+        rows = app.render_emotion_heatmap(heat, app.STAT_KEYS)
+        assert all(r == " " * 24 for r in rows)
+
     def test_set_default_range_is_last_24h_live(self) -> None:
         inst = _bare_app()
         inst._stats_started_at = "2020-01-01T00:00:00"
@@ -571,6 +593,25 @@ class TestStatsRange:
         assert inst._hourly_activity[9] == pytest.approx(2 * app.UI_REFRESH_INTERVAL)
         assert inst._hourly_activity[18] == pytest.approx(app.UI_REFRESH_INTERVAL)
         assert inst._hourly_activity[0] == 0.0
+
+    def test_recompute_buckets_emotion_heatmap(self, data_dir) -> None:
+        (data_dir / "raw_data.csv").write_text(
+            "timestamp,state,score\n"
+            "2026-06-21T09:00:00,happy,0.9\n"
+            "2026-06-21T09:30:00,happy,0.9\n"  # same hour bucket
+            "2026-06-21T18:00:00,sad,0.5\n"
+        )
+        inst = _bare_app()
+        inst._stats_range_start = app.datetime(2026, 6, 21, 0, 0)
+        inst._stats_range_end = app.datetime(2026, 6, 22, 0, 0)
+        inst._recompute_range_stats()
+        assert inst._hourly_emotion["happy"][9] == pytest.approx(
+            2 * app.UI_REFRESH_INTERVAL
+        )
+        assert inst._hourly_emotion["sad"][18] == pytest.approx(
+            app.UI_REFRESH_INTERVAL
+        )
+        assert inst._hourly_emotion["happy"][0] == 0.0
 
     def test_live_accumulate_updates_range_stats(self, monkeypatch) -> None:
         monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
