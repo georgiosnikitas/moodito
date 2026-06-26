@@ -1072,8 +1072,11 @@ def _bare_license_app(active: bool = False):
     inst._license_alert = None
     inst._license_dirty = app.threading.Event()
     inst._license_status_item = rumps.MenuItem("status")
+    inst._license_key_item = rumps.MenuItem("key")
+    inst._license_device_item = rumps.MenuItem("device")
     inst._license_activate_item = rumps.MenuItem("activate")
     inst._license_deactivate_item = rumps.MenuItem("deactivate")
+    inst._license_buy_item = rumps.MenuItem("buy")
     inst._bmc_menu = rumps.MenuItem("bmc")
     return inst
 
@@ -1120,6 +1123,13 @@ class TestLicenseMenu:
         assert inst._license_deactivate_item.hidden is False
         assert inst._bmc_menu.hidden is True
         assert "Licensed" in inst._license_status_item.title
+        # Buy License is hidden once licensed.
+        assert inst._license_buy_item.hidden is True
+        # License details are shown and populated while licensed.
+        assert inst._license_key_item.hidden is False
+        assert inst._license_device_item.hidden is False
+        assert "key-1"[-4:] in inst._license_key_item.title
+        assert "Moodito" in inst._license_device_item.title
 
     def test_visibility_when_inactive(self) -> None:
         inst = _bare_license_app(active=False)
@@ -1128,6 +1138,11 @@ class TestLicenseMenu:
         assert inst._license_deactivate_item.hidden is True
         assert inst._bmc_menu.hidden is False
         assert "Not licensed" in inst._license_status_item.title
+        # License details are hidden while unlicensed.
+        assert inst._license_key_item.hidden is True
+        assert inst._license_device_item.hidden is True
+        # Buy License is shown while unlicensed.
+        assert inst._license_buy_item.hidden is False
 
     def test_buy_and_restore_open_urls(self, monkeypatch) -> None:
         calls = []

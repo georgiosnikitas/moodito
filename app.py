@@ -151,6 +151,15 @@ def is_license_active(license_data: dict) -> bool:
     return bool(license_data.get("license_key") and license_data.get("instance_id"))
 
 
+def mask_license_key(key: str) -> str:
+    """Mask a license key for display, revealing only the last 4 characters."""
+    key = (key or "").strip()
+    if not key:
+        return "—"
+    tail = key[-4:]
+    return f"•••• {tail}"
+
+
 def license_instance_name() -> str:
     """A human label sent to Lemon Squeezy to identify this activation."""
     try:
@@ -842,6 +851,11 @@ class MooditoApp(rumps.App):
         self._license_menu = rumps.MenuItem("License")
         self._license_status_item = rumps.MenuItem("Status: …", callback=None)
         self._license_menu.add(self._license_status_item)
+        # License details, shown only while licensed.
+        self._license_key_item = rumps.MenuItem("Key: …", callback=None)
+        self._license_menu.add(self._license_key_item)
+        self._license_device_item = rumps.MenuItem("Device: …", callback=None)
+        self._license_menu.add(self._license_device_item)
         self._license_menu.add(None)
         self._license_activate_item = rumps.MenuItem(
             "Activate License…", callback=self.activate_license_dialog
@@ -852,7 +866,7 @@ class MooditoApp(rumps.App):
         )
         self._license_menu.add(self._license_deactivate_item)
         self._license_restore_item = rumps.MenuItem(
-            "Restore License…", callback=self.restore_license
+            "Manage License…", callback=self.restore_license
         )
         self._license_menu.add(self._license_restore_item)
         self._license_buy_item = rumps.MenuItem(
@@ -1322,10 +1336,23 @@ class MooditoApp(rumps.App):
         active = self._license_active
         self._license_activate_item.hidden = active
         self._license_deactivate_item.hidden = not active
+        # Buy is only useful before purchasing; hide it once licensed.
+        self._license_buy_item.hidden = active
         self._bmc_menu.hidden = active
         self._license_status_item.title = (
             "Status: Licensed ✓" if active else "Status: Not licensed"
         )
+        # License details: shown only while licensed.
+        self._license_key_item.hidden = not active
+        self._license_device_item.hidden = not active
+        if active:
+            with self._license_lock:
+                key = self._license.get("license_key", "")
+                device = self._license.get("instance_name", "")
+            self._license_key_item.title = f"Key: {mask_license_key(key)}"
+            self._license_device_item.title = (
+                f"Device: {device}" if device else "Device: —"
+            )
         # Custom date ranges are licensed: if the license is gone while a custom
         # range is active, re-pin to the live last-24-hours window.
         if not active and getattr(self, "_stats_live_24h", True) is False:
