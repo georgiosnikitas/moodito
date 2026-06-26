@@ -1471,28 +1471,56 @@ class TestSensitivity:
     def test_defaults_to_normal_for_every_emotion(self, full_app) -> None:
         for emotion in app.SENSITIVITY_EMOTIONS:
             assert full_app._sensitivity[emotion] == app.DEFAULT_SENSITIVITY
-            normal_item = full_app._sensitivity_items[(emotion, "normal")]
-            assert normal_item.state == 1
+            # The "normal" row is ticked; the others are not.
+            assert full_app._sensitivity_items[(emotion, "normal")].state == 1
+            assert full_app._sensitivity_items[(emotion, "low")].state == 0
+            assert full_app._sensitivity_items[(emotion, "high")].state == 0
+
+    def test_all_rows_registered_without_collision(self, full_app) -> None:
+        # rumps drops duplicate add-time titles, so every (emotion, level) row
+        # must survive as a distinct menu key.
+        expected = {
+            full_app._sensitivity_full_title(emotion, level)
+            for emotion in app.SENSITIVITY_EMOTIONS
+            for level in app.SENSITIVITY_LEVELS
+        }
+        assert expected <= set(full_app._sensitivity_menu.keys())
+        assert len(full_app._sensitivity_items) == (
+            len(app.SENSITIVITY_EMOTIONS) * len(app.SENSITIVITY_LEVELS)
+        )
+
+    def test_each_group_has_emoji_label_header(self, full_app) -> None:
+        keys = set(full_app._sensitivity_menu.keys())
+        for emotion in app.SENSITIVITY_EMOTIONS:
+            header = f"{app.EMOTION_EMOJI[emotion]} {emotion.capitalize()}".strip()
+            assert header in keys
+
+    def test_level_rows_show_bare_aligned_values(self, full_app) -> None:
+        # Every level row displays just its level word so they line up vertically.
+        for emotion in app.SENSITIVITY_EMOTIONS:
+            for level in app.SENSITIVITY_LEVELS:
+                item = full_app._sensitivity_items[(emotion, level)]
+                assert item.title == level.capitalize()
 
     def test_worker_receives_initial_sensitivity(self, full_app) -> None:
         assert full_app._worker.sensitivity == full_app._sensitivity
 
-    def test_set_sensitivity_updates_state_worker_and_persists(
+    def test_set_sensitivity_moves_radio_worker_and_persists(
         self, full_app, monkeypatch
     ) -> None:
         saved = []
         monkeypatch.setattr(app, "save_settings", lambda s: saved.append(s))
-        item = full_app._sensitivity_items[("happy", "high")]
-        full_app.set_sensitivity(item)
+        full_app.set_sensitivity(full_app._sensitivity_items[("happy", "high")])
         # Setting recorded and shared with the inference thread.
         assert full_app._sensitivity["happy"] == "high"
         assert full_app._worker.sensitivity["happy"] == "high"
-        # Persisted to settings.
-        assert saved and saved[0]["sensitivity"]["happy"] == "high"
-        # Checkmarks: only the chosen level is ticked for this emotion.
+        assert saved and saved[-1]["sensitivity"]["happy"] == "high"
+        # Radio: only the chosen level is ticked for this emotion.
         assert full_app._sensitivity_items[("happy", "high")].state == 1
         assert full_app._sensitivity_items[("happy", "normal")].state == 0
-        assert full_app._sensitivity_items[("happy", "low")].state == 0
+        # Level rows stay bare (labels live in the group header).
+        assert full_app._sensitivity_items[("happy", "high")].title == "High"
+        assert full_app._sensitivity_items[("happy", "normal")].title == "Normal"
 
     def test_set_sensitivity_only_affects_its_emotion(
         self, full_app, monkeypatch
@@ -1501,6 +1529,7 @@ class TestSensitivity:
         full_app.set_sensitivity(full_app._sensitivity_items[("angry", "low")])
         assert full_app._sensitivity["angry"] == "low"
         assert full_app._sensitivity["happy"] == app.DEFAULT_SENSITIVITY
+        assert full_app._sensitivity_items[("happy", "normal")].state == 1
 
     def test_set_sensitivity_ignores_unknown_sender(
         self, full_app, monkeypatch
@@ -1523,6 +1552,9 @@ class TestSensitivity:
         assert inst._sensitivity["angry"] == "low"
         # Untouched emotions keep the default.
         assert inst._sensitivity["sad"] == app.DEFAULT_SENSITIVITY
+        # Restored level is reflected in the radio checkmarks.
+        assert inst._sensitivity_items[("happy", "high")].state == 1
+        assert inst._sensitivity_items[("happy", "normal")].state == 0
 
     def test_load_sensitivity_ignores_invalid_values(
         self, data_dir, monkeypatch

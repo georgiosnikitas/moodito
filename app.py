@@ -898,21 +898,31 @@ class MooditoApp(rumps.App):
         )
         self._license_menu.add(self._license_buy_item)
 
-        # Sensitivity submenu: one nested submenu per tunable emotion, each
-        # offering Low/Normal/High levels selectable inline (no dialog window).
+        # Sensitivity submenu: grouped by emotion. Each group leads with a
+        # disabled "<emoji> <Emotion>" header, followed by the Low/Normal/High
+        # rows which line up in a vertical column; a checkmark marks the active
+        # level and one click sets it. Level rows are added with their unique
+        # full titles so rumps (which keys items by title and drops duplicates)
+        # keeps them all, then their display text is set to the bare level.
+        # Dividers separate the groups — no nested submenu and no dialog window.
         self._sensitivity_menu = rumps.MenuItem("Sensitivity")
         self._sensitivity_items: dict[tuple[str, str], rumps.MenuItem] = {}
-        for emotion in SENSITIVITY_EMOTIONS:
-            emotion_menu = rumps.MenuItem(emotion.capitalize())
-            set_emoji_icon(emotion_menu, EMOTION_EMOJI.get(emotion, ""))
+        for index, emotion in enumerate(SENSITIVITY_EMOTIONS):
+            if index:
+                self._sensitivity_menu.add(None)
+            emoji = EMOTION_EMOJI.get(emotion, "")
+            self._sensitivity_menu.add(
+                rumps.MenuItem(f"{emoji} {emotion.capitalize()}".strip(), callback=None)
+            )
             for level in SENSITIVITY_LEVELS:
-                level_item = rumps.MenuItem(
-                    level.capitalize(), callback=self.set_sensitivity
+                item = rumps.MenuItem(
+                    self._sensitivity_full_title(emotion, level),
+                    callback=self.set_sensitivity,
                 )
-                level_item.state = self._sensitivity.get(emotion) == level
-                emotion_menu.add(level_item)
-                self._sensitivity_items[(emotion, level)] = level_item
-            self._sensitivity_menu.add(emotion_menu)
+                self._sensitivity_menu.add(item)
+                item.title = level.capitalize()
+                self._sensitivity_items[(emotion, level)] = item
+            self._update_sensitivity_states(emotion)
 
         self.menu = [
             rumps.MenuItem("Detected: …", callback=None),
@@ -1356,8 +1366,19 @@ class MooditoApp(rumps.App):
                     result[emotion] = level
         return result
 
+    def _sensitivity_full_title(self, emotion: str, level: str) -> str:
+        """Unique add-time row title (only used as the rumps menu key)."""
+        emoji = EMOTION_EMOJI.get(emotion, "")
+        return f"{level.capitalize()} · {emoji} {emotion.capitalize()}".strip()
+
+    def _update_sensitivity_states(self, emotion: str) -> None:
+        """Move the radio checkmark to the emotion's selected level."""
+        selected = self._sensitivity.get(emotion, DEFAULT_SENSITIVITY)
+        for level in SENSITIVITY_LEVELS:
+            self._sensitivity_items[(emotion, level)].state = level == selected
+
     def set_sensitivity(self, sender) -> None:
-        """Apply the Low/Normal/High level chosen from the Sensitivity menu."""
+        """Apply the level chosen from the Sensitivity menu."""
         target = next(
             (key for key, item in self._sensitivity_items.items() if item is sender),
             None,
@@ -1366,10 +1387,7 @@ class MooditoApp(rumps.App):
             return
         emotion, level = target
         self._sensitivity[emotion] = level
-        # Update the checkmarks for this emotion's three level rows.
-        for candidate in SENSITIVITY_LEVELS:
-            item = self._sensitivity_items[(emotion, candidate)]
-            item.state = candidate == level
+        self._update_sensitivity_states(emotion)
         # Share the new setting with the inference thread and persist it.
         self._worker.sensitivity = self._sensitivity
         self._settings["sensitivity"] = self._sensitivity
