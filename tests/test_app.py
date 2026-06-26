@@ -351,6 +351,7 @@ def _bare_app():
     inst._stats_range_end = None
     inst._stats_live_24h = False
     inst._settings = {}
+    inst._license_active = True
     inst._range_stats = {k: {"seconds": 0.0, "count": 0} for k in app.STAT_KEYS}
     inst._range_last_state = None
     inst._hourly_activity = [0.0] * 24
@@ -752,6 +753,30 @@ class TestStatsRange:
         before = inst._stats_range_start
         inst.set_stats_range(None)
         assert inst._stats_range_start == before  # unchanged while locked
+
+    def test_toggle_live_24h_off_blocked_without_license(
+        self, data_dir, monkeypatch
+    ) -> None:
+        alerts = []
+        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: alerts.append(a))
+        inst = _bare_app()
+        inst._stats_live_24h = True
+        inst._license_active = False
+        inst.toggle_live_24h(inst._stats_live_item)
+        assert alerts  # user was told a license is required
+        assert inst._stats_live_24h is True  # stays on
+        assert inst._stats_live_item.state == 1  # stays checked
+
+    def test_toggle_live_24h_on_allowed_without_license(
+        self, data_dir, monkeypatch
+    ) -> None:
+        # Re-enabling the live window never requires a license.
+        inst = _bare_app()
+        inst._stats_live_24h = False
+        inst._license_active = False
+        inst.toggle_live_24h(inst._stats_live_item)
+        assert inst._stats_live_24h is True
+
 
 
 class TestExportCsv:

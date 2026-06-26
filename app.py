@@ -756,17 +756,17 @@ class MooditoApp(rumps.App):
         # (and any pending alert) need to be applied on the main thread.
         self._license_dirty = threading.Event()
 
-        # Build the live Statistics submenu (one row per tracked state).
+        # Build the live Insights submenu (charts + per-emotion table). The
+        # range controls (Since/Range/Last 24 Hours) and the Download/Erase
+        # actions live at the top level, around the Insights submenu.
         self._stats_menu = rumps.MenuItem("Insights")
         # Non-clickable label showing when tracking began.
         self._stats_since_item = rumps.MenuItem("Since …", callback=None)
-        self._stats_menu.add(self._stats_since_item)
         # Single control to pick the start and end of the window the statistics
         # are computed over (defaults to the last 24 hours).
         self._stats_range_item = rumps.MenuItem(
             "Range …", callback=self.set_stats_range
         )
-        self._stats_menu.add(self._stats_range_item)
         # Toggle: when on, the range is pinned to a live, sliding last-24-hours
         # window and the manual Range control is locked; when off, the user can
         # edit the Range freely.
@@ -774,8 +774,6 @@ class MooditoApp(rumps.App):
             "Last 24 Hours", callback=self.toggle_live_24h
         )
         self._stats_live_item.state = self._stats_live_24h
-        self._stats_menu.add(self._stats_live_item)
-        self._stats_menu.add(None)
         # Hourly activity chart: usage per hour of day, x axis 0–24.
         self._stats_activity_header_item = rumps.MenuItem(
             "Activity", callback=None
@@ -816,15 +814,13 @@ class MooditoApp(rumps.App):
         self._stats_menu.add(None)
         self._stats_total_item = rumps.MenuItem("Total", callback=None)
         self._stats_menu.add(self._stats_total_item)
-        self._stats_menu.add(None)
+        # Download/Erase actions (added to the top level, after Insights).
         self._stats_export_item = rumps.MenuItem(
             "Download (csv)", callback=self.export_csv
         )
-        self._stats_menu.add(self._stats_export_item)
         self._stats_reset_item = rumps.MenuItem(
             "Erase", callback=self.reset_stats
         )
-        self._stats_menu.add(self._stats_reset_item)
 
         # Buy Me a Coffee submenu: an "open page" action plus the QR code image.
         self._bmc_menu = rumps.MenuItem("Buy Me a Coffee")
@@ -847,14 +843,6 @@ class MooditoApp(rumps.App):
         self._license_status_item = rumps.MenuItem("Status: …", callback=None)
         self._license_menu.add(self._license_status_item)
         self._license_menu.add(None)
-        self._license_buy_item = rumps.MenuItem(
-            "Buy License…", callback=self.buy_license
-        )
-        self._license_menu.add(self._license_buy_item)
-        self._license_restore_item = rumps.MenuItem(
-            "Restore License…", callback=self.restore_license
-        )
-        self._license_menu.add(self._license_restore_item)
         self._license_activate_item = rumps.MenuItem(
             "Activate License…", callback=self.activate_license_dialog
         )
@@ -863,11 +851,24 @@ class MooditoApp(rumps.App):
             "Deactivate License", callback=self.deactivate_license_action
         )
         self._license_menu.add(self._license_deactivate_item)
+        self._license_restore_item = rumps.MenuItem(
+            "Restore License…", callback=self.restore_license
+        )
+        self._license_menu.add(self._license_restore_item)
+        self._license_buy_item = rumps.MenuItem(
+            "Buy License…", callback=self.buy_license
+        )
+        self._license_menu.add(self._license_buy_item)
 
         self.menu = [
             rumps.MenuItem("Detected: …", callback=None),
             None,
+            self._stats_since_item,
+            self._stats_range_item,
+            self._stats_live_item,
             self._stats_menu,
+            self._stats_export_item,
+            self._stats_reset_item,
             None,
             rumps.MenuItem("Show Emojis", callback=self.toggle_emojis),
             rumps.MenuItem("Show Labels", callback=self.toggle_labels),
@@ -1236,8 +1237,20 @@ class MooditoApp(rumps.App):
 
         When on, the range is pinned to a sliding last-24-hours window and the
         manual Range control is locked. When off, the Range becomes editable
-        and keeps whatever window was last shown.
+        and keeps whatever window was last shown. Turning it off (to use a
+        custom range) requires an active license.
         """
+        # Turning the live window off unlocks custom date ranges — a licensed
+        # feature. Block it while unlicensed and keep the option checked.
+        if self._stats_live_24h and not self._license_active:
+            sender.state = True
+            rumps.alert(
+                LICENSE_ALERT_TITLE,
+                "Custom date ranges are a licensed feature.\n\n"
+                "Activate a license to turn off “Last 24 Hours” and choose "
+                "your own range.",
+            )
+            return
         self._stats_live_24h = not self._stats_live_24h
         sender.state = self._stats_live_24h
         if self._stats_live_24h:
@@ -1313,6 +1326,15 @@ class MooditoApp(rumps.App):
         self._license_status_item.title = (
             "Status: Licensed ✓" if active else "Status: Not licensed"
         )
+        # Custom date ranges are licensed: if the license is gone while a custom
+        # range is active, re-pin to the live last-24-hours window.
+        if not active and getattr(self, "_stats_live_24h", True) is False:
+            self._stats_live_24h = True
+            self._stats_live_item.state = True
+            self._set_default_range()
+            self._apply_range_lock()
+            self._recompute_range_stats()
+            self._update_stats_menu()
 
     def _consume_license_updates(self) -> None:
         """Apply any pending license state change on the main thread.
@@ -1369,7 +1391,7 @@ class MooditoApp(rumps.App):
         if self._license_busy.is_set():
             return
         window = rumps.Window(
-            title="Activate Moodito License",
+            title="Moodito License",
             message="Enter your license key:",
             default_text="",
             ok="Activate",
