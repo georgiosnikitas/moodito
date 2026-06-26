@@ -780,13 +780,15 @@ class TestStatsRange:
 
 
 class TestExportCsv:
-    def test_copies_existing_raw_file_to_downloads(
+    def test_exports_rows_in_selected_range(
         self, data_dir, monkeypatch
     ) -> None:
         # Pretend HOME is the temp dir and create a Downloads folder.
         monkeypatch.setenv("HOME", str(data_dir))
         (data_dir / "Downloads").mkdir()
-        (data_dir / "raw_data.csv").write_text("timestamp,state,score\nt,happy,0.9\n")
+        (data_dir / "raw_data.csv").write_text(
+            "timestamp,state,score\n2026-06-21T22:30:00,happy,0.9\n"
+        )
         opened = []
         monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: opened.append(a))
         inst = _bare_app()
@@ -796,12 +798,34 @@ class TestExportCsv:
         assert "happy" in exported[0].read_text()
         assert opened and opened[0][0][0] == "open"
 
+    def test_excludes_rows_outside_selected_range(
+        self, data_dir, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("HOME", str(data_dir))
+        (data_dir / "Downloads").mkdir()
+        (data_dir / "raw_data.csv").write_text(
+            "timestamp,state,score\n"
+            "2026-06-21T22:30:00,happy,0.9\n"  # in range
+            "2020-01-01T00:00:00,sad,0.5\n"  # before range
+            "2099-01-01T00:00:00,angry,0.5\n"  # after range
+        )
+        monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: None)
+        inst = _bare_app()
+        inst._stats_range_start = app.datetime(2026, 6, 21, 0, 0)
+        inst._stats_range_end = app.datetime(2026, 6, 22, 0, 0)
+        inst.export_csv(None)
+        exported = list((data_dir / "Downloads").glob("moodito-raw-*.csv"))
+        text = exported[0].read_text()
+        assert "happy" in text
+        assert "sad" not in text
+        assert "angry" not in text
+
     def test_flushes_buffer_before_export(self, data_dir, monkeypatch) -> None:
         monkeypatch.setenv("HOME", str(data_dir))
         (data_dir / "Downloads").mkdir()
         monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: None)
         inst = _bare_app()
-        inst._raw_buffer = [("t", "happy", "0.9")]
+        inst._raw_buffer = [("2026-06-21T22:30:00.000", "happy", "0.9")]
         inst.export_csv(None)
         assert inst._raw_buffer == []
         exported = list((data_dir / "Downloads").glob("moodito-raw-*.csv"))

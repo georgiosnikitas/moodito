@@ -10,7 +10,6 @@ from __future__ import annotations
 import csv
 import json
 import os
-import shutil
 import socket
 import subprocess
 import sys
@@ -1487,20 +1486,31 @@ class MooditoApp(rumps.App):
         self._license_dirty.set()
 
     def export_csv(self, _sender) -> None:
-        """Export the raw detection log to a CSV file in the Downloads folder."""
+        """Export the raw detection log for the selected date range to a CSV
+        file in the Downloads folder."""
         # Flush any buffered samples first so the export includes everything.
         append_raw_samples(self._raw_buffer)
         self._raw_buffer.clear()
+        start = self._stats_range_start
+        end = self._stats_range_end if self._stats_range_end is not None else datetime.now()
         downloads = os.path.join(os.path.expanduser("~"), "Downloads")
         filename = f"moodito-raw-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
         path = os.path.join(downloads, filename)
         try:
-            if os.path.exists(RAW_PATH):
-                shutil.copyfile(RAW_PATH, path)
-            else:
-                # No samples recorded yet: write a header-only file.
-                with open(path, "w", newline="", encoding="utf-8") as fh:
-                    csv.writer(fh).writerow(RAW_HEADER)
+            with open(path, "w", newline="", encoding="utf-8") as out:
+                writer = csv.writer(out)
+                writer.writerow(RAW_HEADER)
+                if os.path.exists(RAW_PATH):
+                    with open(RAW_PATH, newline="", encoding="utf-8") as src:
+                        reader = csv.reader(src)
+                        next(reader, None)  # skip the header row
+                        for row in reader:
+                            if not row:
+                                continue
+                            ts = parse_iso_datetime(row[0])
+                            if ts is None or ts < start or ts > end:
+                                continue
+                            writer.writerow(row)
         except OSError as exc:
             rumps.notification("Moodito", "Export failed", str(exc))
             return
