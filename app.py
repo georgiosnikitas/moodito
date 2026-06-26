@@ -407,6 +407,32 @@ def format_duration(seconds: float) -> str:
     return f"{secs}s"
 
 
+# Hourly activity chart: a small text bar chart of app usage per hour of day.
+# The x axis ticks at 0, 3, 6, …, 24; each column is one hour (0–23).
+ACTIVITY_AXIS = "0  3  6  9  12 15 18 21 24"
+ACTIVITY_BLOCKS = " ▁▂▃▄▅▆▇█"  # 0 (empty) … 8 (full) eighths
+
+
+def render_activity_sparkline(hourly: list[float], width: int = 24) -> str:
+    """Render per-hour usage seconds as a single monospaced sparkline row.
+
+    The 24 hour-of-day buckets become 24 columns; bar heights are scaled to the
+    busiest hour. Empty hours render as a blank column.
+    """
+    values = [(hourly[i] if i < len(hourly) else 0.0) for i in range(width)]
+    peak = max(values) if values else 0.0
+    if peak <= 0:
+        return " " * width
+    cells = []
+    for v in values:
+        if v <= 0:
+            cells.append(" ")
+            continue
+        level = max(1, min(8, int(round(v / peak * 8))))
+        cells.append(ACTIVITY_BLOCKS[level])
+    return "".join(cells)
+
+
 def set_monospaced_title(item, text: str) -> None:
     """Set a menu item's title in a monospaced font so columns stay aligned.
 
@@ -630,6 +656,8 @@ class MooditoApp(rumps.App):
             key: {"seconds": 0.0, "count": 0} for key in STAT_KEYS
         }
         self._range_last_state: str | None = None
+        # App-usage seconds bucketed by hour of day (0–23) over the range.
+        self._hourly_activity: list[float] = [0.0] * 24
         self._set_default_range()
         # Persisted Lemon Squeezy license activation (if any).
         self._license = load_license()
@@ -664,6 +692,16 @@ class MooditoApp(rumps.App):
         )
         self._stats_live_item.state = self._stats_live_24h
         self._stats_menu.add(self._stats_live_item)
+        self._stats_menu.add(None)
+        # Hourly activity chart: usage per hour of day, x axis 0–24.
+        self._stats_activity_header_item = rumps.MenuItem(
+            "Activity", callback=None
+        )
+        self._stats_menu.add(self._stats_activity_header_item)
+        self._stats_activity_item = rumps.MenuItem("activity", callback=None)
+        self._stats_menu.add(self._stats_activity_item)
+        self._stats_activity_axis_item = rumps.MenuItem("axis", callback=None)
+        self._stats_menu.add(self._stats_activity_axis_item)
         self._stats_menu.add(None)
         self._stats_header_item = rumps.MenuItem("Header", callback=None)
         self._stats_menu.add(self._stats_header_item)
@@ -746,8 +784,10 @@ class MooditoApp(rumps.App):
         # Give each actionable menu option a monochrome SF Symbol icon.
         set_symbol_icon(self._detected_item, "magnifyingglass")
         set_symbol_icon(self._stats_menu, "chart.bar")
+        set_symbol_icon(self._stats_since_item, "clock")
         set_symbol_icon(self._stats_range_item, "calendar")
         set_symbol_icon(self._stats_live_item, "clock.arrow.circlepath")
+        set_symbol_icon(self._stats_activity_header_item, "chart.bar.xaxis")
         set_symbol_icon(self._stats_export_item, "square.and.arrow.down")
         set_symbol_icon(self._stats_reset_item, "trash")
         set_symbol_icon(self._emojis_item, "face.smiling")
@@ -855,8 +895,10 @@ class MooditoApp(rumps.App):
         if self._stats_live_24h:
             self._set_default_range()
             self._add_to_range_stats(label)
+            self._hourly_activity[now.hour] += UI_REFRESH_INTERVAL
         elif self._stats_range_end is None and now >= self._stats_range_start:
             self._add_to_range_stats(label)
+            self._hourly_activity[now.hour] += UI_REFRESH_INTERVAL
         self._update_stats_menu()
 
         # Flush to disk roughly every 10 seconds to limit write frequency.
@@ -904,16 +946,20 @@ class MooditoApp(rumps.App):
         start = self._stats_range_start
         end = self._stats_range_end if self._stats_range_end is not None else datetime.now()
         stats = {key: {"seconds": 0.0, "count": 0} for key in STAT_KEYS}
+        hourly = [0.0] * 24
         previous: str | None = None
         for ts, state in self._iter_raw_states():
             if ts < start or ts > end:
                 continue
+            # Count every sample as app-usage time for the hourly activity chart.
+            hourly[ts.hour] += UI_REFRESH_INTERVAL
             if state in stats:
                 stats[state]["seconds"] += UI_REFRESH_INTERVAL
                 if state != previous:
                     stats[state]["count"] += 1
             previous = state
         self._range_stats = stats
+        self._hourly_activity = hourly
         self._range_last_state = previous
 
     def _set_default_range(self) -> None:
@@ -976,6 +1022,19 @@ class MooditoApp(rumps.App):
             f"Range: {format_datetime(self._stats_range_start)} → {end_text}"
         )
         self._stats_reset_item.title = "Erase"
+        self._update_activity_chart()
+
+    def _update_activity_chart(self) -> None:
+        """Refresh the hourly activity sparkline and axis labels."""
+        peak = max(self._hourly_activity) if self._hourly_activity else 0.0
+        self._stats_activity_header_item.title = (
+            f"Activity · busiest hour {format_duration(peak)}"
+        )
+        set_monospaced_title(
+            self._stats_activity_item,
+            render_activity_sparkline(self._hourly_activity),
+        )
+        set_monospaced_title(self._stats_activity_axis_item, ACTIVITY_AXIS)
 
 
     def set_stats_range(self, _sender) -> None:

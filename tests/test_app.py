@@ -353,12 +353,16 @@ def _bare_app():
     inst._settings = {}
     inst._range_stats = {k: {"seconds": 0.0, "count": 0} for k in app.STAT_KEYS}
     inst._range_last_state = None
+    inst._hourly_activity = [0.0] * 24
     inst._stats_items = {k: rumps.MenuItem(k) for k in app.STAT_KEYS}
     inst._stats_header_item = rumps.MenuItem("header")
     inst._stats_total_item = rumps.MenuItem("total")
     inst._stats_since_item = rumps.MenuItem("since")
     inst._stats_range_item = rumps.MenuItem("range", callback=inst.set_stats_range)
     inst._stats_live_item = rumps.MenuItem("live")
+    inst._stats_activity_header_item = rumps.MenuItem("activity")
+    inst._stats_activity_item = rumps.MenuItem("spark")
+    inst._stats_activity_axis_item = rumps.MenuItem("axis")
     inst._stats_reset_item = rumps.MenuItem("reset")
     return inst
 
@@ -488,6 +492,22 @@ class TestStatsRange:
         assert inst._stats_range_start == app.datetime(2026, 6, 21, 22, 0)
         assert inst._stats_range_end is None
 
+    def test_render_activity_sparkline_shapes_and_scaling(self) -> None:
+        hourly = [0.0] * 24
+        hourly[9] = 60.0  # busiest hour
+        hourly[12] = 30.0
+        line = app.render_activity_sparkline(hourly)
+        assert len(line) == 24
+        # The busiest hour is the full block.
+        assert line[9] == "█"
+        # A half-height hour is a mid-level block, not full and not blank.
+        assert line[12] not in (" ", "█")
+        # Empty hours render as blanks.
+        assert line[0] == " "
+
+    def test_render_activity_sparkline_all_zero_is_blank(self) -> None:
+        assert app.render_activity_sparkline([0.0] * 24) == " " * 24
+
     def test_set_default_range_is_last_24h_live(self) -> None:
         inst = _bare_app()
         inst._stats_started_at = "2020-01-01T00:00:00"
@@ -535,6 +555,22 @@ class TestStatsRange:
         inst._raw_buffer = [("2026-06-21T23:00:00.000", "happy", "0.9")]
         inst._recompute_range_stats()
         assert inst._range_stats["happy"]["count"] == 1
+
+    def test_recompute_buckets_hourly_activity(self, data_dir) -> None:
+        (data_dir / "raw_data.csv").write_text(
+            "timestamp,state,score\n"
+            "2026-06-21T09:00:00,happy,0.9\n"
+            "2026-06-21T09:30:00,sad,0.5\n"  # same hour bucket as above
+            "2026-06-21T18:00:00,paused,\n"  # paused still counts as usage
+            "2026-06-20T18:00:00,happy,0.9\n"  # before range, ignored
+        )
+        inst = _bare_app()
+        inst._stats_range_start = app.datetime(2026, 6, 21, 0, 0)
+        inst._stats_range_end = app.datetime(2026, 6, 22, 0, 0)
+        inst._recompute_range_stats()
+        assert inst._hourly_activity[9] == pytest.approx(2 * app.UI_REFRESH_INTERVAL)
+        assert inst._hourly_activity[18] == pytest.approx(app.UI_REFRESH_INTERVAL)
+        assert inst._hourly_activity[0] == 0.0
 
     def test_live_accumulate_updates_range_stats(self, monkeypatch) -> None:
         monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
