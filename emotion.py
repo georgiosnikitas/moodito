@@ -21,6 +21,17 @@ EMOTION_EMOJI = {
     "no face": "🫥",
 }
 
+# Emotions whose detection threshold can be tuned via the Sensitivity menu.
+SENSITIVITY_EMOTIONS = ("happy", "surprised", "angry", "sad")
+# Selectable sensitivity levels (in menu display order).
+SENSITIVITY_LEVELS = ("low", "normal", "high")
+# Default level applied when nothing is configured.
+DEFAULT_SENSITIVITY = "normal"
+# Multiplier applied to an emotion's base threshold per level. A higher
+# threshold ("low" sensitivity) needs stronger evidence to trigger; a lower
+# threshold ("high" sensitivity) triggers more readily.
+_SENSITIVITY_MULTIPLIER = {"low": 1.4, "normal": 1.0, "high": 0.6}
+
 
 @dataclass
 class EmotionResult:
@@ -52,11 +63,18 @@ def _deadzone(value: float, floor: float) -> float:
     return (value - floor) / (1.0 - floor)
 
 
-def infer_emotion(blendshapes: dict[str, float]) -> EmotionResult:
+def infer_emotion(
+    blendshapes: dict[str, float],
+    sensitivity: dict[str, str] | None = None,
+) -> EmotionResult:
     """Map a dict of {blendshape_name: score} to a coarse emotion.
 
     The weights below are simple, hand-tuned linear combinations. They are
     intentionally easy to read and adjust.
+
+    ``sensitivity`` optionally maps an emotion name to one of
+    :data:`SENSITIVITY_LEVELS` ("low"/"normal"/"high"), scaling that emotion's
+    detection threshold so it triggers more or less readily.
     """
     if not blendshapes:
         return EmotionResult("neutral", 0.0)
@@ -92,8 +110,13 @@ def infer_emotion(blendshapes: dict[str, float]) -> EmotionResult:
     label, raw = max(candidates.items(), key=lambda kv: kv[1])
     score = min(raw, 1.0)
 
+    threshold = min_score[label]
+    if sensitivity:
+        level = sensitivity.get(label, DEFAULT_SENSITIVITY)
+        threshold *= _SENSITIVITY_MULTIPLIER.get(level, 1.0)
+
     # Not expressive enough for its category → treat as neutral.
-    if score < min_score[label]:
+    if score < threshold:
         return EmotionResult("neutral", 1.0 - score)
 
     return EmotionResult(label, score)

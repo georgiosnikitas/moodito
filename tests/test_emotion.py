@@ -99,3 +99,42 @@ class TestInferEmotion:
         # browDown below the 0.45 deadzone should be ignored.
         result = infer_emotion({"browDownLeft": 0.4, "browDownRight": 0.4})
         assert result.label == "neutral"
+
+
+class TestSensitivity:
+    # A faint smile whose happy score (~0.198) sits between the "high"
+    # threshold (0.15) and the "normal" threshold (0.25).
+    FAINT_SMILE = {"mouthSmileLeft": 0.18}
+    # A modest smile whose happy score (~0.275) clears "normal" (0.25) but not
+    # "low" (0.35).
+    MODEST_SMILE = {"mouthSmileLeft": 0.25}
+
+    def test_high_sensitivity_detects_faint_smile(self) -> None:
+        assert infer_emotion(self.FAINT_SMILE).label == "neutral"
+        result = infer_emotion(self.FAINT_SMILE, {"happy": "high"})
+        assert result.label == "happy"
+
+    def test_low_sensitivity_rejects_modest_smile(self) -> None:
+        assert infer_emotion(self.MODEST_SMILE).label == "happy"
+        result = infer_emotion(self.MODEST_SMILE, {"happy": "low"})
+        assert result.label == "neutral"
+
+    def test_normal_sensitivity_matches_default(self) -> None:
+        assert (
+            infer_emotion(self.MODEST_SMILE, {"happy": "normal"}).label
+            == infer_emotion(self.MODEST_SMILE).label
+        )
+
+    def test_unknown_level_falls_back_to_default(self) -> None:
+        result = infer_emotion(self.MODEST_SMILE, {"happy": "bogus"})
+        assert result.label == "happy"
+
+    def test_missing_emotion_uses_default(self) -> None:
+        # Sensitivity only set for another emotion → happy uses the default.
+        result = infer_emotion(self.MODEST_SMILE, {"angry": "low"})
+        assert result.label == "happy"
+
+    def test_empty_sensitivity_is_ignored(self) -> None:
+        result = infer_emotion(self.MODEST_SMILE, {})
+        assert result.label == "happy"
+

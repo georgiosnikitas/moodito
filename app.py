@@ -25,7 +25,14 @@ import rumps
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
-from emotion import EMOTION_EMOJI, EmotionResult, infer_emotion
+from emotion import (
+    DEFAULT_SENSITIVITY,
+    EMOTION_EMOJI,
+    SENSITIVITY_EMOTIONS,
+    SENSITIVITY_LEVELS,
+    EmotionResult,
+    infer_emotion,
+)
 
 MODEL_FILENAME = "face_landmarker.task"
 MODEL_URL = (
@@ -76,6 +83,8 @@ EXTRA_STATES = ["paused", "error"]
 STAT_KEYS = TRACKED_EMOTIONS + EXTRA_STATES
 # Emoji shown for each statistic row (emotions reuse EMOTION_EMOJI).
 STAT_EMOJI = {**EMOTION_EMOJI, "paused": "⏸️", "error": "⚠️"}
+# Title shown on the statistics datetime-range prompt and its error alerts.
+STATS_RANGE_TITLE = "Datetime Range"
 
 # How often (seconds) the menu bar title is refreshed from the latest result.
 UI_REFRESH_INTERVAL = 0.3
@@ -615,11 +624,23 @@ class FaceWorker(threading.Thread):
         self._result = EmotionResult("neutral", 0.0)
         self._error: str | None = None
         self._ready = False
+        self._sensitivity: dict[str, str] = {}
 
     @property
     def result(self) -> EmotionResult:
         with self._lock:
             return self._result
+
+    @property
+    def sensitivity(self) -> dict[str, str]:
+        """Per-emotion detection sensitivity used for inference."""
+        with self._lock:
+            return dict(self._sensitivity)
+
+    @sensitivity.setter
+    def sensitivity(self, value: dict[str, str]) -> None:
+        with self._lock:
+            self._sensitivity = dict(value)
 
     @property
     def ready(self) -> bool:
@@ -697,7 +718,7 @@ class FaceWorker(threading.Thread):
                     category.category_name: category.score
                     for category in detection.face_blendshapes[0]
                 }
-                self._set_result(infer_emotion(scores))
+                self._set_result(infer_emotion(scores, self.sensitivity))
             else:
                 self._set_result(EmotionResult("no face", 0.0))
 
@@ -717,6 +738,10 @@ class MooditoApp(rumps.App):
         legacy_icon_only = bool(self._settings.get("icon_only", False))
         self._show_emojis = bool(self._settings.get("show_emojis", not legacy_icon_only))
         self._show_labels = bool(self._settings.get("show_labels", not legacy_icon_only))
+        # Per-emotion detection sensitivity, restored from settings and shared
+        # with the worker thread that runs inference.
+        self._sensitivity = self._load_sensitivity()
+        self._worker.sensitivity = self._sensitivity
         # The statistics range always starts pinned to the live, sliding
         # last-24-hours window (the manual range is not persisted across runs).
         self._stats_live_24h = True
@@ -873,6 +898,22 @@ class MooditoApp(rumps.App):
         )
         self._license_menu.add(self._license_buy_item)
 
+        # Sensitivity submenu: one nested submenu per tunable emotion, each
+        # offering Low/Normal/High levels selectable inline (no dialog window).
+        self._sensitivity_menu = rumps.MenuItem("Sensitivity")
+        self._sensitivity_items: dict[tuple[str, str], rumps.MenuItem] = {}
+        for emotion in SENSITIVITY_EMOTIONS:
+            emotion_menu = rumps.MenuItem(emotion.capitalize())
+            set_emoji_icon(emotion_menu, EMOTION_EMOJI.get(emotion, ""))
+            for level in SENSITIVITY_LEVELS:
+                level_item = rumps.MenuItem(
+                    level.capitalize(), callback=self.set_sensitivity
+                )
+                level_item.state = self._sensitivity.get(emotion) == level
+                emotion_menu.add(level_item)
+                self._sensitivity_items[(emotion, level)] = level_item
+            self._sensitivity_menu.add(emotion_menu)
+
         self.menu = [
             rumps.MenuItem("Detected: …", callback=None),
             None,
@@ -886,6 +927,7 @@ class MooditoApp(rumps.App):
             rumps.MenuItem("Show Emojis", callback=self.toggle_emojis),
             rumps.MenuItem("Show Labels", callback=self.toggle_labels),
             rumps.MenuItem("Camera Grant Access", callback=self.grant_camera),
+            self._sensitivity_menu,
             rumps.MenuItem("Pause", callback=self.toggle_pause),
             None,
             self._license_menu,
@@ -919,6 +961,7 @@ class MooditoApp(rumps.App):
         set_symbol_icon(self._emojis_item, "face.smiling")
         set_symbol_icon(self._labels_item, "textformat")
         set_symbol_icon(self._camera_item, "camera")
+        set_symbol_icon(self._sensitivity_menu, "slider.horizontal.3")
         set_symbol_icon(self._pause_item, "pause.fill")
         set_symbol_icon(self._bmc_menu, "cup.and.saucer.fill")
         set_symbol_icon(self._bmc_open_item, "globe")
@@ -1200,7 +1243,7 @@ class MooditoApp(rumps.App):
             else self._stats_range_end.strftime("%Y-%m-%d %H:%M")
         )
         window = rumps.Window(
-            title="Datetime Range",
+            title=STATS_RANGE_TITLE,
             message=(
                 "Datetime format YYYY-MM-DD HH:MM\n\n"
                 "Use 'begin' as the start for the Since datetime, "
@@ -1217,7 +1260,7 @@ class MooditoApp(rumps.App):
         parsed = parse_datetime_range(response.text)
         if parsed is None:
             rumps.alert(
-                "Datetime Range",
+                STATS_RANGE_TITLE,
                 "Could not understand that range.\n"
                 "Use the format START to END (YYYY-MM-DD HH:MM).",
             )
@@ -1236,7 +1279,7 @@ class MooditoApp(rumps.App):
         effective_end = end_val if end_val is not None else now
         if start_val >= effective_end:
             rumps.alert(
-                "Datetime Range",
+                STATS_RANGE_TITLE,
                 "The start must be before the end.",
             )
             return
@@ -1297,6 +1340,40 @@ class MooditoApp(rumps.App):
         # Apply immediately rather than waiting for the next refresh tick.
         if not self._paused:
             self.refresh(None)
+
+    def _load_sensitivity(self) -> dict[str, str]:
+        """Return the per-emotion sensitivity, restored from settings.
+
+        Unknown emotions/levels fall back to the default so an edited or stale
+        settings file can never break inference.
+        """
+        stored = self._settings.get("sensitivity")
+        result = dict.fromkeys(SENSITIVITY_EMOTIONS, DEFAULT_SENSITIVITY)
+        if isinstance(stored, dict):
+            for emotion in SENSITIVITY_EMOTIONS:
+                level = stored.get(emotion)
+                if level in SENSITIVITY_LEVELS:
+                    result[emotion] = level
+        return result
+
+    def set_sensitivity(self, sender) -> None:
+        """Apply the Low/Normal/High level chosen from the Sensitivity menu."""
+        target = next(
+            (key for key, item in self._sensitivity_items.items() if item is sender),
+            None,
+        )
+        if target is None:
+            return
+        emotion, level = target
+        self._sensitivity[emotion] = level
+        # Update the checkmarks for this emotion's three level rows.
+        for candidate in SENSITIVITY_LEVELS:
+            item = self._sensitivity_items[(emotion, candidate)]
+            item.state = candidate == level
+        # Share the new setting with the inference thread and persist it.
+        self._worker.sensitivity = self._sensitivity
+        self._settings["sensitivity"] = self._sensitivity
+        save_settings(self._settings)
 
     def toggle_pause(self, _sender) -> None:
         self._paused = not self._paused

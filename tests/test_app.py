@@ -1467,6 +1467,74 @@ class TestToggles:
         assert saved and saved[0]["show_labels"] is False
 
 
+class TestSensitivity:
+    def test_defaults_to_normal_for_every_emotion(self, full_app) -> None:
+        for emotion in app.SENSITIVITY_EMOTIONS:
+            assert full_app._sensitivity[emotion] == app.DEFAULT_SENSITIVITY
+            normal_item = full_app._sensitivity_items[(emotion, "normal")]
+            assert normal_item.state == 1
+
+    def test_worker_receives_initial_sensitivity(self, full_app) -> None:
+        assert full_app._worker.sensitivity == full_app._sensitivity
+
+    def test_set_sensitivity_updates_state_worker_and_persists(
+        self, full_app, monkeypatch
+    ) -> None:
+        saved = []
+        monkeypatch.setattr(app, "save_settings", lambda s: saved.append(s))
+        item = full_app._sensitivity_items[("happy", "high")]
+        full_app.set_sensitivity(item)
+        # Setting recorded and shared with the inference thread.
+        assert full_app._sensitivity["happy"] == "high"
+        assert full_app._worker.sensitivity["happy"] == "high"
+        # Persisted to settings.
+        assert saved and saved[0]["sensitivity"]["happy"] == "high"
+        # Checkmarks: only the chosen level is ticked for this emotion.
+        assert full_app._sensitivity_items[("happy", "high")].state == 1
+        assert full_app._sensitivity_items[("happy", "normal")].state == 0
+        assert full_app._sensitivity_items[("happy", "low")].state == 0
+
+    def test_set_sensitivity_only_affects_its_emotion(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda s: None)
+        full_app.set_sensitivity(full_app._sensitivity_items[("angry", "low")])
+        assert full_app._sensitivity["angry"] == "low"
+        assert full_app._sensitivity["happy"] == app.DEFAULT_SENSITIVITY
+
+    def test_set_sensitivity_ignores_unknown_sender(
+        self, full_app, monkeypatch
+    ) -> None:
+        saved = []
+        monkeypatch.setattr(app, "save_settings", lambda s: saved.append(s))
+        before = dict(full_app._sensitivity)
+        full_app.set_sensitivity(app.rumps.MenuItem("stranger"))
+        assert full_app._sensitivity == before
+        assert saved == []
+
+    def test_load_sensitivity_restores_valid_levels(
+        self, data_dir, monkeypatch
+    ) -> None:
+        app.save_settings({"sensitivity": {"happy": "high", "angry": "low"}})
+        monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+        inst = app.MooditoApp()
+        assert inst._sensitivity["happy"] == "high"
+        assert inst._sensitivity["angry"] == "low"
+        # Untouched emotions keep the default.
+        assert inst._sensitivity["sad"] == app.DEFAULT_SENSITIVITY
+
+    def test_load_sensitivity_ignores_invalid_values(
+        self, data_dir, monkeypatch
+    ) -> None:
+        app.save_settings({"sensitivity": {"happy": "bogus", "sad": 5}})
+        monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+        inst = app.MooditoApp()
+        assert inst._sensitivity["happy"] == app.DEFAULT_SENSITIVITY
+        assert inst._sensitivity["sad"] == app.DEFAULT_SENSITIVITY
+
+
 class TestGrantCamera:
     def test_unavailable_shows_alert(self, full_app, monkeypatch) -> None:
         monkeypatch.setattr(app, "camera_authorization_status", lambda: None)
@@ -1545,7 +1613,7 @@ class TestFaceWorkerRun:
         monkeypatch.setattr(app.cv2, "COLOR_BGR2RGB", 0, raising=False)
         monkeypatch.setattr(app.mp, "Image", lambda **k: "image")
         monkeypatch.setattr(
-            app, "infer_emotion", lambda scores: EmotionResult("happy", 0.9)
+            app, "infer_emotion", lambda scores, sensitivity=None: EmotionResult("happy", 0.9)
         )
         worker = app.FaceWorker()
         landmarker = type(
