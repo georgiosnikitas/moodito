@@ -1274,10 +1274,12 @@ class MooditoApp(rumps.App):
             "Sensitivity…", callback=self.open_sensitivity_window
         )
         # AI provider is configured in a native NSAlert dialog (built each time
-        # it is opened) — see open_ai_provider_window.
+        # it is opened) — see open_ai_provider_window. The title shows which
+        # provider is currently selected.
         self._ai_provider_menu = rumps.MenuItem(
             "AI Provider…", callback=self.open_ai_provider_window
         )
+        self._update_ai_provider_menu()
         # Mood Tip asks the configured AI provider for a detailed report based
         # on the raw data collected within the selected date range.
         self._mood_tip_menu = rumps.MenuItem("Mood Tip…", callback=self.mood_tip)
@@ -1890,6 +1892,16 @@ class MooditoApp(rumps.App):
         self._ai_provider.setdefault("providers", {})[provider] = cleaned
         self._settings["ai_provider"] = self._ai_provider
         save_settings(self._settings)
+        self._update_ai_provider_menu()
+
+    def _update_ai_provider_menu(self) -> None:
+        """Reflect the currently selected AI provider (and model) in the title."""
+        provider = self._ai_provider.get("provider", DEFAULT_AI_PROVIDER)
+        model = self._ai_provider_values(provider).get("model", "").strip()
+        title = f"AI Provider: {provider}"
+        if model:
+            title += f" ({model})"
+        self._ai_provider_menu.title = title
 
     def open_ai_provider_window(self, _sender) -> None:
         """Show the AI Provider dialog (a native NSAlert, like Sensitivity).

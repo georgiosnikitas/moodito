@@ -1618,6 +1618,16 @@ class TestAIProvider:
     def test_menu_item_is_a_single_window_opener(self, full_app) -> None:
         assert full_app._ai_provider_menu.title.startswith("AI Provider")
 
+    def test_menu_title_shows_selected_provider(self, full_app, monkeypatch) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda s: None)
+        # Initial title reflects the default provider.
+        assert full_app._ai_provider_menu.title == (
+            f"AI Provider: {app.DEFAULT_AI_PROVIDER}"
+        )
+        # Switching providers shows the provider and its model (not the URL).
+        full_app._apply_ai_provider("OpenAI", {"api_key": "k", "model": "gpt-4o"})
+        assert full_app._ai_provider_menu.title == "AI Provider: OpenAI (gpt-4o)"
+
     def test_apply_provider_persists_only_relevant_fields(
         self, full_app, monkeypatch
     ) -> None:
