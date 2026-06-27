@@ -1736,11 +1736,49 @@ class TestAIProvider:
             "OpenAI Compatible",
             {"url": "https://x", "api_key": "sk", "model": "m"},
         )
-        _view, fields = full_app._build_ai_fields_accessory("OpenAI Compatible")
+        _view, fields, _status = full_app._build_ai_fields_accessory(
+            "OpenAI Compatible"
+        )
         assert set(fields) == set(app.AI_PROVIDER_FIELDS["OpenAI Compatible"])
         # Fields start pre-filled with their stored values.
         assert str(fields["url"].stringValue()) == "https://x"
         assert str(fields["model"].stringValue()) == "m"
+
+    def test_apply_if_tested_commits_on_success(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda s: None)
+        monkeypatch.setattr(
+            app, "test_ai_connection", lambda *a, **k: (True, "Connection successful.")
+        )
+        status = _FakeStatusLabel()
+        applied = full_app._apply_ai_provider_if_tested(
+            "OpenAI", {"api_key": "k", "model": "gpt"}, status
+        )
+        assert applied is True
+        assert status.value.startswith("✅")
+        assert full_app._ai_provider["provider"] == "OpenAI"
+        assert full_app._ai_provider["providers"]["OpenAI"]["model"] == "gpt"
+
+    def test_apply_if_tested_blocks_on_failure(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda s: None)
+        monkeypatch.setattr(
+            app, "test_ai_connection", lambda *a, **k: (False, "invalid api key")
+        )
+        before_provider = full_app._ai_provider["provider"]
+        before_providers = dict(full_app._ai_provider["providers"])
+        status = _FakeStatusLabel()
+        applied = full_app._apply_ai_provider_if_tested(
+            "OpenAI", {"api_key": "bad", "model": "gpt"}, status
+        )
+        assert applied is False
+        assert status.value.startswith("❌")
+        assert "invalid api key" in status.value
+        # Nothing was committed.
+        assert full_app._ai_provider["provider"] == before_provider
+        assert full_app._ai_provider["providers"] == before_providers
 
 
 class TestLLMConfigError:

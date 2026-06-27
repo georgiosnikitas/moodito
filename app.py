@@ -1934,16 +1934,21 @@ class MooditoApp(rumps.App):
         """Show the credential dialog for ``provider`` and commit on Apply.
 
         The accessory view carries a "Connection" row with a Test button that
-        verifies the entered details in place; the dialog keeps the standard
-        Apply / Cancel buttons.
+        verifies the entered details in place. Clicking Apply re-runs that
+        connection test: the provider is committed only if the test succeeds,
+        otherwise the failure is shown and the dialog stays open so the user can
+        fix the details (or Cancel).
         """
         try:
             from AppKit import NSAlert, NSAlertFirstButtonReturn, NSApp, NSImage
 
-            view, fields = self._build_ai_fields_accessory(provider)
+            view, fields, status = self._build_ai_fields_accessory(provider)
             alert = NSAlert.alloc().init()
             alert.setMessageText_(f"{provider} Settings")
-            alert.setInformativeText_("Enter the details for this provider.")
+            alert.setInformativeText_(
+                "Enter the details for this provider. Apply saves them only "
+                "after a successful connection test."
+            )
             alert.addButtonWithTitle_("Apply")
             alert.addButtonWithTitle_("Cancel")
             icon = NSImage.alloc().initByReferencingFile_(resource_path(MENUBAR_ICON))
@@ -1951,11 +1956,27 @@ class MooditoApp(rumps.App):
                 alert.setIcon_(icon)
             alert.setAccessoryView_(view)
             NSApp.activateIgnoringOtherApps_(True)
-            if alert.runModal() == NSAlertFirstButtonReturn:
+            while alert.runModal() == NSAlertFirstButtonReturn:
                 values = {key: str(field.stringValue()) for key, field in fields.items()}
-                self._apply_ai_provider(provider, values)
+                if self._apply_ai_provider_if_tested(provider, values, status):
+                    return
         except Exception:  # noqa: BLE001 - never let a UI glitch crash the menu
             pass
+
+    def _apply_ai_provider_if_tested(
+        self, provider: str, values: dict, status
+    ) -> bool:
+        """Test ``values`` and commit them only if the connection succeeds.
+
+        Updates the ``status`` label with the ✅/❌ result and returns ``True``
+        when the provider was applied (test passed), ``False`` otherwise.
+        """
+        ok, message = test_ai_connection(provider, values)
+        status.setStringValue_(("✅ " if ok else "❌ ") + message)
+        status.setToolTip_(message)
+        if ok:
+            self._apply_ai_provider(provider, values)
+        return ok
 
     def _run_ai_connection_test(self, provider: str, fields: dict, status) -> None:
         """Test the credentials currently typed in ``fields`` and show the result.
@@ -2109,7 +2130,7 @@ class MooditoApp(rumps.App):
         # Keep a strong reference so the handler outlives the modal dialog.
         self._ai_test_handler = handler
 
-        return view, fields
+        return view, fields, status
 
     def mood_tip(self, _sender) -> None:
         """Open the Mood Tip window: a fixed-size, scrollable report viewer.
