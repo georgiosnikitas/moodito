@@ -2081,6 +2081,9 @@ class _FakeMoodHandler:
         self.app = app_obj
         self.text_view = _FakeTextView()
         self.button = _FakeButton()
+        self.pdf_button = _FakeButton()
+        self.pdf_button.enabled = False
+        self.report_text = ""
 
     def showResult_(self, result) -> None:
         self.app._finish_mood_report(self, result)
@@ -2260,6 +2263,43 @@ class TestMoodTip:
         assert handler.app is full_app
         assert handler.text_view is not None
         assert handler.button is not None
+        # The PDF export button exists and starts disabled (no report yet).
+        assert handler.pdf_button is not None
+        assert handler.pdf_button.isEnabled() is False
+
+    def test_successful_report_enables_pdf_button(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda s: None)
+        full_app._apply_ai_provider("OpenAI", {"api_key": "k", "model": "gpt"})
+        monkeypatch.setattr(app, "call_llm", lambda *a, **k: "stay positive")
+        _patch_sync_threads(monkeypatch)
+        handler = _FakeMoodHandler(full_app)
+        full_app._start_mood_report(handler)
+        assert handler.report_text == "stay positive"
+        assert handler.pdf_button.enabled is True
+
+    def test_error_keeps_pdf_button_disabled(self, full_app, monkeypatch) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda s: None)
+        full_app._apply_ai_provider("OpenAI", {"api_key": "k", "model": "gpt"})
+
+        def boom(*a, **k):
+            raise OSError("offline")
+
+        monkeypatch.setattr(app, "call_llm", boom)
+        _patch_sync_threads(monkeypatch)
+        handler = _FakeMoodHandler(full_app)
+        full_app._start_mood_report(handler)
+        assert handler.report_text == ""
+        assert handler.pdf_button.enabled is False
+
+    def test_save_pdf_no_report_is_noop(self, full_app, monkeypatch) -> None:
+        called = []
+        monkeypatch.setattr(app, "write_text_pdf", lambda *a, **k: called.append(a))
+        handler = _FakeMoodHandler(full_app)
+        handler.report_text = ""
+        full_app._save_mood_report_pdf(handler)
+        assert called == []  # nothing to save, no panel, no write
 
 
 

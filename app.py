@@ -129,6 +129,11 @@ MOOD_TIP_INTRO = (
 )
 # Message shown while the LLM is being contacted.
 MOOD_TIP_WAIT = "Please wait… contacting your AI provider. This can take a moment."
+# Prefix of the message shown when a report could not be generated. Used to
+# tell a real report apart from an error when deciding whether to allow saving.
+MOOD_TIP_ERROR_PREFIX = "Could not get a mood report:"
+# Default file name suggested when saving a generated report as a PDF.
+MOOD_TIP_PDF_NAME = "Moodito Mood Report.pdf"
 
 # How often (seconds) the menu bar title is refreshed from the latest result.
 UI_REFRESH_INTERVAL = 0.3
@@ -615,6 +620,12 @@ def _mood_tip_handler_class():
             except Exception:  # noqa: BLE001 - never let a UI glitch crash
                 pass
 
+        def savePdf_(self, _sender) -> None:
+            try:
+                self.app._save_mood_report_pdf(self)
+            except Exception:  # noqa: BLE001 - never let a UI glitch crash
+                pass
+
         def showResult_(self, result) -> None:
             try:
                 self.app._finish_mood_report(self, result)
@@ -623,6 +634,57 @@ def _mood_tip_handler_class():
 
     _MOOD_TIP_HANDLER_CLASS = _MoodTipHandler
     return _MoodTipHandler
+
+
+def write_text_pdf(text: str, url) -> None:
+    """Write ``text`` to a paginated PDF file at ``url`` (best-effort).
+
+    Lays the report out in an off-screen text view sized to the printable page
+    width and runs a non-interactive print operation that saves directly to the
+    given file URL. Pagination across pages is handled by the print system.
+    """
+    try:
+        from AppKit import (
+            NSFont,
+            NSPrintInfo,
+            NSPrintJobDisposition,
+            NSPrintJobSavingURL,
+            NSPrintOperation,
+            NSPrintSaveJob,
+            NSTextView,
+        )
+        from Foundation import NSMakeRect, NSMakeSize, NSMutableDictionary
+
+        info_dict = NSMutableDictionary.dictionary()
+        info_dict[NSPrintJobDisposition] = NSPrintSaveJob
+        info_dict[NSPrintJobSavingURL] = url
+        print_info = NSPrintInfo.alloc().initWithDictionary_(info_dict)
+
+        page_width = (
+            print_info.paperSize().width
+            - print_info.leftMargin()
+            - print_info.rightMargin()
+        )
+        text_view = NSTextView.alloc().initWithFrame_(
+            NSMakeRect(0.0, 0.0, page_width, 10.0)
+        )
+        text_view.setHorizontallyResizable_(False)
+        text_view.setVerticallyResizable_(True)
+        text_view.setMaxSize_(NSMakeSize(page_width, 1.0e7))
+        text_view.textContainer().setContainerSize_(NSMakeSize(page_width, 1.0e7))
+        text_view.textContainer().setWidthTracksTextView_(True)
+        text_view.setFont_(NSFont.systemFontOfSize_(11.0))
+        text_view.setString_(str(text))
+        text_view.sizeToFit()
+
+        operation = NSPrintOperation.printOperationWithView_printInfo_(
+            text_view, print_info
+        )
+        operation.setShowsPrintPanel_(False)
+        operation.setShowsProgressPanel_(False)
+        operation.runOperation()
+    except Exception:  # noqa: BLE001 - never let PDF export crash the app
+        pass
 
 
 def load_stats() -> tuple[dict, str | None]:
@@ -2205,9 +2267,10 @@ class MooditoApp(rumps.App):
     def _build_mood_tip_accessory(self):
         """Build the Mood Tip accessory view.
 
-        Returns the ``NSView`` containing a "Generate Report" button above a
-        fixed-size, read-only, vertically scrolling text area. The button is
-        wired to a retained ObjC handler that drives report generation.
+        Returns the ``NSView`` containing "Generate Report" and "Save as PDF"
+        buttons above a fixed-size, read-only, vertically scrolling text area.
+        The buttons are wired to a retained ObjC handler that drives report
+        generation and PDF export.
         """
         from AppKit import (
             NSBezelBorder,
@@ -2236,6 +2299,15 @@ class MooditoApp(rumps.App):
         button.setBezelStyle_(NSBezelStyleRounded)
         view.addSubview_(button)
 
+        # "Save as PDF" button, disabled until a report has been generated.
+        pdf_button = NSButton.alloc().initWithFrame_(
+            NSMakeRect(width - 130.0, text_h + gap, 130.0, button_h)
+        )
+        pdf_button.setTitle_("Save as PDF")
+        pdf_button.setBezelStyle_(NSBezelStyleRounded)
+        pdf_button.setEnabled_(False)
+        view.addSubview_(pdf_button)
+
         # Fixed-size, vertically scrolling, read-only report area.
         scroll = NSScrollView.alloc().initWithFrame_(
             NSMakeRect(0.0, 0.0, width, text_h)
@@ -2262,13 +2334,18 @@ class MooditoApp(rumps.App):
         scroll.setDocumentView_(text_view)
         view.addSubview_(scroll)
 
-        # Wire the button to a retained handler that runs report generation.
+        # Wire the buttons to a retained handler that runs report generation
+        # and PDF export.
         handler = _mood_tip_handler_class().alloc().init()
         handler.app = self
         handler.text_view = text_view
         handler.button = button
+        handler.pdf_button = pdf_button
+        handler.report_text = ""
         button.setTarget_(handler)
         button.setAction_("generate:")
+        pdf_button.setTarget_(handler)
+        pdf_button.setAction_("savePdf:")
         # Keep a strong reference so the handler outlives the modal dialog.
         self._mood_tip_handler = handler
 
@@ -2319,7 +2396,7 @@ class MooditoApp(rumps.App):
         try:
             message = call_llm(provider, config, prompt)
         except (OSError, ValueError) as exc:
-            message = f"Could not get a mood report:\n{exc}"
+            message = f"{MOOD_TIP_ERROR_PREFIX}\n{exc}"
         self._llm_busy.clear()
         self._post_mood_result(handler, message)
 
@@ -2341,9 +2418,45 @@ class MooditoApp(rumps.App):
         )
 
     def _finish_mood_report(self, handler, message: str) -> None:
-        """Show the finished report (main thread) and re-enable the button."""
-        handler.text_view.setString_(str(message))
+        """Show the finished report (main thread) and re-enable the button.
+
+        A successful report also stores its text on the handler and enables the
+        "Save as PDF" button; an error leaves PDF export disabled.
+        """
+        text = str(message)
+        handler.text_view.setString_(text)
         handler.button.setEnabled_(True)
+        is_report = not text.startswith(MOOD_TIP_ERROR_PREFIX)
+        handler.report_text = text if is_report else ""
+        pdf_button = getattr(handler, "pdf_button", None)
+        if pdf_button is not None:
+            pdf_button.setEnabled_(is_report)
+
+    def _save_mood_report_pdf(self, handler) -> None:
+        """Save the current report to a user-chosen PDF file.
+
+        Opens a native save panel (nested in the open Mood Tip modal) and writes
+        the report text to a paginated PDF. No-ops if no report exists yet.
+        """
+        text = getattr(handler, "report_text", "")
+        if not text:
+            return
+        from AppKit import NSApp, NSModalResponseOK, NSSavePanel
+
+        panel = NSSavePanel.savePanel()
+        panel.setNameFieldStringValue_(MOOD_TIP_PDF_NAME)
+        try:
+            from UniformTypeIdentifiers import UTTypePDF
+
+            panel.setAllowedContentTypes_([UTTypePDF])
+        except Exception:  # noqa: BLE001 - older macOS lacks UniformTypeIdentifiers
+            panel.setAllowedFileTypes_(["pdf"])
+        NSApp.activateIgnoringOtherApps_(True)
+        if panel.runModal() != NSModalResponseOK:
+            return
+        url = panel.URL()
+        if url is not None:
+            write_text_pdf(text, url)
 
     def toggle_pause(self, _sender) -> None:
         self._paused = not self._paused
