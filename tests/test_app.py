@@ -1616,17 +1616,17 @@ class TestAIProvider:
         assert full_app._ai_provider["providers"] == {}
 
     def test_menu_item_is_a_single_window_opener(self, full_app) -> None:
-        assert full_app._ai_provider_menu.title.startswith("AI Provider")
+        assert "AI Provider" in full_app._ai_provider_menu.title
 
     def test_menu_title_shows_selected_provider(self, full_app, monkeypatch) -> None:
         monkeypatch.setattr(app, "save_settings", lambda s: None)
-        # Initial title reflects the default provider.
+        # Initial title reflects the default provider and marks it unconfigured.
         assert full_app._ai_provider_menu.title == (
-            f"AI Provider: {app.DEFAULT_AI_PROVIDER}"
+            f"AI Provider: {app.DEFAULT_AI_PROVIDER} \u2717"
         )
-        # Switching providers shows the provider and its model (not the URL).
+        # Switching providers shows a ✓, the provider and its model (not the URL).
         full_app._apply_ai_provider("OpenAI", {"api_key": "k", "model": "gpt-4o"})
-        assert full_app._ai_provider_menu.title == "AI Provider: OpenAI (gpt-4o)"
+        assert full_app._ai_provider_menu.title == "AI Provider: OpenAI (gpt-4o) \u2713"
 
     def test_apply_provider_persists_only_relevant_fields(
         self, full_app, monkeypatch
@@ -1779,6 +1779,42 @@ class TestAIProvider:
         # Nothing was committed.
         assert full_app._ai_provider["provider"] == before_provider
         assert full_app._ai_provider["providers"] == before_providers
+
+    def test_clear_removes_saved_credentials(self, full_app, monkeypatch) -> None:
+        saved = []
+        monkeypatch.setattr(app, "save_settings", lambda s: saved.append(s))
+        full_app._apply_ai_provider("OpenAI", {"api_key": "k", "model": "gpt"})
+        assert "OpenAI" in full_app._ai_provider["providers"]
+        full_app._clear_ai_provider("OpenAI")
+        assert "OpenAI" not in full_app._ai_provider["providers"]
+        assert saved  # persisted
+
+    def test_clear_unconfigured_provider_is_noop(
+        self, full_app, monkeypatch
+    ) -> None:
+        saved = []
+        monkeypatch.setattr(app, "save_settings", lambda s: saved.append(s))
+        full_app._clear_ai_provider("Ollama")  # nothing stored; must not raise
+        assert saved == []  # nothing to persist
+
+    def test_clear_in_dialog_empties_fields_and_status(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda s: None)
+        full_app._apply_ai_provider("OpenAI", {"api_key": "k", "model": "gpt"})
+        fields = {
+            "api_key": _FakeTextField("k"),
+            "model": _FakeTextField("gpt"),
+        }
+        status = _FakeStatusLabel()
+        full_app._clear_ai_provider_in_dialog("OpenAI", fields, status)
+        # Stored config is gone and the dialog fields are blanked.
+        assert "OpenAI" not in full_app._ai_provider["providers"]
+        assert all(f.stringValue() == "" for f in fields.values())
+        assert "Cleared" in status.value
+        # Title drops the model and marks it unconfigured now the config is gone.
+        assert full_app._ai_provider_menu.title == "AI Provider: OpenAI \u2717"
+
 
 
 class TestLLMConfigError:
@@ -1988,13 +2024,16 @@ class TestCallLLM:
 
 
 class _FakeTextField:
-    """Minimal NSTextField stand-in exposing stringValue()."""
+    """Minimal NSTextField stand-in exposing get/set stringValue()."""
 
     def __init__(self, value: str = "") -> None:
         self._value = value
 
     def stringValue(self) -> str:
         return self._value
+
+    def setStringValue_(self, value: str) -> None:
+        self._value = value
 
 
 class _FakeStatusLabel:

@@ -585,6 +585,14 @@ def _ai_test_handler_class():
             except Exception:  # noqa: BLE001 - never let a UI glitch crash
                 pass
 
+        def clearProvider_(self, _sender) -> None:
+            try:
+                self.app._clear_ai_provider_in_dialog(
+                    self.provider, self.fields, self.status
+                )
+            except Exception:  # noqa: BLE001 - never let a UI glitch crash
+                pass
+
     _AI_TEST_HANDLER_CLASS = _AITestHandler
     return _AITestHandler
 
@@ -1895,13 +1903,19 @@ class MooditoApp(rumps.App):
         self._update_ai_provider_menu()
 
     def _update_ai_provider_menu(self) -> None:
-        """Reflect the currently selected AI provider (and model) in the title."""
+        """Reflect the currently selected AI provider (and model) in the title.
+
+        A trailing ✓ marks a provider whose configuration is complete; a
+        trailing ✗ marks one that still needs setup.
+        """
         provider = self._ai_provider.get("provider", DEFAULT_AI_PROVIDER)
-        model = self._ai_provider_values(provider).get("model", "").strip()
+        config = self._ai_provider_values(provider)
+        mark = "✗" if ai_provider_config_error(provider, config) else "✓"
+        model = config.get("model", "").strip()
         title = f"AI Provider: {provider}"
         if model:
             title += f" ({model})"
-        self._ai_provider_menu.title = title
+        self._ai_provider_menu.title = f"{title} {mark}"
 
     def open_ai_provider_window(self, _sender) -> None:
         """Show the AI Provider dialog (a native NSAlert, like Sensitivity).
@@ -1933,8 +1947,9 @@ class MooditoApp(rumps.App):
     def _open_ai_provider_fields(self, provider: str) -> None:
         """Show the credential dialog for ``provider`` and commit on Apply.
 
-        The accessory view carries a "Connection" row with a Test button that
-        verifies the entered details in place. Clicking Apply re-runs that
+        The accessory view's "Connection" row carries a Test button that
+        verifies the entered details in place and a Clear button that removes
+        any saved credentials for the provider. Clicking Apply re-runs the
         connection test: the provider is committed only if the test succeeds,
         otherwise the failure is shown and the dialog stays open so the user can
         fix the details (or Cancel).
@@ -1962,6 +1977,23 @@ class MooditoApp(rumps.App):
                     return
         except Exception:  # noqa: BLE001 - never let a UI glitch crash the menu
             pass
+
+    def _clear_ai_provider(self, provider: str) -> None:
+        """Remove any saved credentials for ``provider`` and persist."""
+        providers = self._ai_provider.get("providers", {})
+        if provider in providers:
+            del providers[provider]
+            self._settings["ai_provider"] = self._ai_provider
+            save_settings(self._settings)
+        self._update_ai_provider_menu()
+
+    def _clear_ai_provider_in_dialog(self, provider: str, fields: dict, status) -> None:
+        """Clear the saved credentials and empty the dialog's fields in place."""
+        self._clear_ai_provider(provider)
+        for field in fields.values():
+            field.setStringValue_("")
+        status.setStringValue_("🧹 Cleared saved credentials.")
+        status.setToolTip_("")
 
     def _apply_ai_provider_if_tested(
         self, provider: str, values: dict, status
@@ -2082,7 +2114,7 @@ class MooditoApp(rumps.App):
             view.addSubview_(field)
             fields[key] = field
 
-        # Connection row: "Connection" label + rectangular Test button.
+        # Connection row: "Connection" label + rectangular Test/Clear buttons.
         conn_y = status_h
         conn_label = NSTextField.alloc().initWithFrame_(
             NSMakeRect(0.0, conn_y + 4.0, label_w, 22.0)
@@ -2103,6 +2135,14 @@ class MooditoApp(rumps.App):
         button.setBezelStyle_(NSBezelStyleRounded)
         view.addSubview_(button)
 
+        # "Clear" button right next to "Test", with the same style.
+        clear_button = NSButton.alloc().initWithFrame_(
+            NSMakeRect(label_w + gap + button_w + gap, conn_y + 1.0, button_w, 26.0)
+        )
+        clear_button.setTitle_("Clear")
+        clear_button.setBezelStyle_(NSBezelStyleRounded)
+        view.addSubview_(clear_button)
+
         # Full-width multi-line status area so long errors wrap and stay visible.
         status = NSTextField.alloc().initWithFrame_(
             NSMakeRect(0.0, 0.0, width, status_h)
@@ -2119,7 +2159,7 @@ class MooditoApp(rumps.App):
         status.cell().setLineBreakMode_(NSLineBreakByWordWrapping)
         view.addSubview_(status)
 
-        # Wire the button to a retained ObjC handler that runs the test in place.
+        # Wire the buttons to a retained ObjC handler (test in place / clear).
         handler = _ai_test_handler_class().alloc().init()
         handler.app = self
         handler.provider = provider
@@ -2127,6 +2167,8 @@ class MooditoApp(rumps.App):
         handler.status = status
         button.setTarget_(handler)
         button.setAction_("runTest:")
+        clear_button.setTarget_(handler)
+        clear_button.setAction_("clearProvider:")
         # Keep a strong reference so the handler outlives the modal dialog.
         self._ai_test_handler = handler
 
