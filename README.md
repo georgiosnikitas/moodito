@@ -44,7 +44,10 @@ Everything lives in the menu bar dropdown — small, fast, and out of your way.
   like. Without a license, the range stays pinned to the last 24 hours.
 - **✨ AI-powered Mood Tip** — ask your configured AI provider for a detailed,
   personalised wellbeing report based on your selected date range, delivered in
-  a scrollable in-app window.
+  a scrollable in-app window. **Save as PDF** to export a polished, branded
+  report — complete with the Moodito badge, generation date, date range,
+  face-scanning time, a full per-emotion breakdown (occurrences, share and
+  duration, with totals) and the AI provider/model used.
 - **🔌 Bring your own AI provider** — connect **Anthropic**, **Gemini**,
   **OpenAI**, any **OpenAI-compatible** endpoint, or local **Ollama**. Credentials
   are stored locally, and a built-in **Test** button verifies the connection
@@ -123,7 +126,8 @@ allowing it under System Settings -> Privacy & Security). The model is cached in
 5. Detections are logged on-device and aggregated into the **Insights** charts
    and statistics over your selected date range.
 6. On request, the **Mood Tip** feature sends a summary of that range to your
-   configured AI provider to generate a wellbeing report.
+   configured AI provider to generate a wellbeing report, which you can export
+   as a styled PDF.
 
 Everything in steps 1–5 stays entirely on your Mac. Only the optional Mood Tip
 in step 6 contacts the AI provider you explicitly configure.

@@ -81,6 +81,9 @@ TRACKED_EMOTIONS = ["happy", "sad", "surprised", "angry", "neutral", "no face"]
 EXTRA_STATES = ["paused", "error"]
 # All statistic rows, in display order.
 STAT_KEYS = TRACKED_EMOTIONS + EXTRA_STATES
+# The genuine facial emotions (excludes "no face"/paused/error). Used to count
+# how many emotions a generated report is actually based on.
+REPORT_EMOTIONS = ("happy", "sad", "surprised", "angry", "neutral")
 # Emoji shown for each statistic row (emotions reuse EMOTION_EMOJI).
 STAT_EMOJI = {**EMOTION_EMOJI, "paused": "⏸️", "error": "⚠️"}
 # Title shown on the statistics datetime-range prompt and its error alerts.
@@ -134,6 +137,8 @@ MOOD_TIP_WAIT = "Please wait… contacting your AI provider. This can take a mom
 MOOD_TIP_ERROR_PREFIX = "Could not get a mood report:"
 # Default file name suggested when saving a generated report as a PDF.
 MOOD_TIP_PDF_NAME = "Moodito Mood Report.pdf"
+# Brand accent colour (RGB 0-1) used for the PDF report's header and headings.
+PDF_ACCENT_RGB = (0.45, 0.36, 0.86)
 
 # How often (seconds) the menu bar title is refreshed from the latest result.
 UI_REFRESH_INTERVAL = 0.3
@@ -636,16 +641,17 @@ def _mood_tip_handler_class():
     return _MoodTipHandler
 
 
-def write_text_pdf(text: str, url) -> None:
-    """Write ``text`` to a paginated PDF file at ``url`` (best-effort).
+def write_report_pdf(report_text: str, meta: dict | None, url) -> None:
+    """Write a styled mood-report PDF to ``url`` (best-effort).
 
-    Lays the report out in an off-screen text view sized to the printable page
-    width and runs a non-interactive print operation that saves directly to the
-    given file URL. Pagination across pages is handled by the print system.
+    Builds a rich, branded cover header (Moodito icon, generation date, date
+    range, total tracked time, a per-emotion breakdown table and the AI
+    provider/model) followed by the report body, then runs a non-interactive
+    print operation that saves directly to the given file URL. Pagination is
+    handled by the print system.
     """
     try:
         from AppKit import (
-            NSFont,
             NSPrintInfo,
             NSPrintJobDisposition,
             NSPrintJobSavingURL,
@@ -659,12 +665,26 @@ def write_text_pdf(text: str, url) -> None:
         info_dict[NSPrintJobDisposition] = NSPrintSaveJob
         info_dict[NSPrintJobSavingURL] = url
         print_info = NSPrintInfo.alloc().initWithDictionary_(info_dict)
+        # Custom print dictionaries default to zero margins, which lets text
+        # spill past the printer's imageable area and get clipped. Set sensible
+        # margins so the content sits comfortably inside the page.
+        margin = 54.0
+        print_info.setLeftMargin_(margin)
+        print_info.setRightMargin_(margin)
+        print_info.setTopMargin_(margin)
+        print_info.setBottomMargin_(margin)
+        # Anchor content to the top-left; otherwise a short final page is
+        # vertically centred, so a continuation page would not start at the top.
+        print_info.setVerticallyCentered_(False)
+        print_info.setHorizontallyCentered_(False)
 
         page_width = (
             print_info.paperSize().width
             - print_info.leftMargin()
             - print_info.rightMargin()
         )
+        body = _build_report_attributed_string(report_text, meta or {}, page_width)
+
         text_view = NSTextView.alloc().initWithFrame_(
             NSMakeRect(0.0, 0.0, page_width, 10.0)
         )
@@ -673,8 +693,7 @@ def write_text_pdf(text: str, url) -> None:
         text_view.setMaxSize_(NSMakeSize(page_width, 1.0e7))
         text_view.textContainer().setContainerSize_(NSMakeSize(page_width, 1.0e7))
         text_view.textContainer().setWidthTracksTextView_(True)
-        text_view.setFont_(NSFont.systemFontOfSize_(11.0))
-        text_view.setString_(str(text))
+        text_view.textStorage().setAttributedString_(body)
         text_view.sizeToFit()
 
         operation = NSPrintOperation.printOperationWithView_printInfo_(
@@ -685,6 +704,240 @@ def write_text_pdf(text: str, url) -> None:
         operation.runOperation()
     except Exception:  # noqa: BLE001 - never let PDF export crash the app
         pass
+
+
+def _pdf_brand_badge_image(size: float = 72.0):
+    """Compose a coloured brand badge (accent rounded square + Moodito glyph).
+
+    The bundled ``moodito.png`` is a white menu-bar glyph on transparency, so it
+    is invisible on white paper. Drawing it on an accent-coloured rounded badge
+    makes a crisp, visible logo for the PDF header. Returns an ``NSImage`` or
+    ``None`` if the glyph cannot be loaded.
+    """
+    from AppKit import NSBezierPath, NSColor, NSImage
+    from Foundation import NSMakeRect, NSMakeSize
+
+    glyph = NSImage.alloc().initWithContentsOfFile_(resource_path(MENUBAR_ICON))
+    if glyph is None or not glyph.isValid():
+        return None
+    r, g, b = PDF_ACCENT_RGB
+    badge = NSImage.alloc().initWithSize_(NSMakeSize(size, size))
+    badge.lockFocus()
+    NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 1.0).set()
+    radius = size * 0.26
+    NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+        NSMakeRect(0.0, 0.0, size, size), radius, radius
+    ).fill()
+    inset = size * 0.15
+    glyph.drawInRect_(NSMakeRect(inset, inset, size - 2 * inset, size - 2 * inset))
+    badge.unlockFocus()
+    return badge
+
+
+def _pdf_icon_attributed_string(centered_style):
+    """Return a centred brand-badge attributed string, or None if unavailable."""
+    try:
+        from AppKit import (
+            NSMutableAttributedString,
+            NSParagraphStyleAttributeName,
+            NSTextAttachment,
+            NSTextAttachmentCell,
+        )
+        from Foundation import NSAttributedString
+
+        badge = _pdf_brand_badge_image()
+        if badge is None:
+            return None
+        cell = NSTextAttachmentCell.alloc().initImageCell_(badge)
+        attachment = NSTextAttachment.alloc().init()
+        attachment.setAttachmentCell_(cell)
+        icon_str = NSMutableAttributedString.alloc().initWithAttributedString_(
+            NSAttributedString.attributedStringWithAttachment_(attachment)
+        )
+        icon_str.addAttribute_value_range_(
+            NSParagraphStyleAttributeName, centered_style, (0, icon_str.length())
+        )
+        return icon_str
+    except Exception:  # noqa: BLE001 - the icon is decorative; skip on failure
+        return None
+
+
+def _append_pdf_summary(append, para, meta, accent, ink):
+    """Append the bold label/value summary rows to the report's header."""
+    from AppKit import NSFont
+
+    summary = [
+        ("DATE RANGE",
+         f"{meta.get('range_start', '—')}  →  {meta.get('range_end', '—')}"),
+        ("FACE-SCANNING TIME", meta.get("total_duration", "—")),
+        ("AI PROVIDER", f"{meta.get('provider', '—')}  ·  {meta.get('model') or '—'}"),
+    ]
+    label_font = NSFont.boldSystemFontOfSize_(9.0)
+    value_font = NSFont.systemFontOfSize_(13.0)
+    for label, value in summary:
+        append(f"{label}\n", label_font, accent, para(setParagraphSpacing_=1.0), kern=1.5)
+        append(f"{value}\n", value_font, ink, para(setParagraphSpacing_=10.0))
+
+
+def _append_pdf_emotion_table(append, para, make_tabs, meta, accent, muted, ink):
+    """Append the per-emotion breakdown table to the report's header."""
+    from AppKit import NSFont
+
+    append(
+        "Emotional Breakdown\n",
+        NSFont.boldSystemFontOfSize_(15.0),
+        accent,
+        para(setParagraphSpacing_=8.0),
+    )
+    header = para(setParagraphSpacing_=4.0)
+    header.setTabStops_(make_tabs())
+    append(
+        "Emotion\tTimes\tShare\tDuration\n",
+        NSFont.boldSystemFontOfSize_(9.5),
+        muted,
+        header,
+        kern=0.5,
+    )
+    emotions = meta.get("emotions") or []
+    if not emotions:
+        append(
+            "No emotions were recorded in this period.\n",
+            NSFont.systemFontOfSize_(12.0),
+            muted,
+            para(setParagraphSpacing_=5.0),
+        )
+        return
+    row_font = NSFont.systemFontOfSize_(12.5)
+    for emo in emotions:
+        row = para(setParagraphSpacing_=5.0)
+        row.setTabStops_(make_tabs())
+        line = (
+            f"{emo.get('emoji', '')}  {emo.get('name', '')}\t"
+            f"{emo.get('count', 0)}\t"
+            f"{emo.get('pct', 0.0):.0f}%\t"
+            f"{emo.get('duration', '—')}\n"
+        )
+        append(line, row_font, ink, row)
+
+    # Σ totals row, separated by a thin rule and shown in bold accent.
+    totals = meta.get("totals") or {}
+    total_row = para(setParagraphSpacingBefore_=6.0, setParagraphSpacing_=5.0)
+    total_row.setTabStops_(make_tabs())
+    total_line = (
+        f"Σ  Total\t"
+        f"{totals.get('count', 0)}\t"
+        f"{totals.get('pct', 0.0):.0f}%\t"
+        f"{totals.get('duration', '—')}\n"
+    )
+    append(total_line, NSFont.boldSystemFontOfSize_(12.5), accent, total_row)
+
+
+def _build_report_attributed_string(report_text: str, meta: dict, page_width: float):
+    """Build the styled ``NSAttributedString`` for the mood-report PDF.
+
+    Lays out a branded header (icon, title, metadata, per-emotion table) above
+    the report body. ``page_width`` is the printable content width, used to
+    place the right-aligned table columns.
+    """
+    from AppKit import (
+        NSCenterTextAlignment,
+        NSColor,
+        NSFont,
+        NSFontAttributeName,
+        NSForegroundColorAttributeName,
+        NSKernAttributeName,
+        NSMutableAttributedString,
+        NSMutableParagraphStyle,
+        NSParagraphStyleAttributeName,
+        NSRightTextAlignment,
+        NSTextTab,
+    )
+    from Foundation import NSAttributedString
+
+    r, g, b = PDF_ACCENT_RGB
+    accent = NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 1.0)
+    ink = NSColor.colorWithCalibratedWhite_alpha_(0.12, 1.0)
+    muted = NSColor.colorWithCalibratedWhite_alpha_(0.45, 1.0)
+    hairline = NSColor.colorWithCalibratedWhite_alpha_(0.80, 1.0)
+
+    out = NSMutableAttributedString.alloc().init()
+
+    def para(**kwargs):
+        style = NSMutableParagraphStyle.alloc().init()
+        for setter, value in kwargs.items():
+            getattr(style, setter)(value)
+        return style
+
+    def append(text, font, color, style=None, kern=None):
+        attrs = {NSFontAttributeName: font, NSForegroundColorAttributeName: color}
+        if style is not None:
+            attrs[NSParagraphStyleAttributeName] = style
+        if kern is not None:
+            attrs[NSKernAttributeName] = kern
+        out.appendAttributedString_(
+            NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+        )
+
+    def rule(spacing_before=4.0, spacing_after=14.0):
+        append(
+            "\u00a0\n",
+            NSFont.systemFontOfSize_(0.6),
+            hairline,
+            para(
+                setParagraphSpacingBefore_=spacing_before,
+                setParagraphSpacing_=spacing_after,
+                setLineHeightMultiple_=0.4,
+            ),
+        )
+
+    def make_tabs():
+        cols = (page_width * 0.58, page_width * 0.76, page_width * 0.96)
+        return [
+            NSTextTab.alloc().initWithTextAlignment_location_options_(
+                NSRightTextAlignment, loc, {}
+            )
+            for loc in cols
+        ]
+
+    centered = para(setAlignment_=NSCenterTextAlignment, setParagraphSpacing_=2.0)
+
+    # Centred Moodito icon at the very top.
+    icon_str = _pdf_icon_attributed_string(centered)
+    if icon_str is not None:
+        out.appendAttributedString_(icon_str)
+        append("\n", NSFont.systemFontOfSize_(6.0), ink, centered)
+
+    # Brand wordmark + report title.
+    append("MOODITO\n", NSFont.boldSystemFontOfSize_(13.0), accent, centered, kern=4.0)
+    append("Mood Report\n", NSFont.boldSystemFontOfSize_(30.0), ink, centered)
+    append(
+        f"Generated {meta.get('generated', '—')}\n",
+        NSFont.systemFontOfSize_(10.5),
+        muted,
+        para(setAlignment_=NSCenterTextAlignment, setParagraphSpacingBefore_=2.0,
+             setParagraphSpacing_=14.0),
+    )
+
+    rule()
+    _append_pdf_summary(append, para, meta, accent, ink)
+    rule()
+    _append_pdf_emotion_table(append, para, make_tabs, meta, accent, muted, ink)
+    rule(spacing_before=10.0, spacing_after=16.0)
+
+    # The report body itself.
+    append(
+        "Your Wellbeing Report\n",
+        NSFont.boldSystemFontOfSize_(15.0),
+        accent,
+        para(setParagraphSpacing_=8.0),
+    )
+    append(
+        str(report_text),
+        NSFont.systemFontOfSize_(12.0),
+        ink,
+        para(setParagraphSpacing_=8.0, setLineHeightMultiple_=1.18),
+    )
+    return out
 
 
 def load_stats() -> tuple[dict, str | None]:
@@ -2342,6 +2595,7 @@ class MooditoApp(rumps.App):
         handler.button = button
         handler.pdf_button = pdf_button
         handler.report_text = ""
+        handler.report_meta = None
         button.setTarget_(handler)
         button.setAction_("generate:")
         pdf_button.setTarget_(handler)
@@ -2382,6 +2636,7 @@ class MooditoApp(rumps.App):
             )
             return
         prompt = self._build_mood_report_prompt()
+        handler.report_meta = self._collect_report_meta(provider, config)
         self._llm_busy.set()
         handler.button.setEnabled_(False)
         handler.text_view.setString_(MOOD_TIP_WAIT)
@@ -2417,6 +2672,52 @@ class MooditoApp(rumps.App):
             "showResult:", message, False, modes
         )
 
+    def _collect_report_meta(self, provider: str, config: dict) -> dict:
+        """Snapshot the selected range's stats for the PDF report header.
+
+        Returns the generation date, the date range, the total face-scanning
+        time, a per-emotion breakdown (times, share, duration) and the AI
+        provider/model used. Pure Python (no AppKit) so it stays testable.
+        """
+        stats = self._range_stats
+        total = sum(entry.get("seconds", 0.0) for entry in stats.values())
+        total_count = 0
+        emotions = []
+        for key in STAT_KEYS:
+            entry = stats.get(key, {"seconds": 0.0, "count": 0})
+            seconds = entry.get("seconds", 0.0)
+            count = entry.get("count", 0)
+            total_count += count
+            emotions.append(
+                {
+                    "key": key,
+                    "emoji": STAT_EMOJI.get(key, ""),
+                    "name": key.title(),
+                    "count": count,
+                    "pct": (seconds / total * 100.0) if total else 0.0,
+                    "duration": format_duration(seconds),
+                }
+            )
+        emotion_count = sum(
+            1 for key in REPORT_EMOTIONS if stats.get(key, {}).get("count", 0) > 0
+        )
+        end = self._stats_range_end or datetime.now()
+        return {
+            "generated": format_datetime(datetime.now()),
+            "range_start": format_datetime(self._stats_range_start),
+            "range_end": format_datetime(end),
+            "total_duration": format_duration(total),
+            "emotions": emotions,
+            "emotion_count": emotion_count,
+            "totals": {
+                "count": total_count,
+                "pct": 100.0 if total else 0.0,
+                "duration": format_duration(total),
+            },
+            "provider": provider,
+            "model": config.get("model", ""),
+        }
+
     def _finish_mood_report(self, handler, message: str) -> None:
         """Show the finished report (main thread) and re-enable the button.
 
@@ -2428,6 +2729,8 @@ class MooditoApp(rumps.App):
         handler.button.setEnabled_(True)
         is_report = not text.startswith(MOOD_TIP_ERROR_PREFIX)
         handler.report_text = text if is_report else ""
+        if not is_report:
+            handler.report_meta = None
         pdf_button = getattr(handler, "pdf_button", None)
         if pdf_button is not None:
             pdf_button.setEnabled_(is_report)
@@ -2436,7 +2739,8 @@ class MooditoApp(rumps.App):
         """Save the current report to a user-chosen PDF file.
 
         Opens a native save panel (nested in the open Mood Tip modal) and writes
-        the report text to a paginated PDF. No-ops if no report exists yet.
+        a styled PDF (branded header + the report body). No-ops if no report
+        exists yet.
         """
         text = getattr(handler, "report_text", "")
         if not text:
@@ -2456,7 +2760,7 @@ class MooditoApp(rumps.App):
             return
         url = panel.URL()
         if url is not None:
-            write_text_pdf(text, url)
+            write_report_pdf(text, getattr(handler, "report_meta", None), url)
 
     def toggle_pause(self, _sender) -> None:
         self._paused = not self._paused

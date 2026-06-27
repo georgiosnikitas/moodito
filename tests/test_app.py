@@ -2084,6 +2084,7 @@ class _FakeMoodHandler:
         self.pdf_button = _FakeButton()
         self.pdf_button.enabled = False
         self.report_text = ""
+        self.report_meta = None
 
     def showResult_(self, result) -> None:
         self.app._finish_mood_report(self, result)
@@ -2278,6 +2279,10 @@ class TestMoodTip:
         full_app._start_mood_report(handler)
         assert handler.report_text == "stay positive"
         assert handler.pdf_button.enabled is True
+        # The report's metadata snapshot is captured for the PDF header.
+        assert handler.report_meta is not None
+        assert handler.report_meta["provider"] == "OpenAI"
+        assert handler.report_meta["model"] == "gpt"
 
     def test_error_keeps_pdf_button_disabled(self, full_app, monkeypatch) -> None:
         monkeypatch.setattr(app, "save_settings", lambda s: None)
@@ -2291,15 +2296,60 @@ class TestMoodTip:
         handler = _FakeMoodHandler(full_app)
         full_app._start_mood_report(handler)
         assert handler.report_text == ""
+        assert handler.report_meta is None
         assert handler.pdf_button.enabled is False
 
     def test_save_pdf_no_report_is_noop(self, full_app, monkeypatch) -> None:
         called = []
-        monkeypatch.setattr(app, "write_text_pdf", lambda *a, **k: called.append(a))
+        monkeypatch.setattr(app, "write_report_pdf", lambda *a, **k: called.append(a))
         handler = _FakeMoodHandler(full_app)
         handler.report_text = ""
         full_app._save_mood_report_pdf(handler)
         assert called == []  # nothing to save, no panel, no write
+
+    def test_collect_report_meta_summarises_range(self, full_app) -> None:
+        # Seed a couple of emotions into the selected range and snapshot them.
+        full_app._range_stats = {key: {"seconds": 0.0, "count": 0} for key in app.STAT_KEYS}
+        full_app._range_stats["happy"] = {"seconds": 1800.0, "count": 5}
+        full_app._range_stats["sad"] = {"seconds": 600.0, "count": 2}
+        meta = full_app._collect_report_meta("OpenAI", {"model": "gpt-4o"})
+        assert meta["provider"] == "OpenAI"
+        assert meta["model"] == "gpt-4o"
+        assert meta["emotion_count"] == 2  # happy + sad have occurrences
+        keys = {row["key"]: row for row in meta["emotions"]}
+        # Every tracked state is present, even those with zero occurrences.
+        assert set(keys) == set(app.STAT_KEYS)
+        assert keys["happy"]["count"] == 5
+        assert keys["happy"]["pct"] == 75.0  # 1800 of 2400 total seconds
+        assert keys["surprised"]["count"] == 0  # zero-occurrence emotion shown
+        assert "duration" in keys["happy"]
+        # Totals row sums the occurrences and accounts for all of the time.
+        assert meta["totals"]["count"] == 7
+        assert meta["totals"]["pct"] == 100.0
+        assert "generated" in meta and meta["range_end"]
+
+    def test_build_report_pdf_attributed_string_smoke(self) -> None:
+        # The real AppKit builder produces a non-empty attributed string that
+        # includes the report body and header labels.
+        meta = {
+            "generated": "Jun 27, 2026 10:00",
+            "range_start": "Jun 26, 2026 10:00",
+            "range_end": "Now",
+            "total_duration": "2h 00m",
+            "emotion_count": 1,
+            "emotions": [
+                {"key": "happy", "emoji": "😀", "name": "Happy",
+                 "count": 3, "pct": 100.0, "duration": "2h 00m"},
+            ],
+            "provider": "OpenAI",
+            "model": "gpt-4o",
+        }
+        attributed = app._build_report_attributed_string("Body text.", meta, 468.0)
+        assert attributed.length() > 0
+        plain = attributed.string()
+        assert "Mood Report" in plain
+        assert "Emotional Breakdown" in plain
+        assert "Body text." in plain
 
 
 
