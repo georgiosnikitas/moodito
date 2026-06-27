@@ -8,16 +8,61 @@
 [![License](https://img.shields.io/github/license/georgiosnikitas/moodito)](LICENSE)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=flat&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/georgiosnikitas)
 
-A macOS menu bar app that watches your face through the webcam and shows your
-current emotion as an emoji + label in the menu bar.
+**Your mood, live in the menu bar.** Moodito is a tiny, privacy-first macOS
+menu bar companion that reads your face through the webcam and shows how you're
+feeling right now — as a friendly emoji and label — without ever leaving your
+Mac. No accounts, no cloud, no frames uploaded anywhere: every detection happens
+100% on-device.
+
+But Moodito is more than a fun face emoji. It quietly builds a picture of your
+emotional day, turns it into beautiful in-menu **charts**, and — if you connect
+your favourite AI provider — writes you a personalised **wellbeing report** with
+suggestions to feel better. Think of it as a gentle, always-on mood mirror that
+lives one click away in your menu bar.
 
 Emotion recognition is powered by **Google's MediaPipe Face Landmarker**, which
 produces ARKit-style facial *blendshapes*. Moodito maps those blendshapes to a
 small set of coarse emotions: happy, sad, surprised, angry, and neutral.
 
-> Note on Google ML Kit: ML Kit is a mobile-only SDK (Android/iOS) and does not
-> run on macOS. MediaPipe is Google's cross-platform equivalent that does run on
-> macOS, so it is used here.
+## Features
+
+Everything lives in the menu bar dropdown — small, fast, and out of your way.
+
+- **🙂 Live emotion in the menu bar** — your current mood shown as an emoji +
+  label (e.g. `😀 happy`), refreshed several times a second. The top **Detected**
+  row shows the recognised emotion and its confidence.
+- **📊 Insights submenu** — a rich, at-a-glance dashboard built entirely from
+  your own on-device history:
+  - **Activity chart** — how much you've been at your Mac, by hour of day.
+  - **Emotion heatmap** — a per-emotion grid across the hours of the day, so you
+    can spot when you tend to be happy, stressed, or focused.
+  - **Statistics table** — time spent and occurrences for every state (happy,
+    sad, surprised, angry, neutral, no face, paused, error) plus totals.
+- **🕒 Selectable date range** — by default the insights cover a live, sliding
+  **Last 24 Hours** window. With an active license you can turn that off and use
+  **Since** / **Range…** to compute the insights over any custom start/end you
+  like. Without a license, the range stays pinned to the last 24 hours.
+- **✨ AI-powered Mood Tip** — ask your configured AI provider for a detailed,
+  personalised wellbeing report based on your selected date range, delivered in
+  a scrollable in-app window.
+- **🔌 Bring your own AI provider** — connect **Anthropic**, **Gemini**,
+  **OpenAI**, any **OpenAI-compatible** endpoint, or local **Ollama**. Credentials
+  are stored locally, and a built-in **Test** button verifies the connection
+  before you save.
+- **🎚️ Adjustable sensitivity** — fine-tune detection per emotion (Low / Normal /
+  High) so Moodito reads *your* face the way you want.
+- **🖼️ Customisable display** — toggle **Show Emojis** and **Show Labels**
+  independently, or fall back to the clean Moodito icon.
+- **⏸️ Pause / Resume** — instantly stop processing webcam frames whenever you
+  want privacy or a break.
+- **📷 Camera access helper** — a one-click shortcut to grant or re-grant webcam
+  permission.
+- **💾 Export & erase** — **Download (csv)** your raw detection log, or **Erase**
+  all collected data at any time. Your data, your call.
+- **🔑 Licensing** — manage your Lemon Squeezy license (buy, activate, deactivate,
+  manage) right from the menu.
+- **☕ Buy Me a Coffee** — a built-in tip jar with a handy QR code if you'd like
+  to support development.
 
 ## Requirements
 
@@ -43,13 +88,8 @@ On first launch Moodito downloads the MediaPipe `face_landmarker.task` model
 (~3.7 MB) next to `app.py`. macOS will prompt for **camera permission** the
 first time — grant it, otherwise the app shows a "could not open webcam" error.
 
-The menu bar shows the live emotion (e.g. `😀 happy`). The dropdown menu lets you:
-
-- See the detected emotion and confidence
-- Toggle **Show Emojis** (off shows the Moodito icon) and **Show Labels**
-- **Pause / Resume** detection (stops processing webcam frames)
-- Manage your **License** (buy, restore, activate, deactivate)
-- **Quit**
+The menu bar shows the live emotion (e.g. `😀 happy`), and the dropdown gives you
+the full experience described in [Features](#features).
 
 ## Build a standalone .app
 
@@ -80,6 +120,13 @@ allowing it under System Settings -> Privacy & Security). The model is cached in
 2. Each frame is passed to MediaPipe Face Landmarker (`detect_for_video`).
 3. The 52 blendshape scores are mapped to an emotion in `emotion.py`.
 4. A `rumps` timer refreshes the menu bar title every 0.3s.
+5. Detections are logged on-device and aggregated into the **Insights** charts
+   and statistics over your selected date range.
+6. On request, the **Mood Tip** feature sends a summary of that range to your
+   configured AI provider to generate a wellbeing report.
+
+Everything in steps 1–5 stays entirely on your Mac. Only the optional Mood Tip
+in step 6 contacts the AI provider you explicitly configure.
 
 ## Tuning
 
@@ -90,15 +137,18 @@ or less sensitive.
 ## Licensing
 
 Moodito integrates with [Lemon Squeezy](https://www.lemonsqueezy.com/) for
-license management. The **License** submenu in the menu bar dropdown offers:
+license management. A license unlocks **custom date ranges** for the Insights
+(without one, the insights stay pinned to the live **Last 24 Hours** window). The
+**License** submenu in the menu bar dropdown shows your current **Status**, **Key**,
+and **Device** (when licensed) and offers:
 
-- **Buy License…** — opens the [storefront](https://georgiosnikitas.lemonsqueezy.com/)
-- **Restore License…** — opens your [Lemon Squeezy orders](https://app.lemonsqueezy.com/my-orders)
-  to look up a key you already bought
 - **Activate License…** — prompts for your key and activates it (shown only while
   unlicensed)
 - **Deactivate License** — releases this device's activation (shown only while
   licensed)
+- **Manage License…** — opens your [Lemon Squeezy orders](https://app.lemonsqueezy.com/my-orders)
+  to look up a key you already bought
+- **Buy License…** — opens the [storefront](https://georgiosnikitas.lemonsqueezy.com/)
 
 Activation is verified against the Lemon Squeezy
 [License API](https://docs.lemonsqueezy.com/api/license-api) and stored in
