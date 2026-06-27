@@ -85,6 +85,8 @@ STAT_KEYS = TRACKED_EMOTIONS + EXTRA_STATES
 STAT_EMOJI = {**EMOTION_EMOJI, "paused": "⏸️", "error": "⚠️"}
 # Title shown on the statistics datetime-range prompt and its error alerts.
 STATS_RANGE_TITLE = "Datetime Range"
+# Title shown on the irreversible "Erase" confirmation dialog.
+STATS_ERASE_TITLE = "Erase All Data"
 
 # AI providers offered in the "AI Provider" dialog, in display order.
 AI_PROVIDERS = ("Anthropic", "Gemini", "OpenAI", "OpenAI Compatible", "Ollama")
@@ -119,6 +121,14 @@ OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 # Title shown on every Mood Tip alert dialog.
 MOOD_TIP_TITLE = "Moodito Mood Tip"
+# Placeholder shown in the Mood Tip window before a report is generated.
+MOOD_TIP_INTRO = (
+    "Click “Generate Report” to create a wellbeing report from your "
+    "selected date range.\n\nThe report is written by your configured AI "
+    "provider, so it can take a few moments to arrive."
+)
+# Message shown while the LLM is being contacted.
+MOOD_TIP_WAIT = "Please wait… contacting your AI provider. This can take a moment."
 
 # How often (seconds) the menu bar title is refreshed from the latest result.
 UI_REFRESH_INTERVAL = 0.3
@@ -130,6 +140,28 @@ def resource_path(name: str) -> str:
     """Resolve a bundled resource path for both source and PyInstaller runs."""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, name)
+
+
+def app_version() -> str:
+    """Return the app version without hard-coding it.
+
+    In the packaged app the version comes from the bundle's Info.plist
+    (``CFBundleShortVersionString``, set from the release tag at build time).
+    Running from source it falls back to the ``MOODITO_VERSION`` environment
+    variable, then to ``"dev"``.
+    """
+    if getattr(sys, "frozen", False):
+        try:
+            from Foundation import NSBundle
+
+            version = NSBundle.mainBundle().objectForInfoDictionaryKey_(
+                "CFBundleShortVersionString"
+            )
+            if version:
+                return str(version)
+        except Exception:  # noqa: BLE001 - not running inside a bundle
+            pass
+    return os.environ.get("MOODITO_VERSION", "dev")
 
 
 def ensure_model() -> None:
@@ -555,6 +587,34 @@ def _ai_test_handler_class():
 
     _AI_TEST_HANDLER_CLASS = _AITestHandler
     return _AITestHandler
+
+
+# Lazily-created NSObject subclass backing the Mood Tip window's buttons.
+_MOOD_TIP_HANDLER_CLASS = None
+
+
+def _mood_tip_handler_class():
+    """Return (creating once) the NSObject subclass backing the Mood Tip window."""
+    global _MOOD_TIP_HANDLER_CLASS
+    if _MOOD_TIP_HANDLER_CLASS is not None:
+        return _MOOD_TIP_HANDLER_CLASS
+    from AppKit import NSObject
+
+    class _MoodTipHandler(NSObject):
+        def generate_(self, _sender) -> None:
+            try:
+                self.app._start_mood_report(self)
+            except Exception:  # noqa: BLE001 - never let a UI glitch crash
+                pass
+
+        def showResult_(self, result) -> None:
+            try:
+                self.app._finish_mood_report(self, result)
+            except Exception:  # noqa: BLE001 - never let a UI glitch crash
+                pass
+
+    _MOOD_TIP_HANDLER_CLASS = _MoodTipHandler
+    return _MoodTipHandler
 
 
 def load_stats() -> tuple[dict, str | None]:
@@ -1045,12 +1105,13 @@ class MooditoApp(rumps.App):
         # AI provider configuration (selected service + its credentials),
         # restored from settings.
         self._ai_provider = self._load_ai_provider()
-        # Mood Tip runs the LLM network call off the main thread; results are
-        # staged here and shown by refresh() on the UI thread (like licensing).
+        # Mood Tip runs the LLM network call off the main thread. The report
+        # is shown in a fixed-size scrollable window; the busy flag blocks
+        # overlapping requests while one is in flight.
         self._llm_busy = threading.Event()
-        self._llm_lock = threading.Lock()
-        self._llm_alert: str | None = None
-        self._llm_dirty = threading.Event()
+        # Strong reference to the Mood Tip window's button handler (an NSButton
+        # target is not retained, so the handler must outlive the dialog).
+        self._mood_tip_handler = None
         # The statistics range always starts pinned to the live, sliding
         # last-24-hours window (the manual range is not persisted across runs).
         self._stats_live_24h = True
@@ -1221,6 +1282,14 @@ class MooditoApp(rumps.App):
         # on the raw data collected within the selected date range.
         self._mood_tip_menu = rumps.MenuItem("Mood Tip…", callback=self.mood_tip)
 
+        # Footer row: Moodito icon + name + version (informational, not clickable).
+        self._version_item = rumps.MenuItem(
+            f"Moodito {app_version()}",
+            icon=resource_path(MENUBAR_ICON),
+            dimensions=[18, 18],
+            callback=None,
+        )
+
         self.menu = [
             rumps.MenuItem("Detected: …", callback=None),
             None,
@@ -1242,6 +1311,8 @@ class MooditoApp(rumps.App):
             self._license_menu,
             self._bmc_menu,
             rumps.MenuItem("Quit", callback=self.quit_app),
+            None,
+            self._version_item,
         ]
         self._detected_item = self.menu["Detected: …"]
         self._pause_item = self.menu["Pause"]
@@ -1339,9 +1410,6 @@ class MooditoApp(rumps.App):
 
         # Apply any license state change made by a background license thread.
         self._consume_license_updates()
-
-        # Show any Mood Tip result produced by a background LLM thread.
-        self._consume_llm_updates()
 
         if self._paused:
             self._accumulate_stats("paused")
@@ -2032,32 +2100,104 @@ class MooditoApp(rumps.App):
         return view, fields
 
     def mood_tip(self, _sender) -> None:
-        """Generate a detailed mood report from the selected range's raw data.
+        """Open the Mood Tip window: a fixed-size, scrollable report viewer.
 
-        The prompt is built on the main thread (it reads the raw log), then the
-        LLM network call runs on a background thread; the result is shown by
-        refresh() via _consume_llm_updates.
+        The window opens immediately; the (potentially slow) LLM report is
+        generated only when the user clicks the in-window "Generate Report"
+        button. The report area scrolls vertically so the window keeps a
+        constant size regardless of how long the report is.
         """
-        if self._llm_busy.is_set():
-            return
-        provider = self._ai_provider.get("provider", DEFAULT_AI_PROVIDER)
-        config = self._ai_provider_values(provider)
-        error = ai_provider_config_error(provider, config)
-        if error:
-            rumps.alert(
-                MOOD_TIP_TITLE,
-                f"Please set up your AI provider first ({error}).\n"
-                "Use the “AI Provider…” menu to configure it.",
+        try:
+            from AppKit import NSAlert, NSApp, NSImage
+
+            view = self._build_mood_tip_accessory()
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_(MOOD_TIP_TITLE)
+            alert.setInformativeText_(
+                "A wellbeing report for your selected date range. Click "
+                "“Generate Report” to ask your AI provider."
             )
-            return
-        prompt = self._build_mood_report_prompt()
-        self._llm_busy.set()
-        self._mood_tip_menu.title = "Mood Tip… (thinking)"
-        threading.Thread(
-            target=self._mood_tip_worker,
-            args=(provider, config, prompt),
-            daemon=True,
-        ).start()
+            alert.addButtonWithTitle_("Close")
+            icon = NSImage.alloc().initByReferencingFile_(resource_path(MENUBAR_ICON))
+            if icon is not None and icon.isValid():
+                alert.setIcon_(icon)
+            alert.setAccessoryView_(view)
+            NSApp.activateIgnoringOtherApps_(True)
+            alert.runModal()
+        except Exception:  # noqa: BLE001 - never let a UI glitch crash the menu
+            pass
+
+    def _build_mood_tip_accessory(self):
+        """Build the Mood Tip accessory view.
+
+        Returns the ``NSView`` containing a "Generate Report" button above a
+        fixed-size, read-only, vertically scrolling text area. The button is
+        wired to a retained ObjC handler that drives report generation.
+        """
+        from AppKit import (
+            NSBezelBorder,
+            NSBezelStyleRounded,
+            NSButton,
+            NSScrollView,
+            NSTextView,
+            NSView,
+            NSViewWidthSizable,
+        )
+        from Foundation import NSMakeRect, NSMakeSize
+
+        width = 520.0
+        text_h = 360.0
+        button_h = 28.0
+        gap = 10.0
+        height = text_h + gap + button_h
+
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, width, height))
+
+        # "Generate Report" button across the top of the accessory.
+        button = NSButton.alloc().initWithFrame_(
+            NSMakeRect(0.0, text_h + gap, 160.0, button_h)
+        )
+        button.setTitle_("Generate Report")
+        button.setBezelStyle_(NSBezelStyleRounded)
+        view.addSubview_(button)
+
+        # Fixed-size, vertically scrolling, read-only report area.
+        scroll = NSScrollView.alloc().initWithFrame_(
+            NSMakeRect(0.0, 0.0, width, text_h)
+        )
+        scroll.setHasVerticalScroller_(True)
+        scroll.setHasHorizontalScroller_(False)
+        scroll.setAutohidesScrollers_(True)
+        scroll.setBorderType_(NSBezelBorder)
+
+        text_view = NSTextView.alloc().initWithFrame_(
+            NSMakeRect(0.0, 0.0, width, text_h)
+        )
+        text_view.setEditable_(False)
+        text_view.setSelectable_(True)
+        text_view.setRichText_(False)
+        text_view.setVerticallyResizable_(True)
+        text_view.setHorizontallyResizable_(False)
+        text_view.setMinSize_(NSMakeSize(0.0, text_h))
+        text_view.setMaxSize_(NSMakeSize(1.0e7, 1.0e7))
+        text_view.setAutoresizingMask_(NSViewWidthSizable)
+        text_view.setTextContainerInset_(NSMakeSize(6.0, 8.0))
+        text_view.textContainer().setWidthTracksTextView_(True)
+        text_view.setString_(MOOD_TIP_INTRO)
+        scroll.setDocumentView_(text_view)
+        view.addSubview_(scroll)
+
+        # Wire the button to a retained handler that runs report generation.
+        handler = _mood_tip_handler_class().alloc().init()
+        handler.app = self
+        handler.text_view = text_view
+        handler.button = button
+        button.setTarget_(handler)
+        button.setAction_("generate:")
+        # Keep a strong reference so the handler outlives the modal dialog.
+        self._mood_tip_handler = handler
+
+        return view
 
     def _build_mood_report_prompt(self) -> str:
         """Recompute the selected range and build the mood-report prompt."""
@@ -2070,28 +2210,65 @@ class MooditoApp(rumps.App):
             self._hourly_emotion,
         )
 
-    def _mood_tip_worker(self, provider: str, config: dict, prompt: str) -> None:
-        """Background: call the LLM and stage the result for the UI thread."""
+    def _start_mood_report(self, handler) -> None:
+        """Begin generating the report for the open Mood Tip window.
+
+        Runs on the main thread (button click). Validates the provider config,
+        builds the prompt from the raw log here, then hands the slow network
+        call to a background thread so the UI stays responsive while the
+        "please wait" message is visible.
+        """
+        if self._llm_busy.is_set():
+            return
+        provider = self._ai_provider.get("provider", DEFAULT_AI_PROVIDER)
+        config = self._ai_provider_values(provider)
+        error = ai_provider_config_error(provider, config)
+        if error:
+            handler.text_view.setString_(
+                f"Please set up your AI provider first ({error}).\n"
+                "Use the “AI Provider…” menu to configure it."
+            )
+            return
+        prompt = self._build_mood_report_prompt()
+        self._llm_busy.set()
+        handler.button.setEnabled_(False)
+        handler.text_view.setString_(MOOD_TIP_WAIT)
+        threading.Thread(
+            target=self._mood_tip_worker,
+            args=(provider, config, prompt, handler),
+            daemon=True,
+        ).start()
+
+    def _mood_tip_worker(self, provider: str, config: dict, prompt: str, handler) -> None:
+        """Background: call the LLM and post the result back to the window."""
         try:
             message = call_llm(provider, config, prompt)
         except (OSError, ValueError) as exc:
             message = f"Could not get a mood report:\n{exc}"
-        with self._llm_lock:
-            self._llm_alert = message
         self._llm_busy.clear()
-        self._llm_dirty.set()
+        self._post_mood_result(handler, message)
 
-    def _consume_llm_updates(self) -> None:
-        """Show any pending Mood Tip result on the main (UI) thread."""
-        if not self._llm_dirty.is_set():
-            return
-        self._llm_dirty.clear()
-        self._mood_tip_menu.title = "Mood Tip…"
-        with self._llm_lock:
-            alert = self._llm_alert
-            self._llm_alert = None
-        if alert:
-            rumps.alert(MOOD_TIP_TITLE, alert)
+    def _post_mood_result(self, handler, message: str) -> None:
+        """Apply the report to the window on the main thread.
+
+        The report is produced while a modal NSAlert is open, so the update is
+        scheduled in the modal run-loop modes — a plain main-thread selector
+        would not fire until the dialog closed.
+        """
+        from AppKit import NSModalPanelRunLoopMode
+        from Foundation import NSArray, NSDefaultRunLoopMode
+
+        modes = NSArray.arrayWithObjects_(
+            NSModalPanelRunLoopMode, NSDefaultRunLoopMode, None
+        )
+        handler.performSelectorOnMainThread_withObject_waitUntilDone_modes_(
+            "showResult:", message, False, modes
+        )
+
+    def _finish_mood_report(self, handler, message: str) -> None:
+        """Show the finished report (main thread) and re-enable the button."""
+        handler.text_view.setString_(str(message))
+        handler.button.setEnabled_(True)
 
     def toggle_pause(self, _sender) -> None:
         self._paused = not self._paused
@@ -2313,7 +2490,20 @@ class MooditoApp(rumps.App):
         subprocess.run(["open", "-R", path], check=False)
 
     def reset_stats(self, _sender) -> None:
-        """Clear all accumulated statistics and the raw detection log."""
+        """Clear all accumulated statistics and the raw detection log.
+
+        Erasing is irreversible, so the user is asked to confirm first.
+        """
+        confirmed = rumps.alert(
+            STATS_ERASE_TITLE,
+            "This permanently deletes all of your recorded statistics and "
+            "detection history. This action cannot be undone.\n\n"
+            "Are you sure you want to erase everything?",
+            ok="Erase",
+            cancel="Cancel",
+        )
+        if not confirmed:
+            return
         self._stats = {
             key: {"seconds": 0.0, "count": 0} for key in STAT_KEYS
         }

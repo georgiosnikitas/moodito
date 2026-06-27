@@ -38,6 +38,18 @@ class TestResourcePath:
         assert "/bundle/" not in result
 
 
+class TestAppVersion:
+    def test_uses_env_var_when_not_frozen(self, monkeypatch) -> None:
+        monkeypatch.setattr(app.sys, "frozen", False, raising=False)
+        monkeypatch.setenv("MOODITO_VERSION", "9.9.9")
+        assert app.app_version() == "9.9.9"
+
+    def test_defaults_to_dev_without_env(self, monkeypatch) -> None:
+        monkeypatch.setattr(app.sys, "frozen", False, raising=False)
+        monkeypatch.delenv("MOODITO_VERSION", raising=False)
+        assert app.app_version() == "dev"
+
+
 class TestEnsureModel:
     def test_skips_download_when_model_exists(self, data_dir, monkeypatch) -> None:
         (data_dir / "model.task").write_bytes(b"data")
@@ -861,6 +873,7 @@ class TestExportCsv:
 class TestResetStats:
     def test_clears_stats_and_raw_log(self, data_dir, monkeypatch) -> None:
         monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
+        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: 1)
         (data_dir / "raw_data.csv").write_text("timestamp,state,score\nt,happy,0.9\n")
         inst = _bare_app()
         inst._stats["happy"] = {"seconds": 30.0, "count": 5}
@@ -873,8 +886,25 @@ class TestResetStats:
 
     def test_missing_raw_file_is_tolerated(self, data_dir, monkeypatch) -> None:
         monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
+        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: 1)
         inst = _bare_app()
         inst.reset_stats(None)  # no raw file present; must not raise
+
+    def test_cancel_keeps_data(self, data_dir, monkeypatch) -> None:
+        # Declining the confirmation must leave everything untouched.
+        saved = []
+        monkeypatch.setattr(app, "save_stats", lambda *a, **k: saved.append(a))
+        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: 0)
+        (data_dir / "raw_data.csv").write_text("timestamp,state,score\nt,happy,0.9\n")
+        inst = _bare_app()
+        inst._stats["happy"] = {"seconds": 30.0, "count": 5}
+        inst._raw_buffer = [("t", "happy", "0.9")]
+        inst.reset_stats(None)
+        assert inst._stats["happy"] == {"seconds": 30.0, "count": 5}
+        assert inst._raw_buffer == [("t", "happy", "0.9")]
+        assert (data_dir / "raw_data.csv").exists()
+        assert saved == []  # nothing persisted
+
 
 
 class TestQuitApp:
@@ -1933,6 +1963,47 @@ class _FakeStatusLabel:
         self.tooltip = value
 
 
+class _FakeTextView:
+    """Minimal NSTextView stand-in recording the last setString_ value."""
+
+    def __init__(self, value: str = "") -> None:
+        self.value = value
+
+    def setString_(self, value: str) -> None:
+        self.value = value
+
+
+class _FakeButton:
+    """Minimal NSButton stand-in recording its enabled state."""
+
+    def __init__(self) -> None:
+        self.enabled = True
+
+    def setEnabled_(self, value) -> None:
+        self.enabled = bool(value)
+
+
+class _FakeMoodHandler:
+    """Stand-in for the Mood Tip ObjC handler used in tests.
+
+    Holds the fake text view/button and forwards the (normally main-thread)
+    result delivery straight to the app, synchronously.
+    """
+
+    def __init__(self, app_obj) -> None:
+        self.app = app_obj
+        self.text_view = _FakeTextView()
+        self.button = _FakeButton()
+
+    def showResult_(self, result) -> None:
+        self.app._finish_mood_report(self, result)
+
+    def performSelectorOnMainThread_withObject_waitUntilDone_modes_(
+        self, _selector, obj, _wait, _modes
+    ) -> None:
+        self.showResult_(obj)
+
+
 class TestAIConnectionTest:
     def test_success(self, monkeypatch) -> None:
         monkeypatch.setattr(app, "call_llm", lambda *a, **k: "OK")
@@ -2008,13 +2079,12 @@ class TestAIConnectionTest:
 
 
 class TestMoodTip:
-    def test_unconfigured_shows_alert_and_stays_idle(
-        self, full_app, monkeypatch
-    ) -> None:
-        alerts = []
-        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: alerts.append(a))
-        full_app.mood_tip(None)
-        assert alerts  # told the user to configure a provider
+    def test_unconfigured_writes_message_to_window(self, full_app) -> None:
+        # Default provider has no credentials, so generating reports the issue
+        # in the window itself (the window already opened) and stays idle.
+        handler = _FakeMoodHandler(full_app)
+        full_app._start_mood_report(handler)
+        assert "set up your AI provider" in handler.text_view.value
         assert not full_app._llm_busy.is_set()
 
     def test_busy_guard_blocks_second_call(self, full_app, monkeypatch) -> None:
@@ -2023,28 +2093,44 @@ class TestMoodTip:
             app.threading, "Thread", lambda *a, **k: started.append(k)
         )
         full_app._llm_busy.set()
-        full_app.mood_tip(None)
+        handler = _FakeMoodHandler(full_app)
+        full_app._start_mood_report(handler)
         assert started == []  # no new thread while busy
+        assert handler.text_view.value == ""  # window left untouched
 
-    def test_success_stages_tip_and_consume_shows_it(
-        self, full_app, monkeypatch
-    ) -> None:
+    def test_generate_shows_report_in_window(self, full_app, monkeypatch) -> None:
         monkeypatch.setattr(app, "save_settings", lambda s: None)
         full_app._apply_ai_provider("OpenAI", {"api_key": "k", "model": "gpt"})
         monkeypatch.setattr(app, "call_llm", lambda *a, **k: "you've got this")
         _patch_sync_threads(monkeypatch)
-        full_app.mood_tip(None)
+        handler = _FakeMoodHandler(full_app)
+        full_app._start_mood_report(handler)
         assert not full_app._llm_busy.is_set()
-        with full_app._llm_lock:
-            assert full_app._llm_alert == "you've got this"
-        # The UI thread picks it up on the next refresh tick.
-        alerts = []
-        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: alerts.append(a))
-        full_app._consume_llm_updates()
-        assert alerts and alerts[0][1] == "you've got this"
-        assert full_app._mood_tip_menu.title == "Mood Tip…"
+        assert handler.text_view.value == "you've got this"
+        assert handler.button.enabled is True
 
-    def test_error_is_staged_as_message(self, full_app, monkeypatch) -> None:
+    def test_wait_message_shown_before_network_call(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda s: None)
+        full_app._apply_ai_provider("OpenAI", {"api_key": "k", "model": "gpt"})
+        seen = {}
+
+        def fake_call(provider, config, prompt):
+            # While the network call runs, the window shows the wait message
+            # and the button is disabled.
+            seen["text"] = handler.text_view.value
+            seen["enabled"] = handler.button.enabled
+            return "done"
+
+        monkeypatch.setattr(app, "call_llm", fake_call)
+        _patch_sync_threads(monkeypatch)
+        handler = _FakeMoodHandler(full_app)
+        full_app._start_mood_report(handler)
+        assert seen["text"] == app.MOOD_TIP_WAIT
+        assert seen["enabled"] is False
+
+    def test_error_is_shown_in_window(self, full_app, monkeypatch) -> None:
         monkeypatch.setattr(app, "save_settings", lambda s: None)
         full_app._apply_ai_provider("OpenAI", {"api_key": "k", "model": "gpt"})
 
@@ -2053,10 +2139,12 @@ class TestMoodTip:
 
         monkeypatch.setattr(app, "call_llm", boom)
         _patch_sync_threads(monkeypatch)
-        full_app.mood_tip(None)
-        with full_app._llm_lock:
-            assert "Could not get a mood report" in full_app._llm_alert
-            assert "offline" in full_app._llm_alert
+        handler = _FakeMoodHandler(full_app)
+        full_app._start_mood_report(handler)
+        assert "Could not get a mood report" in handler.text_view.value
+        assert "offline" in handler.text_view.value
+        assert handler.button.enabled is True
+        assert not full_app._llm_busy.is_set()
 
     def test_sends_range_report_prompt_to_llm(self, full_app, monkeypatch) -> None:
         monkeypatch.setattr(app, "save_settings", lambda s: None)
@@ -2069,10 +2157,23 @@ class TestMoodTip:
 
         monkeypatch.setattr(app, "call_llm", fake_call)
         _patch_sync_threads(monkeypatch)
-        full_app.mood_tip(None)
+        handler = _FakeMoodHandler(full_app)
+        full_app._start_mood_report(handler)
         # The prompt is built from the selected range's aggregated data.
         assert "Total tracked time" in captured["prompt"]
         assert "wellbeing suggestions" in captured["prompt"]
+
+    def test_build_accessory_wires_button_handler(self, full_app) -> None:
+        # Smoke test the real AppKit accessory: it builds and retains a handler
+        # wired to the app and its report text view / button.
+        view = full_app._build_mood_tip_accessory()
+        assert view is not None
+        handler = full_app._mood_tip_handler
+        assert handler is not None
+        assert handler.app is full_app
+        assert handler.text_view is not None
+        assert handler.button is not None
+
 
 
 class TestGrantCamera:
