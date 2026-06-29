@@ -112,7 +112,7 @@ AI_FIELD_PLACEHOLDERS = {
     "model": "Model name",
 }
 # Network timeout (seconds) for LLM API calls.
-LLM_API_TIMEOUT = 30
+LLM_API_TIMEOUT = 120
 # Upper bound on tokens requested from the LLM (room for a detailed report).
 LLM_MAX_TOKENS = 2500
 # Anthropic Messages API endpoint + required version header.
