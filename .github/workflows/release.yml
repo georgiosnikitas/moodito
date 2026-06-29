@@ -46,6 +46,9 @@ jobs:
           MOODITO_VERSION: ${{ steps.version.outputs.version }}
         run: python -m PyInstaller --noconfirm --clean moodito.spec
 
+      - name: Ad-hoc codesign the .app
+        run: codesign --force --deep --sign - dist/Moodito.app
+
       - name: Package .app into a zip
         run: |
           cd dist
