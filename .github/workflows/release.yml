@@ -57,3 +57,69 @@ jobs:
           name: Moodito ${{ github.ref_name }}
           generate_release_notes: true
           files: dist/Moodito-${{ github.ref_name }}.zip
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: macos-latest
+
+    steps:
+      - name: Derive version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release asset
+        run: |
+          curl -fsSL -o "Moodito-${{ github.ref_name }}.zip" \
+            "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/Moodito-${{ github.ref_name }}.zip"
+
+      - name: Compute SHA-256
+        id: sha
+        run: echo "sha256=$(shasum -a 256 "Moodito-${{ github.ref_name }}.zip" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: georgiosnikitas/homebrew-moodito
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update cask
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.sha.outputs.sha256 }}
+        run: |
+          mkdir -p tap/Casks
+          cat > tap/Casks/moodito.rb <<EOF
+          cask "moodito" do
+            version "${VERSION}"
+            sha256 "${SHA256}"
+
+            url "https://github.com/${{ github.repository }}/releases/download/v#{version}/Moodito-v#{version}.zip"
+            name "Moodito"
+            desc "Privacy-first macOS menu bar app that reads your mood from the webcam"
+            homepage "https://github.com/${{ github.repository }}"
+
+            depends_on macos: ">= :big_sur"
+
+            app "Moodito.app"
+
+            zap trash: [
+              "~/Library/Application Support/Moodito",
+              "~/Library/Preferences/com.moodito.app.plist",
+            ]
+          end
+          EOF
+
+      - name: Commit and push
+        run: |
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/moodito.rb
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "moodito ${{ steps.version.outputs.version }}"
+            git push
+          fi
