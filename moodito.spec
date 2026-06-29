@@ -6,7 +6,7 @@ from PyInstaller.utils.hooks import collect_all
 
 # Version comes from the release tag (set by CI as MOODITO_VERSION, e.g. "1.0.0");
 # falls back to a sensible default for local builds.
-VERSION = os.environ.get("MOODITO_VERSION", "1.6.4")
+VERSION = os.environ.get("MOODITO_VERSION", "1.6.5")
 
 # Bundle MediaPipe's native libraries and data files (.tflite, .binarypb, etc.).
 mp_datas, mp_binaries, mp_hiddenimports = collect_all("mediapipe")
