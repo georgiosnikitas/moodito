@@ -114,7 +114,7 @@ AI_FIELD_PLACEHOLDERS = {
 # Network timeout (seconds) for LLM API calls.
 LLM_API_TIMEOUT = 30
 # Upper bound on tokens requested from the LLM (room for a detailed report).
-LLM_MAX_TOKENS = 1000
+LLM_MAX_TOKENS = 2500
 # Anthropic Messages API endpoint + required version header.
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
