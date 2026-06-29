@@ -62,6 +62,8 @@ jobs:
     name: Update Homebrew tap
     needs: release
     runs-on: macos-latest
+    permissions:
+      contents: read # required for the GitHub CLI to download the release asset
 
     steps:
       - name: Derive version from tag
@@ -69,9 +71,12 @@ jobs:
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Download release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl -fsSL -o "Moodito-${{ github.ref_name }}.zip" \
-            "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/Moodito-${{ github.ref_name }}.zip"
+          gh release download "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "Moodito-${{ github.ref_name }}.zip"
 
       - name: Compute SHA-256
         id: sha
