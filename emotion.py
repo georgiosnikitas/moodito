@@ -24,12 +24,13 @@ EMOTION_EMOJI = {
 # Emotions whose detection threshold can be tuned via the Sensitivity menu.
 SENSITIVITY_EMOTIONS = ("happy", "surprised", "angry", "sad")
 # Selectable sensitivity levels (in menu display order).
-SENSITIVITY_LEVELS = ("low", "normal", "high")
+SENSITIVITY_LEVELS = ("off", "exact", "low", "normal", "high")
 # Default level applied when nothing is configured.
 DEFAULT_SENSITIVITY = "normal"
 # Multiplier applied to an emotion's base threshold per level. A higher
 # threshold ("low" sensitivity) needs stronger evidence to trigger; a lower
 # threshold ("high" sensitivity) triggers more readily.
+# "off" and "exact" are handled as special cases in infer_emotion.
 _SENSITIVITY_MULTIPLIER = {"low": 1.4, "normal": 1.0, "high": 0.6}
 
 
@@ -113,7 +114,14 @@ def infer_emotion(
     threshold = min_score[label]
     if sensitivity:
         level = sensitivity.get(label, DEFAULT_SENSITIVITY)
-        threshold *= _SENSITIVITY_MULTIPLIER.get(level, 1.0)
+        if level == "off":
+            # Emotion is disabled — always fall through to neutral.
+            return EmotionResult("neutral", 1.0 - score)
+        if level == "exact":
+            # Require a perfect score to trigger.
+            threshold = 1.0
+        else:
+            threshold *= _SENSITIVITY_MULTIPLIER.get(level, 1.0)
 
     # Not expressive enough for its category → treat as neutral.
     if score < threshold:

@@ -138,3 +138,16 @@ class TestSensitivity:
         result = infer_emotion(self.MODEST_SMILE, {})
         assert result.label == "happy"
 
+    def test_off_sensitivity_never_detects_emotion(self) -> None:
+        # Even a strong smile should be suppressed when "off".
+        strong_smile = {"mouthSmileLeft": 0.9, "mouthSmileRight": 0.9}
+        assert infer_emotion(strong_smile).label == "happy"
+        result = infer_emotion(strong_smile, {"happy": "off"})
+        assert result.label == "neutral"
+
+    def test_exact_sensitivity_requires_perfect_score(self) -> None:
+        # A modest smile clears normal threshold but not exact (1.0).
+        assert infer_emotion(self.MODEST_SMILE).label == "happy"
+        result = infer_emotion(self.MODEST_SMILE, {"happy": "exact"})
+        assert result.label == "neutral"
+

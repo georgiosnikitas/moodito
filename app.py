@@ -2130,7 +2130,7 @@ class MooditoApp(rumps.App):
 
         label_w = 120.0
         gap = 10.0
-        control_w = 210.0
+        control_w = 350.0
         row_h = 34.0
         width = label_w + gap + control_w
         n = len(SENSITIVITY_EMOTIONS)
