@@ -523,12 +523,14 @@ def build_mood_report_prompt(
     stats: dict,
     hourly_activity: list[float],
     hourly_emotion: dict,
+    activity: str = "",
 ) -> str:
     """Build the prompt asking the LLM for a detailed mood report.
 
     Uses the full aggregated detail of the data collected within the selected
     date range: per-state durations/shares/occurrences plus the hourly activity
-    and per-emotion hourly breakdown.
+    and per-emotion hourly breakdown. If ``activity`` is provided, it is
+    included as context about what the user was doing during the period.
     """
     end_text = "now" if end is None else format_datetime(end)
     total = sum(entry.get("seconds", 0.0) for entry in stats.values())
@@ -538,6 +540,14 @@ def build_mood_report_prompt(
         "",
         f"Data collected from {format_datetime(start)} to {end_text}.",
         f"Total tracked time: {format_duration(total)}.",
+    ]
+    if activity:
+        lines += [
+            "",
+            "The user described their activity during this period as follows:",
+            activity,
+        ]
+    lines += [
         "",
         "Time spent in each detected state "
         "(state: duration, share of total, distinct occurrences):",
@@ -566,10 +576,17 @@ def build_mood_report_prompt(
         "Using the full details above, write a detailed yet friendly report on "
         "this person's mood and emotional patterns over the period. Cover the "
         "dominant emotions, how their mood shifted across the day, the balance "
-        "of positive versus negative states, and any notable patterns. Finish "
-        "with a few gentle, practical wellbeing suggestions. Reply in plain "
-        "text without markdown.",
+        "of positive versus negative states, and any notable patterns.",
     ]
+    if activity:
+        lines.append(
+            "Take into account the user's described activity and relate their "
+            "emotional patterns to what they were doing."
+        )
+    lines.append(
+        "Finish with a few gentle, practical wellbeing suggestions. "
+        "Reply in plain text without markdown."
+    )
     return "\n".join(lines)
 
 
@@ -2520,16 +2537,18 @@ class MooditoApp(rumps.App):
     def _build_mood_tip_accessory(self):
         """Build the Mood Tip accessory view.
 
-        Returns the ``NSView`` containing "Generate Report" and "Save as PDF"
-        buttons above a fixed-size, read-only, vertically scrolling text area.
-        The buttons are wired to a retained ObjC handler that drives report
-        generation and PDF export.
+        Returns the ``NSView`` containing an optional activity description input,
+        "Generate Report" and "Save as PDF" buttons, and a fixed-size, read-only,
+        vertically scrolling text area for the report. The buttons are wired to a
+        retained ObjC handler that drives report generation and PDF export.
         """
         from AppKit import (
             NSBezelBorder,
             NSBezelStyleRounded,
             NSButton,
+            NSFont,
             NSScrollView,
+            NSTextField,
             NSTextView,
             NSView,
             NSViewWidthSizable,
@@ -2538,15 +2557,60 @@ class MooditoApp(rumps.App):
 
         width = 520.0
         text_h = 360.0
+        activity_h = 60.0
+        label_h = 17.0
         button_h = 28.0
         gap = 10.0
-        height = text_h + gap + button_h
+        height = text_h + gap + button_h + gap + activity_h + label_h + gap
 
         view = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, width, height))
 
-        # "Generate Report" button across the top of the accessory.
+        # --- Activity description (optional user input) at the top ---
+        activity_top = text_h + gap + button_h + gap + activity_h
+        label = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(0.0, activity_top + 2.0, width, label_h)
+        )
+        label.setStringValue_(
+            "Activity during this period (optional):"
+        )
+        label.setBezeled_(False)
+        label.setDrawsBackground_(False)
+        label.setEditable_(False)
+        label.setSelectable_(False)
+        label.setFont_(NSFont.systemFontOfSize_(12.0))
+        view.addSubview_(label)
+
+        activity_scroll = NSScrollView.alloc().initWithFrame_(
+            NSMakeRect(0.0, text_h + gap + button_h + gap, width, activity_h)
+        )
+        activity_scroll.setHasVerticalScroller_(True)
+        activity_scroll.setHasHorizontalScroller_(False)
+        activity_scroll.setAutohidesScrollers_(True)
+        activity_scroll.setBorderType_(NSBezelBorder)
+
+        activity_view = NSTextView.alloc().initWithFrame_(
+            NSMakeRect(0.0, 0.0, width, activity_h)
+        )
+        activity_view.setEditable_(True)
+        activity_view.setSelectable_(True)
+        activity_view.setRichText_(False)
+        activity_view.setVerticallyResizable_(True)
+        activity_view.setHorizontallyResizable_(False)
+        activity_view.setMinSize_(NSMakeSize(0.0, activity_h))
+        activity_view.setMaxSize_(NSMakeSize(1.0e7, 1.0e7))
+        activity_view.setAutoresizingMask_(NSViewWidthSizable)
+        activity_view.setTextContainerInset_(NSMakeSize(6.0, 4.0))
+        activity_view.textContainer().setWidthTracksTextView_(True)
+        activity_view.setFont_(NSFont.systemFontOfSize_(13.0))
+        activity_scroll.setDocumentView_(activity_view)
+        view.addSubview_(activity_scroll)
+
+        # --- Buttons row ---
+        button_y = text_h + gap
+
+        # "Generate Report" button.
         button = NSButton.alloc().initWithFrame_(
-            NSMakeRect(0.0, text_h + gap, 160.0, button_h)
+            NSMakeRect(0.0, button_y, 160.0, button_h)
         )
         button.setTitle_("Generate Report")
         button.setBezelStyle_(NSBezelStyleRounded)
@@ -2554,14 +2618,14 @@ class MooditoApp(rumps.App):
 
         # "Save as PDF" button, disabled until a report has been generated.
         pdf_button = NSButton.alloc().initWithFrame_(
-            NSMakeRect(width - 130.0, text_h + gap, 130.0, button_h)
+            NSMakeRect(width - 130.0, button_y, 130.0, button_h)
         )
         pdf_button.setTitle_("Save as PDF")
         pdf_button.setBezelStyle_(NSBezelStyleRounded)
         pdf_button.setEnabled_(False)
         view.addSubview_(pdf_button)
 
-        # Fixed-size, vertically scrolling, read-only report area.
+        # --- Fixed-size, vertically scrolling, read-only report area ---
         scroll = NSScrollView.alloc().initWithFrame_(
             NSMakeRect(0.0, 0.0, width, text_h)
         )
@@ -2592,6 +2656,7 @@ class MooditoApp(rumps.App):
         handler = _mood_tip_handler_class().alloc().init()
         handler.app = self
         handler.text_view = text_view
+        handler.activity_view = activity_view
         handler.button = button
         handler.pdf_button = pdf_button
         handler.report_text = ""
@@ -2605,7 +2670,7 @@ class MooditoApp(rumps.App):
 
         return view
 
-    def _build_mood_report_prompt(self) -> str:
+    def _build_mood_report_prompt(self, activity: str = "") -> str:
         """Recompute the selected range and build the mood-report prompt."""
         self._recompute_range_stats()
         return build_mood_report_prompt(
@@ -2614,6 +2679,7 @@ class MooditoApp(rumps.App):
             self._range_stats,
             self._hourly_activity,
             self._hourly_emotion,
+            activity=activity,
         )
 
     def _start_mood_report(self, handler) -> None:
@@ -2635,7 +2701,9 @@ class MooditoApp(rumps.App):
                 "Use the “AI Provider…” menu to configure it."
             )
             return
-        prompt = self._build_mood_report_prompt()
+        prompt = self._build_mood_report_prompt(
+            activity=str(handler.activity_view.string() or "").strip()
+        )
         handler.report_meta = self._collect_report_meta(provider, config)
         self._llm_busy.set()
         handler.button.setEnabled_(False)

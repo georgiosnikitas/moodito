@@ -1923,6 +1923,26 @@ class TestLLMHelpers:
         )
         assert "to now" in prompt
 
+    def test_build_mood_report_prompt_includes_activity(self) -> None:
+        start = app.datetime(2026, 6, 21, 8, 0)
+        end = app.datetime(2026, 6, 21, 20, 0)
+        stats = {k: {"seconds": 0.0, "count": 0} for k in app.STAT_KEYS}
+        hourly = [0.0] * 24
+        heat = {k: [0.0] * 24 for k in app.STAT_KEYS}
+        prompt = app.build_mood_report_prompt(
+            start, end, stats, hourly, heat, activity="Working on a presentation"
+        )
+        assert "Working on a presentation" in prompt
+        assert "activity" in prompt.lower()
+
+    def test_build_mood_report_prompt_omits_activity_when_empty(self) -> None:
+        start = app.datetime(2026, 6, 21, 8, 0)
+        stats = {k: {"seconds": 0.0, "count": 0} for k in app.STAT_KEYS}
+        prompt = app.build_mood_report_prompt(
+            start, None, stats, [0.0] * 24, {k: [0.0] * 24 for k in app.STAT_KEYS}
+        )
+        assert "described their activity" not in prompt
+
 
 class TestCallLLM:
     @staticmethod
@@ -2059,6 +2079,9 @@ class _FakeTextView:
     def setString_(self, value: str) -> None:
         self.value = value
 
+    def string(self) -> str:
+        return self.value
+
 
 class _FakeButton:
     """Minimal NSButton stand-in recording its enabled state."""
@@ -2080,6 +2103,7 @@ class _FakeMoodHandler:
     def __init__(self, app_obj) -> None:
         self.app = app_obj
         self.text_view = _FakeTextView()
+        self.activity_view = _FakeTextView()
         self.button = _FakeButton()
         self.pdf_button = _FakeButton()
         self.pdf_button.enabled = False
