@@ -324,6 +324,71 @@ class TestOpenActions:
         assert calls[0][0] == ["open", app.BMC_URL]
 
 
+class TestPrivacyAudio:
+    def test_capture_reads_only_selected_channels(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            app,
+            "_run_osascript",
+            lambda *statements: (True, "42,false,67"),
+        )
+        state = app._capture_audio_state(microphone=True, speakers=False)
+        assert state == app.AudioState(input_volume=67)
+
+    def test_capture_rejects_unexpected_output(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            app,
+            "_run_osascript",
+            lambda *statements: (True, "not audio settings"),
+        )
+        assert app._capture_audio_state(True, True) is None
+
+    def test_mute_returns_snapshot_and_mutes_selected_channels(
+        self, monkeypatch
+    ) -> None:
+        state = app.AudioState(input_volume=55, output_volume=40, output_muted=False)
+        monkeypatch.setattr(app, "_capture_audio_state", lambda *args: state)
+        calls = []
+        monkeypatch.setattr(
+            app,
+            "_run_osascript",
+            lambda *statements: calls.append(statements) or (True, ""),
+        )
+        assert app.mute_audio_for_privacy(True, True) == app.PrivacyMuteResult(
+            state, applied=True
+        )
+        assert calls == [
+            ("set volume input volume 0", "set volume with output muted")
+        ]
+
+    def test_restore_reinstates_volume_and_prior_mute_state(self, monkeypatch) -> None:
+        calls = []
+        monkeypatch.setattr(
+            app,
+            "_run_osascript",
+            lambda *statements: calls.append(statements) or (True, ""),
+        )
+        state = app.AudioState(input_volume=61, output_volume=35, output_muted=True)
+        assert app.restore_audio_state(state) is True
+        assert calls == [
+            (
+                "set volume input volume 61",
+                "set volume output volume 35",
+                "set volume with output muted",
+            )
+        ]
+
+    def test_failed_mute_keeps_snapshot_when_rollback_fails(
+        self, monkeypatch
+    ) -> None:
+        state = app.AudioState(input_volume=50, output_volume=30, output_muted=False)
+        monkeypatch.setattr(app, "_capture_audio_state", lambda *args: state)
+        monkeypatch.setattr(app, "_run_osascript", lambda *statements: (False, ""))
+        monkeypatch.setattr(app, "restore_audio_state", lambda value: False)
+        assert app.mute_audio_for_privacy(True, True) == app.PrivacyMuteResult(
+            state, applied=False
+        )
+
+
 class TestFaceWorker:
     def test_initial_state(self) -> None:
         worker = app.FaceWorker()
@@ -363,6 +428,17 @@ def _bare_app():
     inst._stats_range_end = None
     inst._stats_live_24h = False
     inst._settings = {}
+    inst._notifications = dict.fromkeys(app.NOTIFICATION_KEYS, False)
+    inst._last_notified_emotion = None
+    inst._privacy = {
+        "microphone_seconds": app.DEFAULT_PRIVACY_MICROPHONE_SECONDS,
+        "speakers_seconds": app.DEFAULT_PRIVACY_SPEAKERS_SECONDS,
+    }
+    inst._privacy_no_face_since = None
+    inst._privacy_attempted = set()
+    inst._privacy_audio_states = {}
+    inst._privacy_changed_channels = set()
+    inst._privacy_stepper_handler = None
     inst._license_active = True
     inst._range_stats = {k: {"seconds": 0.0, "count": 0} for k in app.STAT_KEYS}
     inst._range_last_state = None
@@ -1124,7 +1200,9 @@ def _bare_license_app(active: bool = False):
     inst._license_lock = app.threading.Lock()
     inst._license_busy = app.threading.Event()
     inst._license_alert = None
+    inst._license_notification_event = None
     inst._license_dirty = app.threading.Event()
+    inst._notifications = dict.fromkeys(app.NOTIFICATION_KEYS, False)
     inst._license_status_item = rumps.MenuItem("status")
     inst._license_key_item = rumps.MenuItem("key")
     inst._license_device_item = rumps.MenuItem("device")
@@ -1381,6 +1459,7 @@ def full_app(data_dir, monkeypatch):
     """Construct a full MooditoApp without starting the camera thread."""
     monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
     monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+    monkeypatch.setattr(app.rumps, "notification", lambda *args, **kwargs: None)
     return app.MooditoApp()
 
 
@@ -1390,6 +1469,84 @@ class TestMooditoAppInit:
         assert full_app._raw_buffer == []
         assert "Download (csv)" in full_app._stats_export_item.title
         assert set(full_app._stats_items) == set(app.STAT_KEYS)
+
+    def test_version_footer_is_clickable(self, full_app) -> None:
+        assert full_app._version_item.title == f"Moodito {app.app_version()}"
+        assert full_app._version_item.callback is not None
+
+    def test_about_accessory_contains_supplied_description(self, full_app) -> None:
+        _view, text_view = full_app._build_about_accessory()
+        text = str(text_view.string())
+        assert text == app.ABOUT_DESCRIPTION
+        assert "Your mood, live in the menu bar." in text
+        assert "100% on-device" in text
+        assert "wellbeing report" in text
+
+    def test_about_action_presents_version_author_and_description(
+        self, full_app, monkeypatch
+    ) -> None:
+        import AppKit
+
+        captured = {"buttons": [], "modal": False}
+
+        class FakeAlert:
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def init(self):
+                return self
+
+            def setMessageText_(self, value) -> None:
+                captured["title"] = value
+
+            def setInformativeText_(self, value) -> None:
+                captured["info"] = value
+
+            def addButtonWithTitle_(self, value) -> None:
+                captured["buttons"].append(value)
+
+            def setIcon_(self, _value) -> None:
+                captured["icon"] = True
+
+            def setAccessoryView_(self, value) -> None:
+                captured["accessory"] = value
+
+            def runModal(self) -> None:
+                captured["modal"] = True
+
+        class FakeImage:
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def initByReferencingFile_(self, _path):
+                return self
+
+            def isValid(self) -> bool:
+                return True
+
+        fake_ns_app = type(
+            "FakeNSApp",
+            (),
+            {"activateIgnoringOtherApps_": lambda self, _active: None},
+        )()
+        accessory = object()
+        monkeypatch.setattr(AppKit, "NSAlert", FakeAlert)
+        monkeypatch.setattr(AppKit, "NSImage", FakeImage)
+        monkeypatch.setattr(AppKit, "NSApp", fake_ns_app)
+        monkeypatch.setattr(
+            full_app, "_build_about_accessory", lambda: (accessory, object())
+        )
+
+        full_app.open_about_window(None)
+
+        assert captured["title"] == "Moodito"
+        assert f"Version {app.app_version()}" in captured["info"]
+        assert f"Author: {app.APP_AUTHOR}" in captured["info"]
+        assert captured["buttons"] == ["Close"]
+        assert captured["accessory"] is accessory
+        assert captured["modal"] is True
 
     def test_restores_display_settings(self, data_dir, monkeypatch) -> None:
         app.save_settings({"show_emojis": False, "show_labels": True})
@@ -1427,6 +1584,15 @@ class TestRefresh:
         full_app.refresh(None)
         assert "error" in full_app._detected_item.title
         assert full_app._raw_buffer[-1][1] == "error"
+
+    def test_routes_face_presence_to_privacy(self, full_app) -> None:
+        observations = []
+        full_app._update_privacy = lambda face_present: observations.append(face_present)
+        full_app._worker._set_result(EmotionResult(app.NO_FACE_LABEL, 0.0))
+        full_app.refresh(None)
+        full_app._worker._set_result(EmotionResult("happy", 0.8))
+        full_app.refresh(None)
+        assert observations == [False, True]
 
 
 class TestRenderStatus:
@@ -1505,6 +1671,198 @@ class _FakeSegment:
 
     def selectedSegment(self) -> int:
         return self._selected
+
+
+class _FakeIntegerControl:
+    def __init__(self, value: int) -> None:
+        self._value = value
+
+    def integerValue(self) -> int:
+        return self._value
+
+
+class _FakeToggle:
+    def __init__(self, enabled: bool) -> None:
+        self._enabled = enabled
+
+    def state(self) -> int:
+        return int(self._enabled)
+
+
+class TestNotifications:
+    def test_defaults_disable_detected_emotions_only(self, full_app) -> None:
+        assert full_app._notifications == app.DEFAULT_NOTIFICATIONS
+        assert all(
+            not full_app._notifications[event]
+            for event in app.EMOTION_NOTIFICATION_EVENTS.values()
+        )
+        assert all(
+            full_app._notifications[event]
+            for event in app.NOTIFICATION_KEYS
+            if not event.startswith("emotion_")
+        )
+
+    def test_menu_item_precedes_sensitivity(self, full_app) -> None:
+        menu_titles = list(full_app.menu.keys())
+        sensitivity_index = menu_titles.index(full_app._sensitivity_menu.title)
+        assert menu_titles[sensitivity_index - 1] == full_app._notifications_menu.title
+
+    def test_apply_persists_each_toggle(self, full_app, monkeypatch) -> None:
+        saved = []
+        monkeypatch.setattr(app, "save_settings", lambda settings: saved.append(settings))
+        notifications = dict.fromkeys(app.NOTIFICATION_KEYS, True)
+        notifications["microphone_unmuted"] = False
+        notifications["speakers_off"] = False
+        assert full_app._apply_notifications(notifications) is True
+        assert full_app._notifications == notifications
+        assert saved[-1]["notifications"] == notifications
+
+    def test_apply_from_controls_reads_each_toggle(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda settings: None)
+        controls = {
+            key: _FakeToggle(index % 2 == 0)
+            for index, key in enumerate(app.NOTIFICATION_KEYS)
+        }
+        assert full_app._apply_notifications_from_controls(controls) is True
+        assert full_app._notifications == {
+            key: index % 2 == 0
+            for index, key in enumerate(app.NOTIFICATION_KEYS)
+        }
+
+    def test_build_accessory_restores_values_and_icons(self, full_app) -> None:
+        full_app._notifications = {
+            key: index % 2 == 0
+            for index, key in enumerate(app.NOTIFICATION_KEYS)
+        }
+        _view, controls = full_app._build_notifications_accessory()
+        assert set(controls) == set(app.NOTIFICATION_KEYS)
+        for index, key in enumerate(app.NOTIFICATION_KEYS):
+            assert bool(controls[key].state()) is (index % 2 == 0)
+            assert controls[key].image() is not None
+
+    def test_master_controls_update_all_toggles_and_summary(self, full_app) -> None:
+        _view, controls = full_app._build_notifications_accessory()
+        handler = full_app._notifications_handler
+        handler.disableAll_(None)
+        assert not any(bool(control.state()) for control in controls.values())
+        assert handler.summary.stringValue().startswith("0 of ")
+        handler.enableAll_(None)
+        assert all(bool(control.state()) for control in controls.values())
+        assert handler.summary.stringValue().startswith(
+            f"{len(app.NOTIFICATION_KEYS)} of "
+        )
+
+    def test_load_restores_valid_values(self, data_dir, monkeypatch) -> None:
+        app.save_settings(
+            {
+                "notifications": {
+                    "microphone_muted": False,
+                    "speakers_on": False,
+                }
+            }
+        )
+        monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+        monkeypatch.setattr(app.rumps, "notification", lambda *args, **kwargs: None)
+        inst = app.MooditoApp()
+        assert inst._notifications["microphone_muted"] is False
+        assert inst._notifications["speakers_on"] is False
+        assert inst._notifications["microphone_unmuted"] is True
+        assert inst._notifications["emotion_happy"] is False
+
+    def test_saved_emotion_preference_overrides_default(
+        self, data_dir, monkeypatch
+    ) -> None:
+        app.save_settings({"notifications": {"emotion_happy": True}})
+        monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+        monkeypatch.setattr(app.rumps, "notification", lambda *args, **kwargs: None)
+        inst = app.MooditoApp()
+        assert inst._notifications["emotion_happy"] is True
+        assert inst._notifications["emotion_sad"] is False
+
+    def test_disabled_event_does_not_notify(self, full_app, monkeypatch) -> None:
+        calls = []
+        monkeypatch.setattr(
+            app.rumps, "notification", lambda *args, **kwargs: calls.append(args)
+        )
+        full_app._notifications["microphone_muted"] = False
+        full_app._send_privacy_notification("microphone_muted")
+        full_app._send_privacy_notification("speakers_off")
+        assert calls == [
+            ("Moodito Privacy", "Speakers volume off", "No face was detected.")
+        ]
+
+    def test_privacy_transition_sends_all_four_notifications(
+        self, full_app, monkeypatch
+    ) -> None:
+        full_app._privacy = {
+            "microphone_seconds": 1,
+            "speakers_seconds": 1,
+        }
+
+        def mute(microphone, speakers):
+            if microphone:
+                state = app.AudioState(input_volume=70)
+            else:
+                state = app.AudioState(output_volume=45, output_muted=False)
+            return app.PrivacyMuteResult(state, applied=True)
+
+        monkeypatch.setattr(
+            app,
+            "mute_audio_for_privacy",
+            mute,
+        )
+        monkeypatch.setattr(app, "restore_audio_state", lambda value: True)
+        calls = []
+        monkeypatch.setattr(
+            app.rumps, "notification", lambda *args, **kwargs: calls.append(args)
+        )
+
+        full_app._update_privacy(False, now=1.0)
+        full_app._update_privacy(False, now=2.0)
+        full_app._update_privacy(True, now=3.0)
+
+        assert [call[1] for call in calls] == [
+            "Microphone muted",
+            "Speakers volume off",
+            "Microphone unmuted",
+            "Speakers volume on",
+        ]
+
+    def test_already_silent_channels_do_not_notify(
+        self, full_app, monkeypatch
+    ) -> None:
+        full_app._privacy = {
+            "microphone_seconds": 1,
+            "speakers_seconds": 1,
+        }
+
+        def mute(microphone, speakers):
+            if microphone:
+                state = app.AudioState(input_volume=0)
+            else:
+                state = app.AudioState(output_volume=0, output_muted=False)
+            return app.PrivacyMuteResult(state, applied=True)
+
+        monkeypatch.setattr(
+            app,
+            "mute_audio_for_privacy",
+            mute,
+        )
+        monkeypatch.setattr(app, "restore_audio_state", lambda value: True)
+        calls = []
+        monkeypatch.setattr(
+            app.rumps, "notification", lambda *args, **kwargs: calls.append(args)
+        )
+
+        full_app._update_privacy(False, now=1.0)
+        full_app._update_privacy(False, now=2.0)
+        full_app._update_privacy(True, now=3.0)
+
+        assert calls == []
 
 
 class TestSensitivity:
@@ -1608,6 +1966,303 @@ class TestSensitivity:
         inst = app.MooditoApp()
         assert inst._sensitivity["happy"] == app.DEFAULT_SENSITIVITY
         assert inst._sensitivity["sad"] == app.DEFAULT_SENSITIVITY
+
+
+class TestPrivacy:
+    def test_defaults_are_opt_in(self, full_app) -> None:
+        assert full_app._privacy == {
+            "microphone_seconds": 0,
+            "speakers_seconds": 0,
+        }
+
+    def test_menu_item_opens_window(self, full_app) -> None:
+        assert full_app._privacy_menu.title.startswith("Privacy")
+
+    def test_menu_item_follows_sensitivity(self, full_app) -> None:
+        menu_titles = list(full_app.menu.keys())
+        sensitivity_index = menu_titles.index(full_app._sensitivity_menu.title)
+        assert menu_titles[sensitivity_index + 1] == full_app._privacy_menu.title
+
+    def test_apply_persists_settings(self, full_app, monkeypatch) -> None:
+        saved = []
+        notifications = []
+        monkeypatch.setattr(app, "save_settings", lambda settings: saved.append(settings))
+        monkeypatch.setattr(
+            full_app,
+            "_send_notification",
+            lambda event, message=None: notifications.append((event, message)),
+        )
+        assert full_app._apply_privacy(15, 90) is True
+        assert full_app._privacy == {
+            "microphone_seconds": 15,
+            "speakers_seconds": 90,
+        }
+        assert saved[-1]["privacy"] == full_app._privacy
+        assert notifications == [
+            (
+                "privacy_settings_changed",
+                "Microphone: 15 seconds; Speakers: 90 seconds.",
+            )
+        ]
+
+    def test_apply_privacy_reports_disabled_zero_counter(
+        self, full_app, monkeypatch
+    ) -> None:
+        notifications = []
+        monkeypatch.setattr(app, "save_settings", lambda settings: None)
+        monkeypatch.setattr(
+            full_app,
+            "_send_notification",
+            lambda event, message=None: notifications.append((event, message)),
+        )
+        assert full_app._apply_privacy(0, 30) is True
+        assert notifications == [
+            (
+                "privacy_settings_changed",
+                "Microphone: Disabled; Speakers: 30 seconds.",
+            )
+        ]
+
+    def test_unchanged_or_failed_privacy_apply_does_not_notify(
+        self, full_app, monkeypatch
+    ) -> None:
+        notifications = []
+        monkeypatch.setattr(
+            full_app,
+            "_send_notification",
+            lambda event, message=None: notifications.append((event, message)),
+        )
+        assert full_app._apply_privacy(0, 0) is True
+        assert full_app._apply_privacy(-1, 0) is False
+        full_app._privacy_audio_states = {
+            "microphone": app.AudioState(input_volume=55)
+        }
+        monkeypatch.setattr(app, "restore_audio_state", lambda state: False)
+        assert full_app._apply_privacy(10, 0) is False
+        assert notifications == []
+
+    @pytest.mark.parametrize(
+        "microphone_seconds,speakers_seconds",
+        [(-1, 0), (0, -1), (601, 0), (0, 601), (True, 1)],
+    )
+    def test_apply_rejects_invalid_delay(
+        self, full_app, monkeypatch, microphone_seconds, speakers_seconds
+    ) -> None:
+        saved = []
+        monkeypatch.setattr(app, "save_settings", lambda settings: saved.append(settings))
+        assert (
+            full_app._apply_privacy(microphone_seconds, speakers_seconds) is False
+        )
+        assert saved == []
+
+    def test_apply_from_controls_reads_all_values(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda settings: None)
+        controls = {
+            "microphone_seconds": _FakeIntegerControl(125),
+            "speakers_seconds": _FakeIntegerControl(350),
+        }
+        assert full_app._apply_privacy_from_controls(controls) is True
+        assert full_app._privacy == {
+            "microphone_seconds": 125,
+            "speakers_seconds": 350,
+        }
+
+    def test_build_accessory_restores_current_values(self, full_app) -> None:
+        full_app._privacy = {
+            "microphone_seconds": 180,
+            "speakers_seconds": 12,
+        }
+        _view, controls = full_app._build_privacy_accessory()
+        assert controls["microphone_seconds"].integerValue() == 180
+        assert controls["speakers_seconds"].integerValue() == 12
+        for key in ("microphone_seconds", "speakers_seconds"):
+            stepper = controls[f"{key}_stepper"]
+            assert stepper.minValue() == 0
+            assert stepper.maxValue() == app.MAX_PRIVACY_SECONDS
+
+    def test_stepper_updates_counter_and_clamps_typed_value(self, full_app) -> None:
+        _view, controls = full_app._build_privacy_accessory()
+        field = controls["microphone_seconds"]
+        stepper = controls["microphone_seconds_stepper"]
+        stepper.setIntegerValue_(125)
+        full_app._privacy_stepper_handler.stepperChanged_(stepper)
+        assert field.integerValue() == 125
+        field.setIntegerValue_(700)
+        full_app._privacy_stepper_handler.fieldChanged_(field)
+        assert field.integerValue() == 600
+        assert stepper.integerValue() == 600
+
+    def test_load_restores_per_channel_settings(self, data_dir, monkeypatch) -> None:
+        app.save_settings(
+            {
+                "privacy": {
+                    "microphone_seconds": 240,
+                    "speakers_seconds": 20,
+                }
+            }
+        )
+        monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+        inst = app.MooditoApp()
+        assert inst._privacy == {
+            "microphone_seconds": 240,
+            "speakers_seconds": 20,
+        }
+
+    def test_load_migrates_shared_delay_to_enabled_channels(
+        self, data_dir, monkeypatch
+    ) -> None:
+        app.save_settings(
+            {
+                "privacy": {
+                    "minutes": 2,
+                    "seconds": 5,
+                    "microphone": True,
+                    "speakers": False,
+                }
+            }
+        )
+        monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+        inst = app.MooditoApp()
+        assert inst._privacy == {
+            "microphone_seconds": 125,
+            "speakers_seconds": 0,
+        }
+
+    def test_load_ignores_invalid_settings(self, data_dir, monkeypatch) -> None:
+        app.save_settings(
+            {
+                "privacy": {
+                    "minutes": -2,
+                    "seconds": 80,
+                    "microphone": "yes",
+                    "speakers": 1,
+                }
+            }
+        )
+        monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+        inst = app.MooditoApp()
+        assert inst._privacy == {
+            "microphone_seconds": app.DEFAULT_PRIVACY_MICROPHONE_SECONDS,
+            "speakers_seconds": app.DEFAULT_PRIVACY_SPEAKERS_SECONDS,
+        }
+
+    def test_channels_activate_at_independent_delays(
+        self, full_app, monkeypatch
+    ) -> None:
+        full_app._privacy = {
+            "microphone_seconds": 5,
+            "speakers_seconds": 10,
+        }
+        calls = []
+
+        def mute(microphone, speakers):
+            calls.append((microphone, speakers))
+            if microphone:
+                state = app.AudioState(input_volume=62)
+            else:
+                state = app.AudioState(output_volume=50, output_muted=False)
+            return app.PrivacyMuteResult(state, applied=True)
+
+        monkeypatch.setattr(
+            app,
+            "mute_audio_for_privacy",
+            mute,
+        )
+        full_app._update_privacy(False, now=100.0)
+        full_app._update_privacy(False, now=104.9)
+        assert calls == []
+        full_app._update_privacy(False, now=105.0)
+        assert calls == [(True, False)]
+        full_app._update_privacy(False, now=109.9)
+        assert calls == [(True, False)]
+        full_app._update_privacy(False, now=110.0)
+        assert calls == [(True, False), (False, True)]
+        assert set(full_app._privacy_audio_states) == {"microphone", "speakers"}
+
+    def test_zero_disables_its_channel(self, full_app, monkeypatch) -> None:
+        full_app._privacy = {
+            "microphone_seconds": 0,
+            "speakers_seconds": 5,
+        }
+        calls = []
+        monkeypatch.setattr(
+            app,
+            "mute_audio_for_privacy",
+            lambda *args: calls.append(args)
+            or app.PrivacyMuteResult(
+                app.AudioState(output_volume=50, output_muted=False), applied=True
+            ),
+        )
+        full_app._update_privacy(False, now=1.0)
+        full_app._update_privacy(False, now=6.0)
+        assert calls == [(False, True)]
+
+    def test_returning_face_restores_audio(self, full_app, monkeypatch) -> None:
+        microphone_state = app.AudioState(input_volume=70)
+        speakers_state = app.AudioState(output_volume=45, output_muted=False)
+        full_app._privacy_audio_states = {
+            "microphone": microphone_state,
+            "speakers": speakers_state,
+        }
+        full_app._privacy_changed_channels = {"microphone", "speakers"}
+        full_app._privacy_no_face_since = 10.0
+        restored = []
+        monkeypatch.setattr(
+            app, "restore_audio_state", lambda value: restored.append(value) or True
+        )
+        full_app._update_privacy(True, now=12.0)
+        assert restored == [microphone_state, speakers_state]
+        assert full_app._privacy_audio_states == {}
+        assert full_app._privacy_no_face_since is None
+
+    def test_face_interrupts_and_restarts_delay(self, full_app, monkeypatch) -> None:
+        full_app._privacy = {
+            "microphone_seconds": 0,
+            "speakers_seconds": 5,
+        }
+        calls = []
+        monkeypatch.setattr(
+            app,
+            "mute_audio_for_privacy",
+            lambda *args: calls.append(args)
+            or app.PrivacyMuteResult(
+                app.AudioState(output_volume=50, output_muted=False), applied=True
+            ),
+        )
+        full_app._update_privacy(False, now=20.0)
+        full_app._update_privacy(True, now=24.0)
+        full_app._update_privacy(False, now=25.0)
+        full_app._update_privacy(False, now=29.9)
+        assert calls == []
+        full_app._update_privacy(False, now=30.0)
+        assert calls == [(False, True)]
+
+    def test_failed_mute_is_attempted_once_per_absence(
+        self, full_app, monkeypatch
+    ) -> None:
+        full_app._privacy = {
+            "microphone_seconds": 1,
+            "speakers_seconds": 0,
+        }
+        calls = []
+        monkeypatch.setattr(
+            app,
+            "mute_audio_for_privacy",
+            lambda *args: calls.append(args) or None,
+        )
+        full_app._update_privacy(False, now=1.0)
+        full_app._update_privacy(False, now=2.0)
+        full_app._update_privacy(False, now=3.0)
+        assert calls == [(True, False)]
+        full_app._update_privacy(True, now=4.0)
+        full_app._update_privacy(False, now=5.0)
+        full_app._update_privacy(False, now=6.0)
+        assert calls == [(True, False), (True, False)]
 
 
 class TestAIProvider:
@@ -2497,5 +3152,384 @@ class TestMain:
         monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
         app.main()
         assert run_calls == [True]
+
+
+def _capture_notifications(inst, monkeypatch, *enabled_events):
+    """Enable selected events and capture macOS notification arguments."""
+    inst._notifications = dict.fromkeys(app.NOTIFICATION_KEYS, False)
+    for event in enabled_events:
+        inst._notifications[event] = True
+    calls = []
+    monkeypatch.setattr(
+        app.rumps, "notification", lambda *args, **kwargs: calls.append(args)
+    )
+    return calls
+
+
+class TestNotificationClickDetails:
+    def test_sent_notification_includes_timestamp_and_show_action(
+        self, full_app, monkeypatch
+    ) -> None:
+        captured = {}
+
+        def capture(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        monkeypatch.setattr(app.rumps, "notification", capture)
+        full_app._notifications["app_paused"] = True
+
+        full_app._send_notification("app_paused")
+
+        assert captured["kwargs"]["action_button"] == "Show"
+        payload = captured["kwargs"]["data"]
+        assert payload["event"] == "app_paused"
+        assert payload["subtitle"] == "Moodito paused"
+        assert app.parse_iso_datetime(payload["occurred_at"]) is not None
+
+    def test_click_details_prefer_occurrence_payload_and_fallback_to_delivery(
+        self,
+    ) -> None:
+        occurred = "2026-07-20T14:35:42"
+        notification = type(
+            "Notification",
+            (),
+            {
+                "data": {
+                    "subtitle": "Moodito paused",
+                    "message": "Face detection is paused.",
+                    "occurred_at": occurred,
+                },
+                "subtitle": "Fallback subtitle",
+                "message": "Fallback message",
+                "delivered_at": app.datetime(2026, 1, 1),
+            },
+        )()
+        subtitle, message, occurred_at = app.MooditoApp._notification_detail_values(
+            notification
+        )
+        assert subtitle == "Moodito paused"
+        assert message == "Face detection is paused."
+        assert occurred_at == app.datetime(2026, 7, 20, 14, 35, 42)
+
+        notification.data = None
+        _subtitle, _message, occurred_at = (
+            app.MooditoApp._notification_detail_values(notification)
+        )
+        assert occurred_at == notification.delivered_at
+
+    def test_show_action_opens_timestamp_window(self, full_app, monkeypatch) -> None:
+        import AppKit
+
+        captured = {"buttons": [], "modal": False}
+
+        class FakeAlert:
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def init(self):
+                return self
+
+            def setMessageText_(self, value) -> None:
+                captured["title"] = value
+
+            def setInformativeText_(self, value) -> None:
+                captured["info"] = value
+
+            def addButtonWithTitle_(self, value) -> None:
+                captured["buttons"].append(value)
+
+            def setIcon_(self, _value) -> None:
+                pass
+
+            def runModal(self) -> None:
+                captured["modal"] = True
+
+        class FakeImage:
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def initByReferencingFile_(self, _path):
+                return self
+
+            def isValid(self) -> bool:
+                return True
+
+        fake_ns_app = type(
+            "FakeNSApp",
+            (),
+            {"activateIgnoringOtherApps_": lambda self, _active: None},
+        )()
+        monkeypatch.setattr(AppKit, "NSAlert", FakeAlert)
+        monkeypatch.setattr(AppKit, "NSImage", FakeImage)
+        monkeypatch.setattr(AppKit, "NSApp", fake_ns_app)
+        notification = type(
+            "Notification",
+            (),
+            {
+                "data": {
+                    "subtitle": "CSV downloaded",
+                    "message": "Saved moodito.csv in Downloads.",
+                    "occurred_at": "2026-07-20T14:35:42",
+                },
+                "subtitle": "",
+                "message": "",
+                "delivered_at": None,
+            },
+        )()
+
+        full_app._show_notification_details(notification)
+
+        assert captured["title"] == "CSV downloaded"
+        assert "Saved moodito.csv in Downloads." in captured["info"]
+        assert "Jul 20, 2026 at 14:35:42" in captured["info"]
+        assert captured["buttons"] == ["Close"]
+        assert captured["modal"] is True
+
+    def test_global_click_handler_routes_to_running_app(
+        self, full_app, monkeypatch
+    ) -> None:
+        received = []
+        monkeypatch.setattr(
+            full_app,
+            "_show_notification_details",
+            lambda notification: received.append(notification),
+        )
+        monkeypatch.setattr(
+            app.rumps.App, "*app_instance", full_app, raising=False
+        )
+        notification = object()
+
+        app._handle_notification_activation(notification)
+
+        assert received == [notification]
+
+
+class TestRequestedNotificationEvents:
+    def test_catalog_covers_every_requested_event(self) -> None:
+        assert set(app.NOTIFICATION_KEYS) == {
+            "microphone_muted",
+            "microphone_unmuted",
+            "speakers_off",
+            "speakers_on",
+            "data_range_changed",
+            "mood_tip_generated",
+            "mood_tip_pdf_exported",
+            "csv_downloaded",
+            "data_erased",
+            "privacy_settings_changed",
+            "sensitivity_changed",
+            "ai_provider_changed",
+            "app_paused",
+            "app_resumed",
+            "emotion_neutral",
+            "emotion_happy",
+            "emotion_surprised",
+            "emotion_angry",
+            "emotion_sad",
+            "emotion_no_face",
+            "license_activated",
+            "license_deactivated",
+            "app_quit",
+        }
+
+    def test_emotions_notify_once_per_transition(
+        self, full_app, monkeypatch
+    ) -> None:
+        emotion_events = tuple(app.EMOTION_NOTIFICATION_EVENTS.values())
+        calls = _capture_notifications(full_app, monkeypatch, *emotion_events)
+        labels = ("neutral", "happy", "surprised", "angry", "sad", "no face")
+        for label in labels:
+            full_app._worker._set_result(EmotionResult(label, 0.8))
+            full_app.refresh(None)
+            full_app.refresh(None)
+        assert [call[1] for call in calls] == [
+            "Neutral detected",
+            "Happy detected",
+            "Surprised detected",
+            "Angry detected",
+            "Sad detected",
+            "No face detected",
+        ]
+
+    def test_pause_resume_sensitivity_and_ai_provider_notify(
+        self, full_app, monkeypatch
+    ) -> None:
+        calls = _capture_notifications(
+            full_app,
+            monkeypatch,
+            "app_paused",
+            "app_resumed",
+            "sensitivity_changed",
+            "ai_provider_changed",
+        )
+        monkeypatch.setattr(app, "save_settings", lambda settings: None)
+
+        full_app.toggle_pause(None)
+        full_app.toggle_pause(None)
+        full_app._apply_sensitivity_from_controls(
+            {
+                "happy": _FakeSegment(app.SENSITIVITY_LEVELS.index("high")),
+                "angry": _FakeSegment(app.SENSITIVITY_LEVELS.index("low")),
+            }
+        )
+        values = {"api_key": "k", "model": "gpt-4o"}
+        full_app._apply_ai_provider("OpenAI", values)
+        full_app._apply_ai_provider("OpenAI", values)
+
+        assert [call[1] for call in calls] == [
+            "Moodito paused",
+            "Moodito resumed",
+            "Sensitivity updated",
+            "AI provider updated",
+        ]
+        assert "Happy" in calls[2][2] and "Angry" in calls[2][2]
+
+    def test_data_range_notifies_only_when_changed(
+        self, data_dir, monkeypatch
+    ) -> None:
+        _patch_window(monkeypatch, clicked=1, text="2026-06-21 22:10 to now")
+        inst = _bare_app()
+        calls = _capture_notifications(inst, monkeypatch, "data_range_changed")
+
+        inst.set_stats_range(None)
+        inst.set_stats_range(None)
+
+        assert [call[1] for call in calls] == ["Data range changed"]
+        assert "Jun 21, 2026 22:10" in calls[0][2]
+
+    def test_mood_tip_notifies_only_for_success(
+        self, full_app, monkeypatch
+    ) -> None:
+        calls = _capture_notifications(full_app, monkeypatch, "mood_tip_generated")
+        handler = _FakeMoodHandler(full_app)
+
+        full_app._finish_mood_report(handler, "A finished report")
+        full_app._finish_mood_report(
+            handler, f"{app.MOOD_TIP_ERROR_PREFIX}\noffline"
+        )
+
+        assert [call[1] for call in calls] == ["Mood Tip ready"]
+
+    def test_pdf_notifies_only_after_successful_write(
+        self, full_app, monkeypatch
+    ) -> None:
+        import AppKit
+
+        class FakeSavePanel:
+            @classmethod
+            def savePanel(cls):
+                return cls()
+
+            def setNameFieldStringValue_(self, _value) -> None:
+                pass
+
+            def setAllowedContentTypes_(self, _value) -> None:
+                pass
+
+            def setAllowedFileTypes_(self, _value) -> None:
+                pass
+
+            def runModal(self):
+                return AppKit.NSModalResponseOK
+
+            def URL(self):
+                return "report-url"
+
+        fake_app = type(
+            "FakeNSApp",
+            (),
+            {"activateIgnoringOtherApps_": lambda self, _active: None},
+        )()
+        monkeypatch.setattr(AppKit, "NSSavePanel", FakeSavePanel)
+        monkeypatch.setattr(AppKit, "NSApp", fake_app)
+        calls = _capture_notifications(
+            full_app, monkeypatch, "mood_tip_pdf_exported"
+        )
+        handler = _FakeMoodHandler(full_app)
+        handler.report_text = "A finished report"
+        results = iter((True, False))
+        monkeypatch.setattr(app, "write_report_pdf", lambda *args: next(results))
+
+        full_app._save_mood_report_pdf(handler)
+        full_app._save_mood_report_pdf(handler)
+
+        assert [call[1] for call in calls] == ["Mood Tip PDF saved"]
+
+    def test_csv_download_notifies_after_file_is_written(
+        self, data_dir, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("HOME", str(data_dir))
+        (data_dir / "Downloads").mkdir()
+        monkeypatch.setattr(app.subprocess, "run", lambda *args, **kwargs: None)
+        inst = _bare_app()
+        calls = _capture_notifications(inst, monkeypatch, "csv_downloaded")
+
+        inst.export_csv(None)
+
+        assert [call[1] for call in calls] == ["CSV downloaded"]
+        assert "Downloads" in calls[0][2]
+
+    def test_data_erase_cancel_is_quiet_and_success_notifies(
+        self, data_dir, monkeypatch
+    ) -> None:
+        responses = iter((0, 1))
+        monkeypatch.setattr(app.rumps, "alert", lambda *args, **kwargs: next(responses))
+        monkeypatch.setattr(app, "save_stats", lambda *args, **kwargs: None)
+        inst = _bare_app()
+        calls = _capture_notifications(inst, monkeypatch, "data_erased")
+
+        inst.reset_stats(None)
+        inst.reset_stats(None)
+
+        assert [call[1] for call in calls] == ["Data erased"]
+
+    def test_license_events_are_delivered_on_main_thread(
+        self, data_dir, monkeypatch
+    ) -> None:
+        inst = _bare_license_app(active=False)
+        calls = _capture_notifications(
+            inst, monkeypatch, "license_activated", "license_deactivated"
+        )
+        monkeypatch.setattr(app.rumps, "alert", lambda *args, **kwargs: None)
+        monkeypatch.setattr(app, "license_instance_name", lambda: "Moodito on Mac")
+        monkeypatch.setattr(
+            app, "activate_license", lambda *args: (True, "activated", "iid")
+        )
+
+        inst._activate_worker("key")
+        assert calls == []
+        inst._consume_license_updates()
+        monkeypatch.setattr(app, "deactivate_license", lambda *args: (True, "ok"))
+        inst._deactivate_worker("key", "iid")
+        assert len(calls) == 1
+        inst._consume_license_updates()
+
+        assert [call[1] for call in calls] == [
+            "License activated",
+            "License deactivated",
+        ]
+
+    def test_quit_notifies_after_state_is_flushed(self, monkeypatch) -> None:
+        order = []
+        monkeypatch.setattr(
+            app, "save_stats", lambda *args, **kwargs: order.append("saved")
+        )
+        monkeypatch.setattr(
+            app, "append_raw_samples", lambda rows: order.append("flushed")
+        )
+        monkeypatch.setattr(
+            app.rumps, "quit_application", lambda: order.append("quit")
+        )
+        inst = _bare_app()
+        inst._worker = type("Worker", (), {"stop": lambda self: order.append("stopped")})()
+        calls = _capture_notifications(inst, monkeypatch, "app_quit")
+
+        inst.quit_app(None)
+
+        assert [call[1] for call in calls] == ["Moodito quit"]
+        assert order == ["stopped", "saved", "flushed", "quit"]
 
 

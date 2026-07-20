@@ -14,9 +14,11 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import cv2
@@ -76,7 +78,8 @@ RAW_PATH = os.path.join(DATA_DIR, "raw_data.csv")
 # Column labels for the raw detection log.
 RAW_HEADER = ["timestamp", "state", "score"]
 # Emotions accumulated in the statistics.
-TRACKED_EMOTIONS = ["happy", "sad", "surprised", "angry", "neutral", "no face"]
+NO_FACE_LABEL = "no face"
+TRACKED_EMOTIONS = ["happy", "sad", "surprised", "angry", "neutral", NO_FACE_LABEL]
 # Non-emotion states that are also tracked.
 EXTRA_STATES = ["paused", "error"]
 # All statistic rows, in display order.
@@ -139,11 +142,145 @@ MOOD_TIP_ERROR_PREFIX = "Could not get a mood report:"
 MOOD_TIP_PDF_NAME = "Moodito Mood Report.pdf"
 # Brand accent colour (RGB 0-1) used for the PDF report's header and headings.
 PDF_ACCENT_RGB = (0.45, 0.36, 0.86)
+# About-window content shown from the clickable version footer.
+APP_AUTHOR = "Georgios Nikitas"
+ABOUT_DESCRIPTION = (
+    "Your mood, live in the menu bar. Moodito is a tiny, privacy-first macOS "
+    "menu bar companion that reads your face through the webcam and shows how "
+    "you're feeling right now — as a friendly emoji and label — without ever "
+    "leaving your Mac. No accounts, no cloud, no frames uploaded anywhere: "
+    "every detection happens 100% on-device.\n\n"
+    "But Moodito is more than a fun face emoji. It quietly builds a picture of "
+    "your emotional day, turns it into beautiful in-menu charts, and — if you "
+    "connect your favourite AI provider — writes you a personalised wellbeing "
+    "report with suggestions to feel better. Think of it as a gentle, always-on "
+    "mood mirror that lives one click away in your menu bar."
+)
+ABOUT_BOLD_PHRASES = (
+    "Your mood, live in the menu bar.",
+    "charts",
+    "wellbeing report",
+)
 
 # How often (seconds) the menu bar title is refreshed from the latest result.
 UI_REFRESH_INTERVAL = 0.3
 # Target webcam sampling rate (seconds between processed frames).
 SAMPLE_INTERVAL = 0.15
+# Privacy is opt-in so upgrading Moodito never changes audio unexpectedly.
+PRIVACY_CHANNELS = ("microphone", "speakers")
+MAX_PRIVACY_SECONDS = 600
+DEFAULT_PRIVACY_MICROPHONE_SECONDS = 0
+DEFAULT_PRIVACY_SPEAKERS_SECONDS = 0
+PAUSE_SYMBOL = "pause.fill"
+PRIVACY_NOTIFICATION_TITLE = "Moodito Privacy"
+# Notification events grouped in the order shown in the settings dialog.
+NOTIFICATION_GROUPS = (
+    (
+        "Privacy Audio",
+        (
+            ("microphone_muted", "Microphone muted", "mic.slash.fill"),
+            ("microphone_unmuted", "Microphone unmuted", "mic.fill"),
+            ("speakers_off", "Speakers volume off", "speaker.slash.fill"),
+            ("speakers_on", "Speakers volume on", "speaker.wave.2.fill"),
+        ),
+    ),
+    (
+        "Mood & Data",
+        (
+            ("data_range_changed", "Data range changed", "calendar"),
+            ("mood_tip_generated", "Mood Tip generated", "text.bubble"),
+            ("mood_tip_pdf_exported", "Mood Tip exported to PDF", "doc.text"),
+            ("csv_downloaded", "CSV downloaded", "square.and.arrow.down"),
+            ("data_erased", "Data erased", "trash"),
+        ),
+    ),
+    (
+        "Settings & Activity",
+        (
+            ("privacy_settings_changed", "Privacy settings changed", "lock.shield"),
+            ("sensitivity_changed", "Sensitivity changed", "slider.horizontal.3"),
+            ("ai_provider_changed", "AI provider changed", "sparkles"),
+            ("app_paused", "Moodito paused", PAUSE_SYMBOL),
+            ("app_resumed", "Moodito resumed", "play.fill"),
+        ),
+    ),
+    (
+        "Detected Emotion",
+        (
+            ("emotion_neutral", "Neutral detected", "minus.circle"),
+            ("emotion_happy", "Happy detected", "face.smiling"),
+            ("emotion_surprised", "Surprised detected", "exclamationmark.circle"),
+            ("emotion_angry", "Angry detected", "bolt.fill"),
+            ("emotion_sad", "Sad detected", "cloud.rain"),
+            ("emotion_no_face", "No face detected", "eye.slash"),
+        ),
+    ),
+    (
+        "License & App",
+        (
+            ("license_activated", "License activated", "checkmark.seal"),
+            ("license_deactivated", "License deactivated", "xmark.seal"),
+            ("app_quit", "Moodito quit", "power"),
+        ),
+    ),
+)
+NOTIFICATION_OPTIONS = tuple(
+    option for _group, options in NOTIFICATION_GROUPS for option in options
+)
+NOTIFICATION_KEYS = tuple(option[0] for option in NOTIFICATION_OPTIONS)
+DEFAULT_NOTIFICATIONS = {
+    key: not key.startswith("emotion_") for key in NOTIFICATION_KEYS
+}
+NOTIFICATION_MESSAGES = {
+    "microphone_muted": (PRIVACY_NOTIFICATION_TITLE, "Microphone muted", "No face was detected."),
+    "microphone_unmuted": (PRIVACY_NOTIFICATION_TITLE, "Microphone unmuted", "Your face is visible again."),
+    "speakers_off": (PRIVACY_NOTIFICATION_TITLE, "Speakers volume off", "No face was detected."),
+    "speakers_on": (PRIVACY_NOTIFICATION_TITLE, "Speakers volume on", "Your face is visible again."),
+    "data_range_changed": ("Moodito", "Data range changed", "Insights now use the selected date range."),
+    "mood_tip_generated": ("Moodito", "Mood Tip ready", "Your Mood Tip was generated successfully."),
+    "mood_tip_pdf_exported": ("Moodito", "Mood Tip PDF saved", "Your Mood Tip was exported successfully."),
+    "csv_downloaded": ("Moodito", "CSV downloaded", "Your selected data was exported successfully."),
+    "data_erased": ("Moodito", "Data erased", "Recorded statistics and detection history were erased."),
+    "privacy_settings_changed": ("Moodito", "Privacy settings updated", "Privacy auto-mute settings were changed."),
+    "sensitivity_changed": ("Moodito", "Sensitivity updated", "Emotion sensitivity settings were changed."),
+    "ai_provider_changed": ("Moodito", "AI provider updated", "AI provider settings were changed."),
+    "app_paused": ("Moodito", "Moodito paused", "Face detection is paused."),
+    "app_resumed": ("Moodito", "Moodito resumed", "Face detection has resumed."),
+    "emotion_neutral": ("Moodito", "Neutral detected", "Moodito now detects a neutral expression."),
+    "emotion_happy": ("Moodito", "Happy detected", "Moodito now detects a happy expression."),
+    "emotion_surprised": ("Moodito", "Surprised detected", "Moodito now detects a surprised expression."),
+    "emotion_angry": ("Moodito", "Angry detected", "Moodito now detects an angry expression."),
+    "emotion_sad": ("Moodito", "Sad detected", "Moodito now detects a sad expression."),
+    "emotion_no_face": ("Moodito", "No face detected", "No face is currently visible."),
+    "license_activated": ("Moodito", "License activated", "Your Moodito license is active."),
+    "license_deactivated": ("Moodito", "License deactivated", "Your Moodito license is no longer active."),
+    "app_quit": ("Moodito", "Moodito quit", "Tracking has stopped."),
+}
+EMOTION_NOTIFICATION_EVENTS = {
+    "neutral": "emotion_neutral",
+    "happy": "emotion_happy",
+    "surprised": "emotion_surprised",
+    "angry": "emotion_angry",
+    "sad": "emotion_sad",
+    NO_FACE_LABEL: "emotion_no_face",
+}
+
+
+@dataclass(frozen=True)
+class AudioState:
+    """Audio values captured before Privacy mutes the selected channels."""
+
+    input_volume: int | None = None
+    output_volume: int | None = None
+    output_muted: bool | None = None
+
+
+@dataclass(frozen=True)
+class PrivacyMuteResult:
+    """Audio state to restore and whether the requested mute fully succeeded."""
+
+    state: AudioState
+    applied: bool
 
 
 def resource_path(name: str) -> str:
@@ -658,7 +795,67 @@ def _mood_tip_handler_class():
     return _MoodTipHandler
 
 
-def write_report_pdf(report_text: str, meta: dict | None, url) -> None:
+# Lazily-created target for the Privacy dialog's numeric fields and steppers.
+_PRIVACY_STEPPER_HANDLER_CLASS = None
+
+
+def _privacy_stepper_handler_class():
+    """Return the NSObject subclass that synchronizes Privacy counters."""
+    global _PRIVACY_STEPPER_HANDLER_CLASS
+    if _PRIVACY_STEPPER_HANDLER_CLASS is not None:
+        return _PRIVACY_STEPPER_HANDLER_CLASS
+    from AppKit import NSObject
+
+    class _PrivacyStepperHandler(NSObject):
+        def stepperChanged_(self, sender) -> None:
+            index = int(sender.tag())
+            self.fields[index].setIntegerValue_(sender.integerValue())
+
+        def fieldChanged_(self, sender) -> None:
+            index = int(sender.tag())
+            value = max(0, min(MAX_PRIVACY_SECONDS, int(sender.integerValue())))
+            sender.setIntegerValue_(value)
+            self.steppers[index].setIntegerValue_(value)
+
+    _PRIVACY_STEPPER_HANDLER_CLASS = _PrivacyStepperHandler
+    return _PrivacyStepperHandler
+
+
+_NOTIFICATION_SETTINGS_HANDLER_CLASS = None
+
+
+def _notification_settings_handler_class():
+    """Return the target that manages notification settings master controls."""
+    global _NOTIFICATION_SETTINGS_HANDLER_CLASS
+    if _NOTIFICATION_SETTINGS_HANDLER_CLASS is not None:
+        return _NOTIFICATION_SETTINGS_HANDLER_CLASS
+    from AppKit import NSObject
+
+    class _NotificationSettingsHandler(NSObject):
+        def _update_summary(self) -> None:
+            enabled = sum(bool(control.state()) for control in self.controls)
+            self.summary.setStringValue_(
+                f"{enabled} of {len(self.controls)} notifications enabled"
+            )
+
+        def toggleChanged_(self, _sender) -> None:
+            self._update_summary()
+
+        def enableAll_(self, _sender) -> None:
+            for control in self.controls:
+                control.setState_(1)
+            self._update_summary()
+
+        def disableAll_(self, _sender) -> None:
+            for control in self.controls:
+                control.setState_(0)
+            self._update_summary()
+
+    _NOTIFICATION_SETTINGS_HANDLER_CLASS = _NotificationSettingsHandler
+    return _NotificationSettingsHandler
+
+
+def write_report_pdf(report_text: str, meta: dict | None, url) -> bool:
     """Write a styled mood-report PDF to ``url`` (best-effort).
 
     Builds a rich, branded cover header (Moodito icon, generation date, date
@@ -718,9 +915,9 @@ def write_report_pdf(report_text: str, meta: dict | None, url) -> None:
         )
         operation.setShowsPrintPanel_(False)
         operation.setShowsProgressPanel_(False)
-        operation.runOperation()
+        return bool(operation.runOperation())
     except Exception:  # noqa: BLE001 - never let PDF export crash the app
-        pass
+        return False
 
 
 def _pdf_brand_badge_image(size: float = 72.0):
@@ -1313,6 +1510,84 @@ def open_camera_settings() -> None:
     )
 
 
+def _run_osascript(*statements: str) -> tuple[bool, str]:
+    """Run AppleScript statements and return ``(succeeded, stdout)``."""
+    command = ["/usr/bin/osascript"]
+    for statement in statements:
+        command.extend(["-e", statement])
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False, ""
+    return result.returncode == 0, result.stdout.strip()
+
+
+def _capture_audio_state(microphone: bool, speakers: bool) -> AudioState | None:
+    """Read the current macOS audio state for the channels Privacy will mute."""
+    ok, output = _run_osascript(
+        "set audioSettings to get volume settings",
+        "return ((output volume of audioSettings) as text) & \",\" & "
+        "((output muted of audioSettings) as text) & \",\" & "
+        "((input volume of audioSettings) as text)",
+    )
+    if not ok:
+        return None
+    try:
+        output_volume_text, output_muted_text, input_volume_text = output.split(",")
+        return AudioState(
+            input_volume=int(input_volume_text) if microphone else None,
+            output_volume=int(output_volume_text) if speakers else None,
+            output_muted=(output_muted_text.lower() == "true") if speakers else None,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def restore_audio_state(state: AudioState) -> bool:
+    """Restore audio values previously captured by :func:`mute_audio_for_privacy`."""
+    statements = []
+    if state.input_volume is not None:
+        statements.append(f"set volume input volume {state.input_volume}")
+    if state.output_volume is not None:
+        statements.append(f"set volume output volume {state.output_volume}")
+        statements.append(
+            "set volume with output muted"
+            if state.output_muted
+            else "set volume without output muted"
+        )
+    if not statements:
+        return True
+    restored, _output = _run_osascript(*statements)
+    return restored
+
+
+def mute_audio_for_privacy(
+    microphone: bool, speakers: bool
+) -> PrivacyMuteResult | None:
+    """Mute selected channels and retain the state needed for restoration."""
+    if not microphone and not speakers:
+        return None
+    state = _capture_audio_state(microphone, speakers)
+    if state is None:
+        return None
+    statements = []
+    if microphone:
+        statements.append("set volume input volume 0")
+    if speakers:
+        statements.append("set volume with output muted")
+    muted, _output = _run_osascript(*statements)
+    if muted:
+        return PrivacyMuteResult(state, applied=True)
+    if restore_audio_state(state):
+        return None
+    return PrivacyMuteResult(state, applied=False)
+
+
 class FaceWorker(threading.Thread):
     """Background thread: capture frames and infer the current emotion."""
 
@@ -1420,9 +1695,17 @@ class FaceWorker(threading.Thread):
                 }
                 self._set_result(infer_emotion(scores, self.sensitivity))
             else:
-                self._set_result(EmotionResult("no face", 0.0))
+                self._set_result(EmotionResult(NO_FACE_LABEL, 0.0))
 
             self._stop.wait(SAMPLE_INTERVAL)
+
+
+@rumps.notifications
+def _handle_notification_activation(notification) -> None:
+    """Route a clicked macOS notification to the running Moodito instance."""
+    instance = getattr(rumps.App, "*app_instance", None)
+    if isinstance(instance, MooditoApp):
+        instance._show_notification_details(notification)
 
 
 class MooditoApp(rumps.App):
@@ -1438,10 +1721,22 @@ class MooditoApp(rumps.App):
         legacy_icon_only = bool(self._settings.get("icon_only", False))
         self._show_emojis = bool(self._settings.get("show_emojis", not legacy_icon_only))
         self._show_labels = bool(self._settings.get("show_labels", not legacy_icon_only))
+        # Each Privacy audio transition has its own persisted notification toggle.
+        self._notifications = self._load_notifications()
+        self._notifications_handler = None
+        self._last_notified_emotion: str | None = None
         # Per-emotion detection sensitivity, restored from settings and shared
         # with the worker thread that runs inference.
         self._sensitivity = self._load_sensitivity()
         self._worker.sensitivity = self._sensitivity
+        # Privacy can mute either audio channel after a continuous period with
+        # no face. Runtime state is kept separately from persisted preferences.
+        self._privacy = self._load_privacy()
+        self._privacy_no_face_since: float | None = None
+        self._privacy_attempted: set[str] = set()
+        self._privacy_audio_states: dict[str, AudioState] = {}
+        self._privacy_changed_channels: set[str] = set()
+        self._privacy_stepper_handler = None
         # AI provider configuration (selected service + its credentials),
         # restored from settings.
         self._ai_provider = self._load_ai_provider()
@@ -1495,6 +1790,8 @@ class MooditoApp(rumps.App):
         self._license_busy = threading.Event()
         # Pending alert text to show on the main thread after a network call.
         self._license_alert: str | None = None
+        # Successful license transitions are also delivered on the main thread.
+        self._license_notification_event: str | None = None
         # Set by a background license thread when the menu's license visibility
         # (and any pending alert) need to be applied on the main thread.
         self._license_dirty = threading.Event()
@@ -1608,10 +1905,18 @@ class MooditoApp(rumps.App):
         )
         self._license_menu.add(self._license_buy_item)
 
+        # Notification preferences are configured directly before Sensitivity.
+        self._notifications_menu = rumps.MenuItem(
+            "Notifications…", callback=self.open_notifications_window
+        )
         # Sensitivity is configured in a native NSAlert dialog (built each time
         # it is opened) — see open_sensitivity_window.
         self._sensitivity_menu = rumps.MenuItem(
             "Sensitivity…", callback=self.open_sensitivity_window
+        )
+        # Privacy is configured in a native NSAlert directly after Sensitivity.
+        self._privacy_menu = rumps.MenuItem(
+            "Privacy…", callback=self.open_privacy_window
         )
         # AI provider is configured in a native NSAlert dialog (built each time
         # it is opened) — see open_ai_provider_window. The title shows which
@@ -1624,12 +1929,12 @@ class MooditoApp(rumps.App):
         # on the raw data collected within the selected date range.
         self._mood_tip_menu = rumps.MenuItem("Mood Tip…", callback=self.mood_tip)
 
-        # Footer row: Moodito icon + name + version (informational, not clickable).
+        # Footer row: Moodito icon + version, opening the native About window.
         self._version_item = rumps.MenuItem(
             f"Moodito {app_version()}",
             icon=resource_path(MENUBAR_ICON),
             dimensions=[18, 18],
-            callback=None,
+            callback=self.open_about_window,
         )
 
         self.menu = [
@@ -1646,7 +1951,9 @@ class MooditoApp(rumps.App):
             rumps.MenuItem("Show Emojis", callback=self.toggle_emojis),
             rumps.MenuItem("Show Labels", callback=self.toggle_labels),
             rumps.MenuItem("Camera Grant Access", callback=self.grant_camera),
+            self._notifications_menu,
             self._sensitivity_menu,
+            self._privacy_menu,
             self._ai_provider_menu,
             rumps.MenuItem("Pause", callback=self.toggle_pause),
             None,
@@ -1683,10 +1990,12 @@ class MooditoApp(rumps.App):
         set_symbol_icon(self._emojis_item, "face.smiling")
         set_symbol_icon(self._labels_item, "textformat")
         set_symbol_icon(self._camera_item, "camera")
+        set_symbol_icon(self._notifications_menu, "bell")
         set_symbol_icon(self._sensitivity_menu, "slider.horizontal.3")
+        set_symbol_icon(self._privacy_menu, "lock.shield")
         set_symbol_icon(self._ai_provider_menu, "sparkles")
         set_symbol_icon(self._mood_tip_menu, "text.bubble")
-        set_symbol_icon(self._pause_item, "pause.fill")
+        set_symbol_icon(self._pause_item, PAUSE_SYMBOL)
         set_symbol_icon(self._bmc_menu, "cup.and.saucer.fill")
         set_symbol_icon(self._bmc_open_item, "globe")
         set_symbol_icon(self._license_menu, "key.fill")
@@ -1730,6 +2039,94 @@ class MooditoApp(rumps.App):
             self.title = title
             self.icon = None
 
+    def open_about_window(self, _sender) -> None:
+        """Show Moodito's version, author, and product description."""
+        try:
+            from AppKit import NSAlert, NSApp, NSImage
+
+            view, _text_view = self._build_about_accessory()
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Moodito")
+            alert.setInformativeText_(
+                f"Version {app_version()}\nAuthor: {APP_AUTHOR}"
+            )
+            alert.addButtonWithTitle_("Close")
+            icon = NSImage.alloc().initByReferencingFile_(resource_path(MENUBAR_ICON))
+            if icon is not None and icon.isValid():
+                alert.setIcon_(icon)
+            alert.setAccessoryView_(view)
+            NSApp.activateIgnoringOtherApps_(True)
+            alert.runModal()
+        except Exception:  # noqa: BLE001 - never let an About UI glitch crash
+            pass
+
+    def _build_about_accessory(self):
+        """Build the selectable, richly formatted About description view."""
+        from AppKit import (
+            NSColor,
+            NSFont,
+            NSFontAttributeName,
+            NSForegroundColorAttributeName,
+            NSMutableParagraphStyle,
+            NSNoBorder,
+            NSParagraphStyleAttributeName,
+            NSScrollView,
+            NSTextView,
+            NSView,
+            NSViewWidthSizable,
+        )
+        from Foundation import NSMutableAttributedString, NSMakeRange, NSMakeRect
+        from Foundation import NSMakeSize
+
+        width = 470.0
+        height = 190.0
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, width, height))
+        scroll = NSScrollView.alloc().initWithFrame_(
+            NSMakeRect(0.0, 0.0, width, height)
+        )
+        scroll.setBorderType_(NSNoBorder)
+        scroll.setHasVerticalScroller_(True)
+        scroll.setAutohidesScrollers_(True)
+
+        paragraph = NSMutableParagraphStyle.alloc().init()
+        paragraph.setLineSpacing_(3.0)
+        paragraph.setParagraphSpacing_(7.0)
+        attributed = NSMutableAttributedString.alloc().initWithString_attributes_(
+            ABOUT_DESCRIPTION,
+            {
+                NSFontAttributeName: NSFont.systemFontOfSize_(13.0),
+                NSForegroundColorAttributeName: NSColor.labelColor(),
+                NSParagraphStyleAttributeName: paragraph,
+            },
+        )
+        bold_font = NSFont.boldSystemFontOfSize_(13.0)
+        for phrase in ABOUT_BOLD_PHRASES:
+            start = ABOUT_DESCRIPTION.find(phrase)
+            if start >= 0:
+                attributed.addAttribute_value_range_(
+                    NSFontAttributeName,
+                    bold_font,
+                    NSMakeRange(start, len(phrase)),
+                )
+
+        text_view = NSTextView.alloc().initWithFrame_(
+            NSMakeRect(0.0, 0.0, width, height)
+        )
+        text_view.setEditable_(False)
+        text_view.setSelectable_(True)
+        text_view.setDrawsBackground_(False)
+        text_view.setHorizontallyResizable_(False)
+        text_view.setVerticallyResizable_(True)
+        text_view.setAutoresizingMask_(NSViewWidthSizable)
+        text_view.setTextContainerInset_(NSMakeSize(8.0, 8.0))
+        text_view.textContainer().setContainerSize_(NSMakeSize(width - 16.0, 1.0e7))
+        text_view.textContainer().setWidthTracksTextView_(True)
+        text_view.textStorage().setAttributedString_(attributed)
+        text_view.sizeToFit()
+        scroll.setDocumentView_(text_view)
+        view.addSubview_(scroll)
+        return view, text_view
+
     def _render_emotion(self, result: EmotionResult) -> None:
         """Render an emotion in the menu bar per the show emojis/labels options.
 
@@ -1754,17 +2151,22 @@ class MooditoApp(rumps.App):
         self._consume_license_updates()
 
         if self._paused:
+            self._reset_privacy()
             self._accumulate_stats("paused")
             return
 
         error = self._worker.error
         if error:
+            self._reset_privacy()
             self._set_menubar(None, "⚠️ Moodito")
             self._detected_item.title = f"Detected: error ({error})"
             self._accumulate_stats("error")
             return
 
         result = self._worker.result
+        self._update_privacy(result.label != NO_FACE_LABEL)
+        if self._worker.ready:
+            self._notify_emotion_transition(result.label)
         self._render_emotion(result)
         self._detected_item.title = f"Detected: {result.label} ({result.score:.0%})"
         self._accumulate_stats(result.label, result.score)
@@ -1873,6 +2275,18 @@ class MooditoApp(rumps.App):
         self._stats_range_start = start
         self._stats_range_end = None
 
+    def _notify_data_range_changed(self) -> None:
+        """Notify with the currently applied Insights date range."""
+        end_text = (
+            "Now"
+            if self._stats_range_end is None
+            else format_datetime(self._stats_range_end)
+        )
+        self._send_notification(
+            "data_range_changed",
+            f"{format_datetime(self._stats_range_start)} to {end_text}",
+        )
+
 
     def _update_stats_menu(self) -> None:
         """Refresh the Statistics submenu rows as an aligned table."""
@@ -1956,6 +2370,7 @@ class MooditoApp(rumps.App):
         # The range is locked while the live last-24-hours window is on.
         if self._stats_live_24h:
             return
+        previous_range = (self._stats_range_start, self._stats_range_end)
         now = datetime.now()
         tracking_start = parse_iso_datetime(self._stats_started_at) or now
         # Pre-fill the prompt with the last applied range so the user's
@@ -2011,6 +2426,8 @@ class MooditoApp(rumps.App):
         self._stats_range_end = end_val
         self._recompute_range_stats()
         self._update_stats_menu()
+        if previous_range != (self._stats_range_start, self._stats_range_end):
+            self._notify_data_range_changed()
 
     def toggle_live_24h(self, sender) -> None:
         """Toggle the live last-24-hours window on or off.
@@ -2038,6 +2455,7 @@ class MooditoApp(rumps.App):
         self._apply_range_lock()
         self._recompute_range_stats()
         self._update_stats_menu()
+        self._notify_data_range_changed()
 
     def _apply_range_lock(self) -> None:
         """Enable or disable the manual Range control based on the live toggle."""
@@ -2065,6 +2483,267 @@ class MooditoApp(rumps.App):
         if not self._paused:
             self.refresh(None)
 
+    def _load_notifications(self) -> dict[str, bool]:
+        """Return validated notification preferences from settings."""
+        notifications = dict(DEFAULT_NOTIFICATIONS)
+        stored = self._settings.get("notifications")
+        if isinstance(stored, dict):
+            for key in NOTIFICATION_KEYS:
+                if isinstance(stored.get(key), bool):
+                    notifications[key] = stored[key]
+        return notifications
+
+    def _apply_notifications(self, notifications: dict) -> bool:
+        """Validate, apply, and persist all notification toggles."""
+        if not all(
+            isinstance(notifications.get(key), bool) for key in NOTIFICATION_KEYS
+        ):
+            return False
+        updated = {key: notifications[key] for key in NOTIFICATION_KEYS}
+        if updated == self._notifications:
+            return True
+        self._notifications = updated
+        self._settings["notifications"] = dict(updated)
+        save_settings(self._settings)
+        return True
+
+    def _send_notification(self, event: str, message: str | None = None) -> None:
+        """Show an enabled event notification, best-effort."""
+        if not self._notifications.get(event, False):
+            return
+        title, subtitle, default_message = NOTIFICATION_MESSAGES[event]
+        notification_message = message or default_message
+        self._deliver_notification(event, title, subtitle, notification_message)
+
+    @staticmethod
+    def _deliver_notification(
+        event: str, title: str, subtitle: str, message: str
+    ) -> None:
+        """Deliver a notification carrying Show-action occurrence metadata."""
+        try:
+            rumps.notification(
+                title,
+                subtitle,
+                message,
+                data={
+                    "event": event,
+                    "title": title,
+                    "subtitle": subtitle,
+                    "message": message,
+                    "occurred_at": datetime.now().isoformat(timespec="seconds"),
+                },
+                action_button="Show",
+            )
+        except Exception:  # noqa: BLE001 - notifications must not break tracking
+            pass
+
+    @staticmethod
+    def _notification_detail_values(notification) -> tuple[str, str, datetime | None]:
+        """Extract display text and occurrence time from a clicked notification."""
+        data = getattr(notification, "data", None)
+        data = data if isinstance(data, dict) else {}
+        subtitle = str(
+            data.get("subtitle") or getattr(notification, "subtitle", "Notification")
+        )
+        message = str(data.get("message") or getattr(notification, "message", ""))
+        occurred_at = parse_iso_datetime(data.get("occurred_at"))
+        if occurred_at is None:
+            delivered_at = getattr(notification, "delivered_at", None)
+            if isinstance(delivered_at, datetime):
+                occurred_at = delivered_at
+        return subtitle, message, occurred_at
+
+    def _show_notification_details(self, notification) -> None:
+        """Show when a clicked notification originally occurred."""
+        subtitle, message, occurred_at = self._notification_detail_values(notification)
+        occurred_text = (
+            occurred_at.strftime("%b %d, %Y at %H:%M:%S")
+            if occurred_at is not None
+            else "Unknown"
+        )
+        try:
+            from AppKit import NSAlert, NSApp, NSImage
+
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_(subtitle)
+            alert.setInformativeText_(f"{message}\n\nOccurred\n{occurred_text}")
+            alert.addButtonWithTitle_("Close")
+            icon = NSImage.alloc().initByReferencingFile_(resource_path(MENUBAR_ICON))
+            if icon is not None and icon.isValid():
+                alert.setIcon_(icon)
+            NSApp.activateIgnoringOtherApps_(True)
+            alert.runModal()
+        except Exception:  # noqa: BLE001 - notification details are best-effort
+            pass
+
+    def _send_privacy_notification(self, event: str) -> None:
+        """Compatibility wrapper for Privacy audio transition notifications."""
+        self._send_notification(event)
+
+    def _notify_emotion_transition(self, label: str) -> None:
+        """Notify once when the detected facial state changes."""
+        event = EMOTION_NOTIFICATION_EVENTS.get(label)
+        if event is None or label == self._last_notified_emotion:
+            return
+        self._last_notified_emotion = label
+        self._send_notification(event)
+
+    def open_notifications_window(self, _sender) -> None:
+        """Show the native grouped notification preferences dialog."""
+        try:
+            from AppKit import NSAlert, NSAlertFirstButtonReturn, NSApp, NSImage
+
+            view, controls = self._build_notifications_accessory()
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Notifications")
+            alert.setInformativeText_(
+                "Choose which Moodito events can send a macOS notification."
+            )
+            alert.addButtonWithTitle_("Apply")
+            alert.addButtonWithTitle_("Cancel")
+            icon = NSImage.alloc().initByReferencingFile_(resource_path(MENUBAR_ICON))
+            if icon is not None and icon.isValid():
+                alert.setIcon_(icon)
+            alert.setAccessoryView_(view)
+            NSApp.activateIgnoringOtherApps_(True)
+            if alert.runModal() == NSAlertFirstButtonReturn:
+                self._apply_notifications_from_controls(controls)
+        except Exception:  # noqa: BLE001 - never let a UI glitch crash the menu
+            pass
+
+    def _apply_notifications_from_controls(self, controls: dict) -> bool:
+        """Commit values selected in the Notifications dialog controls."""
+        return self._apply_notifications(
+            {key: bool(controls[key].state()) for key in NOTIFICATION_KEYS}
+        )
+
+    def _build_notifications_accessory(self):
+        """Build grouped notification toggles in a fixed-height scroll view."""
+        from AppKit import (
+            NSButton,
+            NSBezelBorder,
+            NSControlStateValueOn,
+            NSFont,
+            NSImage,
+            NSImageLeading,
+            NSScrollView,
+            NSSwitchButton,
+            NSTextField,
+            NSView,
+        )
+        from Foundation import NSMakePoint, NSMakeRect
+
+        width = 500.0
+        height = 420.0
+        toolbar_height = 42.0
+        scroll_height = height - toolbar_height
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, width, height))
+
+        summary = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(0.0, height - 31.0, 230.0, 22.0)
+        )
+        summary.setBezeled_(False)
+        summary.setDrawsBackground_(False)
+        summary.setEditable_(False)
+        summary.setSelectable_(False)
+        summary.setFont_(NSFont.systemFontOfSize_(12.0))
+        view.addSubview_(summary)
+
+        enable_all = NSButton.alloc().initWithFrame_(
+            NSMakeRect(280.0, height - 35.0, 100.0, 28.0)
+        )
+        enable_all.setTitle_("Enable All")
+        view.addSubview_(enable_all)
+        disable_all = NSButton.alloc().initWithFrame_(
+            NSMakeRect(386.0, height - 35.0, 108.0, 28.0)
+        )
+        disable_all.setTitle_("Disable All")
+        view.addSubview_(disable_all)
+        for button, symbol_name, tooltip in (
+            (enable_all, "checkmark.circle", "Enable every notification"),
+            (disable_all, "xmark.circle", "Disable every notification"),
+        ):
+            image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                symbol_name, button.title()
+            )
+            if image is not None:
+                image.setTemplate_(True)
+                button.setImage_(image)
+                button.setImagePosition_(NSImageLeading)
+            button.setToolTip_(tooltip)
+
+        scroll = NSScrollView.alloc().initWithFrame_(
+            NSMakeRect(0.0, 0.0, width, scroll_height)
+        )
+        scroll.setHasVerticalScroller_(True)
+        scroll.setAutohidesScrollers_(True)
+        scroll.setBorderType_(NSBezelBorder)
+        row_height = 30.0
+        group_header_height = 30.0
+        group_gap = 8.0
+        content_height = sum(
+            group_header_height + len(options) * row_height + group_gap
+            for _group, options in NOTIFICATION_GROUPS
+        )
+        document_width = width - 18.0
+        document = NSView.alloc().initWithFrame_(
+            NSMakeRect(0.0, 0.0, document_width, content_height)
+        )
+        controls = {}
+        cursor = content_height
+        for group, options in NOTIFICATION_GROUPS:
+            cursor -= group_header_height
+            heading = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(12.0, cursor + 5.0, document_width - 24.0, 20.0)
+            )
+            heading.setStringValue_(group.upper())
+            heading.setBezeled_(False)
+            heading.setDrawsBackground_(False)
+            heading.setEditable_(False)
+            heading.setSelectable_(False)
+            heading.setFont_(NSFont.boldSystemFontOfSize_(11.0))
+            document.addSubview_(heading)
+            for key, title, symbol_name in options:
+                cursor -= row_height
+                toggle = NSButton.alloc().initWithFrame_(
+                    NSMakeRect(12.0, cursor + 3.0, document_width - 24.0, 24.0)
+                )
+                toggle.setButtonType_(NSSwitchButton)
+                toggle.setTitle_(title)
+                image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                    symbol_name, title
+                )
+                if image is not None:
+                    image.setTemplate_(True)
+                    toggle.setImage_(image)
+                    toggle.setImagePosition_(NSImageLeading)
+                toggle.setAllowsMixedState_(False)
+                toggle.setState_(
+                    NSControlStateValueOn if self._notifications[key] else 0
+                )
+                toggle.setToolTip_(NOTIFICATION_MESSAGES[key][2])
+                document.addSubview_(toggle)
+                controls[key] = toggle
+            cursor -= group_gap
+
+        handler = _notification_settings_handler_class().alloc().init()
+        handler.controls = list(controls.values())
+        handler.summary = summary
+        for toggle in controls.values():
+            toggle.setTarget_(handler)
+            toggle.setAction_("toggleChanged:")
+        enable_all.setTarget_(handler)
+        enable_all.setAction_("enableAll:")
+        disable_all.setTarget_(handler)
+        disable_all.setAction_("disableAll:")
+        handler._update_summary()
+        self._notifications_handler = handler
+
+        scroll.setDocumentView_(document)
+        document.scrollPoint_(NSMakePoint(0.0, content_height - scroll_height))
+        view.addSubview_(scroll)
+        return view, controls
+
     def _load_sensitivity(self) -> dict[str, str]:
         """Return the per-emotion sensitivity, restored from settings.
 
@@ -2090,10 +2769,15 @@ class MooditoApp(rumps.App):
             return
         if self._sensitivity.get(emotion) == level:
             return
+        previous = self._sensitivity[emotion]
         self._sensitivity[emotion] = level
         self._worker.sensitivity = self._sensitivity
-        self._settings["sensitivity"] = self._sensitivity
+        self._settings["sensitivity"] = dict(self._sensitivity)
         save_settings(self._settings)
+        self._send_notification(
+            "sensitivity_changed",
+            f"{emotion.title()}: {previous.title()} to {level.title()}",
+        )
 
     def open_sensitivity_window(self, _sender) -> None:
         """Show the Sensitivity dialog (a native NSAlert, like the other windows).
@@ -2123,11 +2807,24 @@ class MooditoApp(rumps.App):
             pass
 
     def _apply_sensitivity_from_controls(self, controls: dict) -> None:
-        """Commit the level selected in each emotion's segmented control."""
+        """Commit selected levels and summarize all changes in one alert."""
+        changes = []
         for emotion, control in controls.items():
             index = int(control.selectedSegment())
             if 0 <= index < len(SENSITIVITY_LEVELS):
-                self._apply_sensitivity(emotion, SENSITIVITY_LEVELS[index])
+                level = SENSITIVITY_LEVELS[index]
+                previous = self._sensitivity.get(emotion)
+                if emotion in SENSITIVITY_EMOTIONS and previous != level:
+                    self._sensitivity[emotion] = level
+                    changes.append(
+                        f"{emotion.title()}: {previous.title()} to {level.title()}"
+                    )
+        if not changes:
+            return
+        self._worker.sensitivity = self._sensitivity
+        self._settings["sensitivity"] = dict(self._sensitivity)
+        save_settings(self._settings)
+        self._send_notification("sensitivity_changed", "; ".join(changes))
 
     def _build_sensitivity_accessory(self):
         """Build the NSAlert accessory view: one segmented control per emotion.
@@ -2188,6 +2885,281 @@ class MooditoApp(rumps.App):
 
         return view, controls
 
+    def _load_privacy(self) -> dict:
+        """Return per-channel delays, migrating the former shared-delay shape."""
+        privacy = {
+            "microphone_seconds": DEFAULT_PRIVACY_MICROPHONE_SECONDS,
+            "speakers_seconds": DEFAULT_PRIVACY_SPEAKERS_SECONDS,
+        }
+        stored = self._settings.get("privacy")
+        if not isinstance(stored, dict):
+            return privacy
+
+        new_keys = tuple(privacy)
+        if any(key in stored for key in new_keys):
+            for key in new_keys:
+                value = stored.get(key)
+                if self._valid_privacy_delay(value):
+                    privacy[key] = value
+            return privacy
+
+        # Versions before per-channel counters stored one minutes/seconds delay
+        # plus channel toggles. Preserve enabled channels, clamped to the new
+        # range; an old immediate (0-second) delay becomes the closest valid
+        # enabled value because zero now explicitly means disabled.
+        minutes = stored.get("minutes")
+        seconds = stored.get("seconds")
+        if not (
+            isinstance(minutes, int)
+            and not isinstance(minutes, bool)
+            and minutes >= 0
+            and isinstance(seconds, int)
+            and not isinstance(seconds, bool)
+            and 0 <= seconds < 60
+        ):
+            return privacy
+        migrated_delay = max(1, min(MAX_PRIVACY_SECONDS, minutes * 60 + seconds))
+        for channel in PRIVACY_CHANNELS:
+            if stored.get(channel) is True:
+                privacy[f"{channel}_seconds"] = migrated_delay
+        return privacy
+
+    @staticmethod
+    def _valid_privacy_delay(value) -> bool:
+        """Whether a Privacy channel delay is an integer from 0 to 600."""
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 <= value <= MAX_PRIVACY_SECONDS
+        )
+
+    def _apply_privacy(self, microphone_seconds: int, speakers_seconds: int) -> bool:
+        """Validate, apply, and persist Privacy settings."""
+        if not all(
+            self._valid_privacy_delay(value)
+            for value in (microphone_seconds, speakers_seconds)
+        ):
+            return False
+        privacy = {
+            "microphone_seconds": microphone_seconds,
+            "speakers_seconds": speakers_seconds,
+        }
+        if privacy == self._privacy:
+            return True
+        if not self._reset_privacy():
+            return False
+        self._privacy = privacy
+        self._settings["privacy"] = dict(privacy)
+        save_settings(self._settings)
+        microphone_text = (
+            f"{microphone_seconds} seconds" if microphone_seconds else "Disabled"
+        )
+        speakers_text = (
+            f"{speakers_seconds} seconds" if speakers_seconds else "Disabled"
+        )
+        self._send_notification(
+            "privacy_settings_changed",
+            f"Microphone: {microphone_text}; Speakers: {speakers_text}.",
+        )
+        return True
+
+    def _restore_privacy_audio(self) -> bool:
+        """Restore each channel captured when Privacy activated."""
+        restored_all = True
+        for channel in PRIVACY_CHANNELS:
+            state = self._privacy_audio_states.get(channel)
+            if state is None:
+                continue
+            if not restore_audio_state(state):
+                restored_all = False
+                continue
+            del self._privacy_audio_states[channel]
+            changed = channel in self._privacy_changed_channels
+            self._privacy_changed_channels.discard(channel)
+            if changed:
+                event = (
+                    "microphone_unmuted" if channel == "microphone" else "speakers_on"
+                )
+                self._send_privacy_notification(event)
+        return restored_all
+
+    def _reset_privacy(self) -> bool:
+        """Cancel the absence timer and restore audio if Privacy was active."""
+        self._privacy_no_face_since = None
+        self._privacy_attempted.clear()
+        return self._restore_privacy_audio()
+
+    def _update_privacy(self, face_present: bool, now: float | None = None) -> None:
+        """Advance Privacy for the current face-presence observation."""
+        if face_present or not any(self._privacy.values()):
+            self._reset_privacy()
+            return
+
+        current_time = time.monotonic() if now is None else now
+        if self._privacy_no_face_since is None:
+            self._privacy_no_face_since = current_time
+        elapsed = current_time - self._privacy_no_face_since
+        for channel in PRIVACY_CHANNELS:
+            self._activate_privacy_channel(channel, elapsed)
+
+    def _activate_privacy_channel(self, channel: str, elapsed: float) -> None:
+        """Mute one channel once its configured no-face delay has elapsed."""
+        delay = self._privacy[f"{channel}_seconds"]
+        if (
+            delay == 0
+            or elapsed < delay
+            or channel in self._privacy_attempted
+            or channel in self._privacy_audio_states
+        ):
+            return
+        self._privacy_attempted.add(channel)
+        microphone = channel == "microphone"
+        result = mute_audio_for_privacy(microphone, not microphone)
+        if result is None:
+            return
+        self._privacy_audio_states[channel] = result.state
+        if not result.applied:
+            return
+        changed = (
+            result.state.input_volume not in (None, 0)
+            if microphone
+            else result.state.output_volume not in (None, 0)
+            and result.state.output_muted is False
+        )
+        if changed:
+            self._privacy_changed_channels.add(channel)
+            event = "microphone_muted" if microphone else "speakers_off"
+            self._send_privacy_notification(event)
+
+    def open_privacy_window(self, _sender) -> None:
+        """Show the native Privacy delay and channel settings dialog."""
+        try:
+            from AppKit import NSAlert, NSAlertFirstButtonReturn, NSApp, NSImage
+
+            view, controls = self._build_privacy_accessory()
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Privacy")
+            alert.setInformativeText_(
+                "Set each no-face delay from 1 to 600 seconds. Set 0 to disable."
+            )
+            alert.addButtonWithTitle_("Apply")
+            alert.addButtonWithTitle_("Cancel")
+            icon = NSImage.alloc().initByReferencingFile_(resource_path(MENUBAR_ICON))
+            if icon is not None and icon.isValid():
+                alert.setIcon_(icon)
+            alert.setAccessoryView_(view)
+            NSApp.activateIgnoringOtherApps_(True)
+            if (
+                alert.runModal() == NSAlertFirstButtonReturn
+                and not self._apply_privacy_from_controls(controls)
+            ):
+                rumps.alert(
+                    "Privacy",
+                    "Enter a whole number from 0 to 600 for each channel.",
+                )
+        except Exception:  # noqa: BLE001 - never let a UI glitch crash the menu
+            pass
+
+    def _apply_privacy_from_controls(self, controls: dict) -> bool:
+        """Commit values selected in the Privacy dialog controls."""
+        return self._apply_privacy(
+            int(controls["microphone_seconds"].integerValue()),
+            int(controls["speakers_seconds"].integerValue()),
+        )
+
+    def _build_privacy_accessory(self):
+        """Build independent 0-600 second counters for both audio channels."""
+        from AppKit import (
+            NSFont,
+            NSImage,
+            NSImageView,
+            NSStepper,
+            NSTextField,
+            NSView,
+        )
+        from Foundation import NSMakeRect, NSNumberFormatter
+
+        width = 420.0
+        row_height = 38.0
+        height = len(PRIVACY_CHANNELS) * row_height
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, width, height))
+
+        def add_label(text: str, x: float, y: float, label_width: float) -> None:
+            label = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(x, y, label_width, 22.0)
+            )
+            label.setStringValue_(text)
+            label.setBezeled_(False)
+            label.setDrawsBackground_(False)
+            label.setEditable_(False)
+            label.setSelectable_(False)
+            label.setFont_(NSFont.systemFontOfSize_(13.0))
+            view.addSubview_(label)
+
+        controls = {}
+        fields = []
+        steppers = []
+        rows = (
+            ("Mute microphone", "microphone_seconds", "mic.fill"),
+            ("Mute speakers", "speakers_seconds", "speaker.wave.2.fill"),
+        )
+        for index, (title, key, symbol_name) in enumerate(rows):
+            row_y = height - (index + 1) * row_height
+            image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                symbol_name, title
+            )
+            if image is not None:
+                image.setTemplate_(True)
+                image_view = NSImageView.alloc().initWithFrame_(
+                    NSMakeRect(0.0, row_y + 8.0, 18.0, 18.0)
+                )
+                image_view.setImage_(image)
+                view.addSubview_(image_view)
+            add_label(title, 28.0, row_y + 7.0, 138.0)
+
+            formatter = NSNumberFormatter.alloc().init()
+            formatter.setAllowsFloats_(False)
+            formatter.setMinimum_(0)
+            formatter.setMaximum_(MAX_PRIVACY_SECONDS)
+            field = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(174.0, row_y + 5.0, 72.0, 24.0)
+            )
+            field.setFormatter_(formatter)
+            field.setIntegerValue_(self._privacy[key])
+            field.setTag_(index)
+            view.addSubview_(field)
+
+            stepper = NSStepper.alloc().initWithFrame_(
+                NSMakeRect(250.0, row_y + 3.0, 20.0, 27.0)
+            )
+            stepper.setMinValue_(0.0)
+            stepper.setMaxValue_(float(MAX_PRIVACY_SECONDS))
+            stepper.setIncrement_(1.0)
+            stepper.setValueWraps_(False)
+            stepper.setAutorepeat_(True)
+            stepper.setIntegerValue_(self._privacy[key])
+            stepper.setTag_(index)
+            view.addSubview_(stepper)
+            add_label("seconds", 280.0, row_y + 7.0, 58.0)
+
+            controls[key] = field
+            controls[f"{key}_stepper"] = stepper
+            fields.append(field)
+            steppers.append(stepper)
+
+        handler = _privacy_stepper_handler_class().alloc().init()
+        handler.fields = fields
+        handler.steppers = steppers
+        for field in fields:
+            field.setTarget_(handler)
+            field.setAction_("fieldChanged:")
+        for stepper in steppers:
+            stepper.setTarget_(handler)
+            stepper.setAction_("stepperChanged:")
+        self._privacy_stepper_handler = handler
+
+        return view, controls
+
     def _load_ai_provider(self) -> dict:
         """Return the AI provider config, restored from settings.
 
@@ -2228,11 +3200,19 @@ class MooditoApp(rumps.App):
         cleaned = {
             key: str(values.get(key, "")).strip() for key in AI_PROVIDER_FIELDS[provider]
         }
+        changed = (
+            self._ai_provider.get("provider") != provider
+            or self._ai_provider.get("providers", {}).get(provider) != cleaned
+        )
         self._ai_provider["provider"] = provider
         self._ai_provider.setdefault("providers", {})[provider] = cleaned
         self._settings["ai_provider"] = self._ai_provider
         save_settings(self._settings)
         self._update_ai_provider_menu()
+        if changed:
+            model = cleaned.get("model", "")
+            detail = f"{provider} ({model})" if model else provider
+            self._send_notification("ai_provider_changed", f"Now using {detail}.")
 
     def _update_ai_provider_menu(self) -> None:
         """Reflect the currently selected AI provider (and model) in the title.
@@ -2317,6 +3297,9 @@ class MooditoApp(rumps.App):
             del providers[provider]
             self._settings["ai_provider"] = self._ai_provider
             save_settings(self._settings)
+            self._send_notification(
+                "ai_provider_changed", f"Cleared saved {provider} settings."
+            )
         self._update_ai_provider_menu()
 
     def _clear_ai_provider_in_dialog(self, provider: str, fields: dict, status) -> None:
@@ -2802,6 +3785,8 @@ class MooditoApp(rumps.App):
         pdf_button = getattr(handler, "pdf_button", None)
         if pdf_button is not None:
             pdf_button.setEnabled_(is_report)
+        if is_report:
+            self._send_notification("mood_tip_generated")
 
     def _save_mood_report_pdf(self, handler) -> None:
         """Save the current report to a user-chosen PDF file.
@@ -2827,19 +3812,24 @@ class MooditoApp(rumps.App):
         if panel.runModal() != NSModalResponseOK:
             return
         url = panel.URL()
-        if url is not None:
-            write_report_pdf(text, getattr(handler, "report_meta", None), url)
+        if url is not None and write_report_pdf(
+            text, getattr(handler, "report_meta", None), url
+        ):
+            self._send_notification("mood_tip_pdf_exported")
 
     def toggle_pause(self, _sender) -> None:
         self._paused = not self._paused
         if self._paused:
+            self._reset_privacy()
             self._pause_item.title = "Resume"
             set_symbol_icon(self._pause_item, "play.fill")
             self._set_menubar(None, "⏸️ Moodito")
             self._detected_item.title = "Detected: paused"
+            self._send_notification("app_paused")
         else:
             self._pause_item.title = "Pause"
-            set_symbol_icon(self._pause_item, "pause.fill")
+            set_symbol_icon(self._pause_item, PAUSE_SYMBOL)
+            self._send_notification("app_resumed")
 
     def grant_camera(self, _sender) -> None:
         status = camera_authorization_status()
@@ -2908,6 +3898,10 @@ class MooditoApp(rumps.App):
         with self._license_lock:
             alert = self._license_alert
             self._license_alert = None
+            notification_event = self._license_notification_event
+            self._license_notification_event = None
+        if notification_event:
+            self._send_notification(notification_event)
         if alert:
             rumps.alert(LICENSE_ALERT_TITLE, alert)
 
@@ -2934,6 +3928,7 @@ class MooditoApp(rumps.App):
         with self._license_lock:
             self._license = {}
             self._license_active = False
+            self._license_notification_event = "license_deactivated"
         self._license_dirty.set()
 
     def buy_license(self, _sender) -> None:
@@ -2983,6 +3978,7 @@ class MooditoApp(rumps.App):
                 self._license = license_data
                 self._license_active = True
                 self._license_alert = "License activated. Thank you! 🎉"
+                self._license_notification_event = "license_activated"
         else:
             with self._license_lock:
                 self._license_alert = f"Could not activate license:\n{message}"
@@ -3011,6 +4007,7 @@ class MooditoApp(rumps.App):
                 self._license = {}
                 self._license_active = False
                 self._license_alert = "License deactivated."
+                self._license_notification_event = "license_deactivated"
         else:
             with self._license_lock:
                 self._license_alert = f"Could not deactivate license:\n{message}"
@@ -3044,10 +4041,13 @@ class MooditoApp(rumps.App):
                                 continue
                             writer.writerow(row)
         except OSError as exc:
-            rumps.notification("Moodito", "Export failed", str(exc))
+            self._deliver_notification(
+                "csv_export_failed", "Moodito", "Export failed", str(exc)
+            )
             return
         # Reveal the exported file in Finder.
         subprocess.run(["open", "-R", path], check=False)
+        self._send_notification("csv_downloaded", f"Saved {filename} in Downloads.")
 
     def reset_stats(self, _sender) -> None:
         """Clear all accumulated statistics and the raw detection log.
@@ -3078,12 +4078,15 @@ class MooditoApp(rumps.App):
         self._set_default_range()
         self._recompute_range_stats()
         self._update_stats_menu()
+        self._send_notification("data_erased")
 
     def quit_app(self, _sender) -> None:
+        self._reset_privacy()
         self._worker.stop()
         save_stats(self._stats, self._stats_started_at)
         append_raw_samples(self._raw_buffer)
         self._raw_buffer.clear()
+        self._send_notification("app_quit")
         rumps.quit_application()
 
 

@@ -54,6 +54,15 @@ Everything lives in the menu bar dropdown — small, fast, and out of your way.
   before you save.
 - **🎚️ Adjustable sensitivity** — fine-tune detection per emotion (Low / Normal /
   High) so Moodito reads *your* face the way you want.
+- **🔒 Automatic Privacy** — set independent no-face delays from 0 to 600
+  seconds for the microphone and speakers; `0` disables auto-mute for that
+  channel. When your face returns, Moodito restores the exact audio levels and
+  speaker mute state that were active before Privacy engaged.
+- **🔔 Configurable notifications** — independently control notifications for
+  Privacy audio, data-range and export actions, Mood Tips and PDFs, settings
+  changes, pause/resume, each detected emotion, license changes, and quitting.
+  The grouped, scrollable settings window includes Enable All / Disable All
+  controls and a live enabled count.
 - **🖼️ Customisable display** — toggle **Show Emojis** and **Show Labels**
   independently, or fall back to the clean Moodito icon.
 - **⏸️ Pause / Resume** — instantly stop processing webcam frames whenever you
