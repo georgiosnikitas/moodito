@@ -55,8 +55,8 @@ Everything lives in the menu bar dropdown — small, fast, and out of your way.
 - **🎚️ Adjustable sensitivity** — fine-tune detection per emotion (Low / Normal /
   High) so Moodito reads *your* face the way you want.
 - **🔒 Automatic Privacy** — set independent no-face delays from 0 to 600
-  seconds for the microphone and speakers; `0` disables auto-mute for that
-  channel. When your face returns, Moodito restores the exact audio levels and
+  seconds for microphone mute, speaker mute, and screen lock; `0` disables that
+  action. When your face returns, Moodito restores the exact audio levels and
   speaker mute state that were active before Privacy engaged.
 - **🔔 Configurable notifications** — independently control notifications for
   Privacy audio, data-range and export actions, Mood Tips and PDFs, settings

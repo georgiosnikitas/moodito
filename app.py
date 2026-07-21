@@ -7,6 +7,7 @@ and shows it as an emoji + label in the menu bar title.
 
 from __future__ import annotations
 
+import ctypes
 import csv
 import json
 import os
@@ -166,13 +167,16 @@ ABOUT_BOLD_PHRASES = (
 UI_REFRESH_INTERVAL = 0.3
 # Target webcam sampling rate (seconds between processed frames).
 SAMPLE_INTERVAL = 0.15
-# Privacy is opt-in so upgrading Moodito never changes audio unexpectedly.
+# Privacy is opt-in so upgrading Moodito never changes the system unexpectedly.
 PRIVACY_CHANNELS = ("microphone", "speakers")
+PRIVACY_ACTIONS = (*PRIVACY_CHANNELS, "lock_screen")
 MAX_PRIVACY_SECONDS = 600
 DEFAULT_PRIVACY_MICROPHONE_SECONDS = 0
 DEFAULT_PRIVACY_SPEAKERS_SECONDS = 0
+DEFAULT_PRIVACY_LOCK_SCREEN_SECONDS = 0
 PAUSE_SYMBOL = "pause.fill"
 PRIVACY_NOTIFICATION_TITLE = "Moodito Privacy"
+NO_FACE_NOTIFICATION_MESSAGE = "No face was detected."
 # Notification events grouped in the order shown in the settings dialog.
 NOTIFICATION_GROUPS = (
     (
@@ -232,16 +236,16 @@ DEFAULT_NOTIFICATIONS = {
     key: not key.startswith("emotion_") for key in NOTIFICATION_KEYS
 }
 NOTIFICATION_MESSAGES = {
-    "microphone_muted": (PRIVACY_NOTIFICATION_TITLE, "Microphone muted", "No face was detected."),
+    "microphone_muted": (PRIVACY_NOTIFICATION_TITLE, "Microphone muted", NO_FACE_NOTIFICATION_MESSAGE),
     "microphone_unmuted": (PRIVACY_NOTIFICATION_TITLE, "Microphone unmuted", "Your face is visible again."),
-    "speakers_off": (PRIVACY_NOTIFICATION_TITLE, "Speakers volume off", "No face was detected."),
+    "speakers_off": (PRIVACY_NOTIFICATION_TITLE, "Speakers volume off", NO_FACE_NOTIFICATION_MESSAGE),
     "speakers_on": (PRIVACY_NOTIFICATION_TITLE, "Speakers volume on", "Your face is visible again."),
     "data_range_changed": ("Moodito", "Data range changed", "Insights now use the selected date range."),
     "mood_tip_generated": ("Moodito", "Mood Tip ready", "Your Mood Tip was generated successfully."),
     "mood_tip_pdf_exported": ("Moodito", "Mood Tip PDF saved", "Your Mood Tip was exported successfully."),
     "csv_downloaded": ("Moodito", "CSV downloaded", "Your selected data was exported successfully."),
     "data_erased": ("Moodito", "Data erased", "Recorded statistics and detection history were erased."),
-    "privacy_settings_changed": ("Moodito", "Privacy settings updated", "Privacy auto-mute settings were changed."),
+    "privacy_settings_changed": ("Moodito", "Privacy settings updated", "Privacy actions were changed."),
     "sensitivity_changed": ("Moodito", "Sensitivity updated", "Emotion sensitivity settings were changed."),
     "ai_provider_changed": ("Moodito", "AI provider updated", "AI provider settings were changed."),
     "app_paused": ("Moodito", "Moodito paused", "Face detection is paused."),
@@ -1527,6 +1531,21 @@ def _run_osascript(*statements: str) -> tuple[bool, str]:
     return result.returncode == 0, result.stdout.strip()
 
 
+def lock_screen_for_privacy() -> bool:
+    """Lock the current macOS session through the native login service."""
+    try:
+        login_framework = ctypes.CDLL(
+            "/System/Library/PrivateFrameworks/login.framework/Versions/A/login"
+        )
+        lock_screen = login_framework.SACLockScreenImmediate
+        lock_screen.argtypes = []
+        lock_screen.restype = None
+        lock_screen()
+        return True
+    except (AttributeError, OSError):
+        return False
+
+
 def _capture_audio_state(microphone: bool, speakers: bool) -> AudioState | None:
     """Read the current macOS audio state for the channels Privacy will mute."""
     ok, output = _run_osascript(
@@ -2577,7 +2596,7 @@ class MooditoApp(rumps.App):
             pass
 
     def _send_privacy_notification(self, event: str) -> None:
-        """Compatibility wrapper for Privacy audio transition notifications."""
+        """Compatibility wrapper for Privacy transition notifications."""
         self._send_notification(event)
 
     def _notify_emotion_transition(self, label: str) -> None:
@@ -2886,10 +2905,11 @@ class MooditoApp(rumps.App):
         return view, controls
 
     def _load_privacy(self) -> dict:
-        """Return per-channel delays, migrating the former shared-delay shape."""
+        """Return per-action delays, migrating the former shared-delay shape."""
         privacy = {
             "microphone_seconds": DEFAULT_PRIVACY_MICROPHONE_SECONDS,
             "speakers_seconds": DEFAULT_PRIVACY_SPEAKERS_SECONDS,
+            "lock_screen_seconds": DEFAULT_PRIVACY_LOCK_SCREEN_SECONDS,
         }
         stored = self._settings.get("privacy")
         if not isinstance(stored, dict):
@@ -2933,16 +2953,26 @@ class MooditoApp(rumps.App):
             and 0 <= value <= MAX_PRIVACY_SECONDS
         )
 
-    def _apply_privacy(self, microphone_seconds: int, speakers_seconds: int) -> bool:
+    def _apply_privacy(
+        self,
+        microphone_seconds: int,
+        speakers_seconds: int,
+        lock_screen_seconds: int,
+    ) -> bool:
         """Validate, apply, and persist Privacy settings."""
         if not all(
             self._valid_privacy_delay(value)
-            for value in (microphone_seconds, speakers_seconds)
+            for value in (
+                microphone_seconds,
+                speakers_seconds,
+                lock_screen_seconds,
+            )
         ):
             return False
         privacy = {
             "microphone_seconds": microphone_seconds,
             "speakers_seconds": speakers_seconds,
+            "lock_screen_seconds": lock_screen_seconds,
         }
         if privacy == self._privacy:
             return True
@@ -2957,9 +2987,13 @@ class MooditoApp(rumps.App):
         speakers_text = (
             f"{speakers_seconds} seconds" if speakers_seconds else "Disabled"
         )
+        lock_screen_text = (
+            f"{lock_screen_seconds} seconds" if lock_screen_seconds else "Disabled"
+        )
         self._send_notification(
             "privacy_settings_changed",
-            f"Microphone: {microphone_text}; Speakers: {speakers_text}.",
+            f"Microphone: {microphone_text}; Speakers: {speakers_text}; "
+            f"Lock screen: {lock_screen_text}.",
         )
         return True
 
@@ -3001,6 +3035,7 @@ class MooditoApp(rumps.App):
         elapsed = current_time - self._privacy_no_face_since
         for channel in PRIVACY_CHANNELS:
             self._activate_privacy_channel(channel, elapsed)
+        self._activate_privacy_screen_lock(elapsed)
 
     def _activate_privacy_channel(self, channel: str, elapsed: float) -> None:
         """Mute one channel once its configured no-face delay has elapsed."""
@@ -3031,6 +3066,20 @@ class MooditoApp(rumps.App):
             event = "microphone_muted" if microphone else "speakers_off"
             self._send_privacy_notification(event)
 
+    def _activate_privacy_screen_lock(self, elapsed: float) -> None:
+        """Lock the screen once its configured no-face delay has elapsed."""
+        action = "lock_screen"
+        delay = self._privacy[f"{action}_seconds"]
+        if (
+            delay == 0
+            or elapsed < delay
+            or action in self._privacy_attempted
+        ):
+            return
+        if not lock_screen_for_privacy():
+            return
+        self._privacy_attempted.add(action)
+
     def open_privacy_window(self, _sender) -> None:
         """Show the native Privacy delay and channel settings dialog."""
         try:
@@ -3040,7 +3089,7 @@ class MooditoApp(rumps.App):
             alert = NSAlert.alloc().init()
             alert.setMessageText_("Privacy")
             alert.setInformativeText_(
-                "Set each no-face delay from 1 to 600 seconds. Set 0 to disable."
+                "Set each no-face delay from 0 to 600 seconds. Set 0 to disable."
             )
             alert.addButtonWithTitle_("Apply")
             alert.addButtonWithTitle_("Cancel")
@@ -3055,7 +3104,7 @@ class MooditoApp(rumps.App):
             ):
                 rumps.alert(
                     "Privacy",
-                    "Enter a whole number from 0 to 600 for each channel.",
+                    "Enter a whole number from 0 to 600 for each action.",
                 )
         except Exception:  # noqa: BLE001 - never let a UI glitch crash the menu
             pass
@@ -3065,10 +3114,11 @@ class MooditoApp(rumps.App):
         return self._apply_privacy(
             int(controls["microphone_seconds"].integerValue()),
             int(controls["speakers_seconds"].integerValue()),
+            int(controls["lock_screen_seconds"].integerValue()),
         )
 
     def _build_privacy_accessory(self):
-        """Build independent 0-600 second counters for both audio channels."""
+        """Build independent 0-600 second counters for Privacy actions."""
         from AppKit import (
             NSFont,
             NSImage,
@@ -3081,7 +3131,7 @@ class MooditoApp(rumps.App):
 
         width = 420.0
         row_height = 38.0
-        height = len(PRIVACY_CHANNELS) * row_height
+        height = len(PRIVACY_ACTIONS) * row_height
         view = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, width, height))
 
         def add_label(text: str, x: float, y: float, label_width: float) -> None:
@@ -3102,6 +3152,7 @@ class MooditoApp(rumps.App):
         rows = (
             ("Mute microphone", "microphone_seconds", "mic.fill"),
             ("Mute speakers", "speakers_seconds", "speaker.wave.2.fill"),
+            ("Lock screen", "lock_screen_seconds", "lock.fill"),
         )
         for index, (title, key, symbol_name) in enumerate(rows):
             row_y = height - (index + 1) * row_height

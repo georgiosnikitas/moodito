@@ -325,6 +325,44 @@ class TestOpenActions:
 
 
 class TestPrivacyAudio:
+    def test_lock_screen_uses_native_login_service(self, monkeypatch) -> None:
+        calls = []
+
+        class FakeLockScreen:
+            argtypes = None
+            restype = object()
+
+            def __call__(self):
+                calls.append("lock")
+
+        lock_screen = FakeLockScreen()
+        framework = type(
+            "FakeLoginFramework",
+            (),
+            {"SACLockScreenImmediate": lock_screen},
+        )()
+        loaded = []
+        monkeypatch.setattr(
+            app.ctypes,
+            "CDLL",
+            lambda path: loaded.append(path) or framework,
+        )
+
+        assert app.lock_screen_for_privacy() is True
+        assert loaded == [
+            "/System/Library/PrivateFrameworks/login.framework/Versions/A/login"
+        ]
+        assert lock_screen.argtypes == []
+        assert lock_screen.restype is None
+        assert calls == ["lock"]
+
+    def test_lock_screen_handles_unavailable_login_service(self, monkeypatch) -> None:
+        def unavailable(_path):
+            raise OSError("framework unavailable")
+
+        monkeypatch.setattr(app.ctypes, "CDLL", unavailable)
+        assert app.lock_screen_for_privacy() is False
+
     def test_capture_reads_only_selected_channels(self, monkeypatch) -> None:
         monkeypatch.setattr(
             app,
@@ -433,6 +471,7 @@ def _bare_app():
     inst._privacy = {
         "microphone_seconds": app.DEFAULT_PRIVACY_MICROPHONE_SECONDS,
         "speakers_seconds": app.DEFAULT_PRIVACY_SPEAKERS_SECONDS,
+            "lock_screen_seconds": app.DEFAULT_PRIVACY_LOCK_SCREEN_SECONDS,
     }
     inst._privacy_no_face_since = None
     inst._privacy_attempted = set()
@@ -1801,6 +1840,7 @@ class TestNotifications:
         full_app._privacy = {
             "microphone_seconds": 1,
             "speakers_seconds": 1,
+            "lock_screen_seconds": 0,
         }
 
         def mute(microphone, speakers):
@@ -1838,6 +1878,7 @@ class TestNotifications:
         full_app._privacy = {
             "microphone_seconds": 1,
             "speakers_seconds": 1,
+            "lock_screen_seconds": 0,
         }
 
         def mute(microphone, speakers):
@@ -1973,6 +2014,7 @@ class TestPrivacy:
         assert full_app._privacy == {
             "microphone_seconds": 0,
             "speakers_seconds": 0,
+            "lock_screen_seconds": 0,
         }
 
     def test_menu_item_opens_window(self, full_app) -> None:
@@ -1992,16 +2034,18 @@ class TestPrivacy:
             "_send_notification",
             lambda event, message=None: notifications.append((event, message)),
         )
-        assert full_app._apply_privacy(15, 90) is True
+        assert full_app._apply_privacy(15, 90, 300) is True
         assert full_app._privacy == {
             "microphone_seconds": 15,
             "speakers_seconds": 90,
+            "lock_screen_seconds": 300,
         }
         assert saved[-1]["privacy"] == full_app._privacy
         assert notifications == [
             (
                 "privacy_settings_changed",
-                "Microphone: 15 seconds; Speakers: 90 seconds.",
+                "Microphone: 15 seconds; Speakers: 90 seconds; "
+                "Lock screen: 300 seconds.",
             )
         ]
 
@@ -2015,11 +2059,12 @@ class TestPrivacy:
             "_send_notification",
             lambda event, message=None: notifications.append((event, message)),
         )
-        assert full_app._apply_privacy(0, 30) is True
+        assert full_app._apply_privacy(0, 30, 0) is True
         assert notifications == [
             (
                 "privacy_settings_changed",
-                "Microphone: Disabled; Speakers: 30 seconds.",
+                "Microphone: Disabled; Speakers: 30 seconds; "
+                "Lock screen: Disabled.",
             )
         ]
 
@@ -2032,26 +2077,44 @@ class TestPrivacy:
             "_send_notification",
             lambda event, message=None: notifications.append((event, message)),
         )
-        assert full_app._apply_privacy(0, 0) is True
-        assert full_app._apply_privacy(-1, 0) is False
+        assert full_app._apply_privacy(0, 0, 0) is True
+        assert full_app._apply_privacy(-1, 0, 0) is False
         full_app._privacy_audio_states = {
             "microphone": app.AudioState(input_volume=55)
         }
         monkeypatch.setattr(app, "restore_audio_state", lambda state: False)
-        assert full_app._apply_privacy(10, 0) is False
+        assert full_app._apply_privacy(10, 0, 0) is False
         assert notifications == []
 
     @pytest.mark.parametrize(
-        "microphone_seconds,speakers_seconds",
-        [(-1, 0), (0, -1), (601, 0), (0, 601), (True, 1)],
+        "microphone_seconds,speakers_seconds,lock_screen_seconds",
+        [
+            (-1, 0, 0),
+            (0, -1, 0),
+            (0, 0, -1),
+            (601, 0, 0),
+            (0, 601, 0),
+            (0, 0, 601),
+            (True, 1, 1),
+        ],
     )
     def test_apply_rejects_invalid_delay(
-        self, full_app, monkeypatch, microphone_seconds, speakers_seconds
+        self,
+        full_app,
+        monkeypatch,
+        microphone_seconds,
+        speakers_seconds,
+        lock_screen_seconds,
     ) -> None:
         saved = []
         monkeypatch.setattr(app, "save_settings", lambda settings: saved.append(settings))
         assert (
-            full_app._apply_privacy(microphone_seconds, speakers_seconds) is False
+            full_app._apply_privacy(
+                microphone_seconds,
+                speakers_seconds,
+                lock_screen_seconds,
+            )
+            is False
         )
         assert saved == []
 
@@ -2062,22 +2125,30 @@ class TestPrivacy:
         controls = {
             "microphone_seconds": _FakeIntegerControl(125),
             "speakers_seconds": _FakeIntegerControl(350),
+            "lock_screen_seconds": _FakeIntegerControl(600),
         }
         assert full_app._apply_privacy_from_controls(controls) is True
         assert full_app._privacy == {
             "microphone_seconds": 125,
             "speakers_seconds": 350,
+            "lock_screen_seconds": 600,
         }
 
     def test_build_accessory_restores_current_values(self, full_app) -> None:
         full_app._privacy = {
             "microphone_seconds": 180,
             "speakers_seconds": 12,
+            "lock_screen_seconds": 600,
         }
         _view, controls = full_app._build_privacy_accessory()
         assert controls["microphone_seconds"].integerValue() == 180
         assert controls["speakers_seconds"].integerValue() == 12
-        for key in ("microphone_seconds", "speakers_seconds"):
+        assert controls["lock_screen_seconds"].integerValue() == 600
+        for key in (
+            "microphone_seconds",
+            "speakers_seconds",
+            "lock_screen_seconds",
+        ):
             stepper = controls[f"{key}_stepper"]
             assert stepper.minValue() == 0
             assert stepper.maxValue() == app.MAX_PRIVACY_SECONDS
@@ -2100,6 +2171,7 @@ class TestPrivacy:
                 "privacy": {
                     "microphone_seconds": 240,
                     "speakers_seconds": 20,
+                    "lock_screen_seconds": 450,
                 }
             }
         )
@@ -2109,6 +2181,7 @@ class TestPrivacy:
         assert inst._privacy == {
             "microphone_seconds": 240,
             "speakers_seconds": 20,
+            "lock_screen_seconds": 450,
         }
 
     def test_load_migrates_shared_delay_to_enabled_channels(
@@ -2130,6 +2203,7 @@ class TestPrivacy:
         assert inst._privacy == {
             "microphone_seconds": 125,
             "speakers_seconds": 0,
+            "lock_screen_seconds": 0,
         }
 
     def test_load_ignores_invalid_settings(self, data_dir, monkeypatch) -> None:
@@ -2149,6 +2223,7 @@ class TestPrivacy:
         assert inst._privacy == {
             "microphone_seconds": app.DEFAULT_PRIVACY_MICROPHONE_SECONDS,
             "speakers_seconds": app.DEFAULT_PRIVACY_SPEAKERS_SECONDS,
+            "lock_screen_seconds": app.DEFAULT_PRIVACY_LOCK_SCREEN_SECONDS,
         }
 
     def test_channels_activate_at_independent_delays(
@@ -2157,6 +2232,7 @@ class TestPrivacy:
         full_app._privacy = {
             "microphone_seconds": 5,
             "speakers_seconds": 10,
+            "lock_screen_seconds": 0,
         }
         calls = []
 
@@ -2188,6 +2264,7 @@ class TestPrivacy:
         full_app._privacy = {
             "microphone_seconds": 0,
             "speakers_seconds": 5,
+            "lock_screen_seconds": 0,
         }
         calls = []
         monkeypatch.setattr(
@@ -2201,6 +2278,57 @@ class TestPrivacy:
         full_app._update_privacy(False, now=1.0)
         full_app._update_privacy(False, now=6.0)
         assert calls == [(False, True)]
+
+    def test_screen_locks_once_at_its_independent_delay(
+        self, full_app, monkeypatch
+    ) -> None:
+        full_app._privacy = {
+            "microphone_seconds": 0,
+            "speakers_seconds": 0,
+            "lock_screen_seconds": 5,
+        }
+        calls = []
+        monkeypatch.setattr(
+            app,
+            "lock_screen_for_privacy",
+            lambda: calls.append("lock") or True,
+        )
+
+        full_app._update_privacy(False, now=10.0)
+        full_app._update_privacy(False, now=14.9)
+        assert calls == []
+        full_app._update_privacy(False, now=15.0)
+        full_app._update_privacy(False, now=16.0)
+        assert calls == ["lock"]
+
+        full_app._update_privacy(True, now=17.0)
+        full_app._update_privacy(False, now=20.0)
+        full_app._update_privacy(False, now=25.0)
+        assert calls == ["lock", "lock"]
+
+    def test_screen_lock_retries_after_failed_attempt(
+        self, full_app, monkeypatch
+    ) -> None:
+        full_app._privacy = {
+            "microphone_seconds": 0,
+            "speakers_seconds": 0,
+            "lock_screen_seconds": 1,
+        }
+        results = iter((False, True))
+        calls = []
+        monkeypatch.setattr(
+            app,
+            "lock_screen_for_privacy",
+            lambda: calls.append("lock") or next(results),
+        )
+
+        full_app._update_privacy(False, now=1.0)
+        full_app._update_privacy(False, now=2.0)
+        assert "lock_screen" not in full_app._privacy_attempted
+        full_app._update_privacy(False, now=2.3)
+
+        assert calls == ["lock", "lock"]
+        assert "lock_screen" in full_app._privacy_attempted
 
     def test_returning_face_restores_audio(self, full_app, monkeypatch) -> None:
         microphone_state = app.AudioState(input_volume=70)
@@ -2224,6 +2352,7 @@ class TestPrivacy:
         full_app._privacy = {
             "microphone_seconds": 0,
             "speakers_seconds": 5,
+            "lock_screen_seconds": 0,
         }
         calls = []
         monkeypatch.setattr(
@@ -2248,6 +2377,7 @@ class TestPrivacy:
         full_app._privacy = {
             "microphone_seconds": 1,
             "speakers_seconds": 0,
+            "lock_screen_seconds": 0,
         }
         calls = []
         monkeypatch.setattr(
