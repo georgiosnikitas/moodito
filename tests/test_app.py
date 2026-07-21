@@ -1931,6 +1931,36 @@ class TestNotifications:
 
         assert calls == []
 
+    def test_break_timer_notifications_have_independent_toggles(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda settings: None)
+        monkeypatch.setattr(full_app, "_show_break_timer_alert", lambda: None)
+        full_app._notifications["break_timer_finished"] = False
+        calls = []
+        monkeypatch.setattr(
+            app.rumps,
+            "notification",
+            lambda *args, **kwargs: calls.append(args),
+        )
+
+        full_app._apply_break_timer(10, 25)
+        full_app._update_break_timer(True, now=0.0)
+        full_app._update_break_timer(True, now=10.0)
+
+        assert calls == [
+            (
+                "Moodito Break Timer",
+                "Break Timer started",
+                "Next break in 0h 0m 10s.",
+            ),
+            (
+                "Moodito Break Timer",
+                "Break Timer started",
+                "Next break in 0h 0m 10s.",
+            ),
+        ]
+
 
 class TestSensitivity:
     def test_defaults_to_normal_for_every_emotion(self, full_app) -> None:
@@ -2684,6 +2714,29 @@ class TestBreakTimer:
             "fired": False,
         }
         assert saved[-1]["break_timer"] == full_app._break_timer
+
+    def test_countdown_sends_started_finished_started_notifications(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda settings: None)
+        monkeypatch.setattr(full_app, "_show_break_timer_alert", lambda: None)
+        calls = []
+        monkeypatch.setattr(
+            app.rumps,
+            "notification",
+            lambda *args, **kwargs: calls.append(args),
+        )
+
+        full_app._apply_break_timer(10, 25)
+        full_app._update_break_timer(True, now=100.0)
+        full_app._update_break_timer(True, now=110.0)
+        full_app._update_break_timer(True, now=111.0)
+
+        assert [call[1] for call in calls] == [
+            "Break Timer started",
+            "Break Timer finished",
+            "Break Timer started",
+        ]
 
     def test_long_absence_resets_and_waits_for_face(
         self, full_app, monkeypatch
@@ -3796,6 +3849,8 @@ class TestRequestedNotificationEvents:
             "microphone_unmuted",
             "speakers_off",
             "speakers_on",
+            "break_timer_started",
+            "break_timer_finished",
             "data_range_changed",
             "mood_tip_generated",
             "mood_tip_pdf_exported",

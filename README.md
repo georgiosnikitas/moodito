@@ -65,10 +65,10 @@ Everything lives in the menu bar dropdown — small, fast, and out of your way.
   A configurable `0–99%` no-face threshold resets the countdown after a
   sufficiently long time away.
 - **🔔 Configurable notifications** — independently control notifications for
-  Privacy audio, data-range and export actions, Mood Tips and PDFs, settings
-  changes, pause/resume, each detected emotion, license changes, and quitting.
-  The grouped, scrollable settings window includes Enable All / Disable All
-  controls and a live enabled count.
+  Privacy audio, Break Timer start/finish, data-range and export actions, Mood
+  Tips and PDFs, settings changes, pause/resume, each detected emotion, license
+  changes, and quitting. The grouped, scrollable settings window includes
+  Enable All / Disable All controls and a live enabled count.
 - **🖼️ Customisable display** — toggle **Show Emojis** and **Show Labels**
   independently, or fall back to the clean Moodito icon.
 - **⏸️ Pause / Resume** — instantly stop processing webcam frames whenever you

@@ -185,8 +185,10 @@ DEFAULT_BREAK_TIMER_SECONDS = 0
 DEFAULT_BREAK_TIMER_RESET_PERCENT = 0
 MAX_BREAK_TIMER_RESET_PERCENT = 99
 BREAK_TIMER_STATUS_SYMBOL = "⏱"
+BREAK_TIMER_LABEL = "Break Timer"
 PAUSE_SYMBOL = "pause.fill"
 PRIVACY_NOTIFICATION_TITLE = "Moodito Privacy"
+BREAK_TIMER_NOTIFICATION_TITLE = "Moodito Break Timer"
 NO_FACE_NOTIFICATION_MESSAGE = "No face was detected."
 # Notification events grouped in the order shown in the settings dialog.
 NOTIFICATION_GROUPS = (
@@ -197,6 +199,13 @@ NOTIFICATION_GROUPS = (
             ("microphone_unmuted", "Microphone unmuted", "mic.fill"),
             ("speakers_off", "Speakers volume off", "speaker.slash.fill"),
             ("speakers_on", "Speakers volume on", "speaker.wave.2.fill"),
+        ),
+    ),
+    (
+        BREAK_TIMER_LABEL,
+        (
+            ("break_timer_started", "Break Timer started", "clock"),
+            ("break_timer_finished", "Break Timer finished", "bell.fill"),
         ),
     ),
     (
@@ -251,6 +260,8 @@ NOTIFICATION_MESSAGES = {
     "microphone_unmuted": (PRIVACY_NOTIFICATION_TITLE, "Microphone unmuted", "Your face is visible again."),
     "speakers_off": (PRIVACY_NOTIFICATION_TITLE, "Speakers volume off", NO_FACE_NOTIFICATION_MESSAGE),
     "speakers_on": (PRIVACY_NOTIFICATION_TITLE, "Speakers volume on", "Your face is visible again."),
+    "break_timer_started": (BREAK_TIMER_NOTIFICATION_TITLE, "Break Timer started", "Your break countdown is running."),
+    "break_timer_finished": (BREAK_TIMER_NOTIFICATION_TITLE, "Break Timer finished", "It is time to take a break."),
     "data_range_changed": ("Moodito", "Data range changed", "Insights now use the selected date range."),
     "mood_tip_generated": ("Moodito", "Mood Tip ready", "Your Mood Tip was generated successfully."),
     "mood_tip_pdf_exported": ("Moodito", "Mood Tip PDF saved", "Your Mood Tip was exported successfully."),
@@ -1782,6 +1793,9 @@ class MooditoApp(rumps.App):
         self._break_timer_last_update: float | None = None
         self._break_timer_no_face_since: float | None = None
         self._break_timer_waiting_for_face = False
+        self._break_timer_start_pending = bool(
+            self._break_timer["duration_seconds"]
+        )
         self._break_timer_stepper_handler = None
         # AI provider configuration (selected service + its credentials),
         # restored from settings.
@@ -3313,7 +3327,7 @@ class MooditoApp(rumps.App):
 
             view, controls = self._build_break_timer_accessory()
             alert = NSAlert.alloc().init()
-            alert.setMessageText_("Break Timer")
+            alert.setMessageText_(BREAK_TIMER_LABEL)
             alert.setInformativeText_(
                 "Set a recurring countdown. A continuous no-face period longer "
                 "than the reset percentage restarts it when your face returns. "
@@ -3331,7 +3345,7 @@ class MooditoApp(rumps.App):
                 and not self._apply_break_timer_from_controls(controls)
             ):
                 rumps.alert(
-                    "Break Timer",
+                    BREAK_TIMER_LABEL,
                     "Use 0-23 hours, 0-59 minutes, 0-59 seconds, and a reset "
                     "percentage from 0 to 99.",
                 )
@@ -3475,12 +3489,13 @@ class MooditoApp(rumps.App):
         self._break_timer_stepper_handler = handler
         return view, controls
 
-    def _reset_break_timer_runtime(self) -> None:
+    def _reset_break_timer_runtime(self, *, start_pending: bool = False) -> None:
         """Reset transient countdown and continuous-absence state."""
         self._break_timer_elapsed = 0.0
         self._break_timer_last_update = None
         self._break_timer_no_face_since = None
         self._break_timer_waiting_for_face = False
+        self._break_timer_start_pending = start_pending
 
     def _apply_break_timer(self, duration_seconds: int, reset_percent: int) -> bool:
         """Validate, persist, and explicitly start a fresh Break Timer."""
@@ -3495,10 +3510,11 @@ class MooditoApp(rumps.App):
             "absence_reset_percent": reset_percent,
             "fired": False,
         }
-        self._reset_break_timer_runtime()
+        self._reset_break_timer_runtime(start_pending=duration_seconds > 0)
         self._settings["break_timer"] = dict(self._break_timer)
         save_settings(self._settings)
         self._update_break_timer_menu()
+        self._notify_break_timer_started()
         return True
 
     def _update_break_timer_menu(self) -> None:
@@ -3516,6 +3532,7 @@ class MooditoApp(rumps.App):
         if self._break_timer_last_update is None:
             self._break_timer_last_update = current_time
             self._break_timer_no_face_since = None if face_present else current_time
+            self._notify_break_timer_started()
             return
 
         delta = max(0.0, current_time - self._break_timer_last_update)
@@ -3537,8 +3554,9 @@ class MooditoApp(rumps.App):
         """Start a fresh countdown when a face returns after an absence reset."""
         if not face_present:
             return
-        self._reset_break_timer_runtime()
+        self._reset_break_timer_runtime(start_pending=True)
         self._break_timer_last_update = current_time
+        self._notify_break_timer_started()
 
     def _reset_break_timer_for_absence(
         self, face_present: bool, current_time: float, duration: int
@@ -3560,13 +3578,26 @@ class MooditoApp(rumps.App):
     def _finish_break_timer(self) -> None:
         """Show the reminder, then start a fresh countdown after dismissal."""
         self._break_timer["fired"] = True
+        self._send_notification("break_timer_finished")
         try:
             self._show_break_timer_alert()
         finally:
             self._break_timer["fired"] = False
-            self._reset_break_timer_runtime()
+            self._reset_break_timer_runtime(start_pending=True)
             self._settings["break_timer"] = dict(self._break_timer)
             save_settings(self._settings)
+            self._notify_break_timer_started()
+
+    def _notify_break_timer_started(self) -> None:
+        """Send the enabled notification once at the start of each cycle."""
+        if not self._break_timer_start_pending:
+            return
+        self._break_timer_start_pending = False
+        duration = format_privacy_delay(self._break_timer["duration_seconds"])
+        self._send_notification(
+            "break_timer_started",
+            f"Next break in {duration}.",
+        )
 
     def _pause_break_timer(self) -> None:
         """Exclude paused/error time from the active countdown."""
