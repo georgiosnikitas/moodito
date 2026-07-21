@@ -1633,6 +1633,17 @@ class TestRefresh:
         full_app.refresh(None)
         assert observations == [False, True]
 
+    def test_routes_face_presence_to_break_timer(self, full_app) -> None:
+        observations = []
+        full_app._update_break_timer = (
+            lambda face_present: observations.append(face_present)
+        )
+        full_app._worker._set_result(EmotionResult(app.NO_FACE_LABEL, 0.0))
+        full_app.refresh(None)
+        full_app._worker._set_result(EmotionResult("happy", 0.8))
+        full_app.refresh(None)
+        assert observations == [False, True]
+
 
 class TestRenderStatus:
     def test_emojis_and_labels_show_emoji_and_text(self, full_app) -> None:
@@ -1665,6 +1676,21 @@ class TestRenderStatus:
         full_app._render_emotion(EmotionResult("happy", 0.8))
         assert full_app.icon is not None
         assert full_app.title is None
+
+    def test_active_break_timer_shows_clock_in_top_menu(self, full_app) -> None:
+        full_app._break_timer["duration_seconds"] = 60
+        full_app._last_render = None
+        full_app._render_emotion(EmotionResult("happy", 0.8))
+        assert full_app.title == "😀 happy ⏱"
+
+    def test_active_break_timer_clock_survives_icon_only_mode(self, full_app) -> None:
+        full_app._break_timer["duration_seconds"] = 60
+        full_app._show_emojis = False
+        full_app._show_labels = False
+        full_app._last_render = None
+        full_app._render_emotion(EmotionResult("happy", 0.8))
+        assert full_app.icon is not None
+        assert full_app.title == "⏱"
 
     def test_set_menubar_skips_redundant_render(self, full_app) -> None:
         full_app._last_render = None
@@ -2438,6 +2464,287 @@ class TestPrivacy:
         full_app._update_privacy(False, now=5.0)
         full_app._update_privacy(False, now=6.0)
         assert calls == [(True, False), (True, False)]
+
+
+class TestBreakTimer:
+    def test_defaults_are_disabled(self, full_app) -> None:
+        assert full_app._break_timer == {
+            "duration_seconds": 0,
+            "absence_reset_percent": 0,
+            "fired": False,
+        }
+
+    def test_menu_item_follows_privacy(self, full_app) -> None:
+        menu_titles = list(full_app.menu.keys())
+        privacy_index = menu_titles.index(full_app._privacy_menu.title)
+        assert menu_titles[privacy_index + 1] == full_app._break_timer_menu.title
+
+    def test_menu_clock_icon_is_always_shown(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda settings: None)
+        assert full_app._break_timer_menu._menuitem.image() is not None
+
+        full_app._apply_break_timer(60, 20)
+        assert full_app._break_timer_menu._menuitem.image() is not None
+
+        full_app._apply_break_timer(0, 20)
+        assert full_app._break_timer_menu._menuitem.image() is not None
+
+    def test_apply_from_controls_reads_duration_and_percentage(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda settings: None)
+        controls = {
+            "hours": _FakeIntegerControl(1),
+            "minutes": _FakeIntegerControl(2),
+            "seconds": _FakeIntegerControl(3),
+            "reset_percent": _FakeIntegerControl(99),
+        }
+
+        assert full_app._apply_break_timer_from_controls(controls) is True
+        assert full_app._break_timer == {
+            "duration_seconds": 3723,
+            "absence_reset_percent": 99,
+            "fired": False,
+        }
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("hours", 24),
+            ("minutes", 60),
+            ("seconds", 60),
+            ("reset_percent", 100),
+            ("reset_percent", -1),
+        ],
+    )
+    def test_apply_from_controls_rejects_invalid_component(
+        self, full_app, monkeypatch, key, value
+    ) -> None:
+        saved = []
+        monkeypatch.setattr(app, "save_settings", lambda settings: saved.append(settings))
+        controls = {
+            "hours": _FakeIntegerControl(0),
+            "minutes": _FakeIntegerControl(0),
+            "seconds": _FakeIntegerControl(0),
+            "reset_percent": _FakeIntegerControl(0),
+        }
+        controls[key] = _FakeIntegerControl(value)
+
+        assert full_app._apply_break_timer_from_controls(controls) is False
+        assert saved == []
+
+    def test_accessory_restores_values_and_bounds(self, full_app) -> None:
+        full_app._break_timer = {
+            "duration_seconds": 86399,
+            "absence_reset_percent": 99,
+            "fired": False,
+        }
+        _view, controls = full_app._build_break_timer_accessory()
+
+        assert controls["hours"].integerValue() == 23
+        assert controls["minutes"].integerValue() == 59
+        assert controls["seconds"].integerValue() == 59
+        assert controls["reset_percent"].integerValue() == 99
+        assert controls["hours_stepper"].maxValue() == 23
+        assert controls["minutes_stepper"].maxValue() == 59
+        assert controls["seconds_stepper"].maxValue() == 59
+        assert controls["reset_percent_stepper"].maxValue() == 99
+
+    def test_saved_finished_timer_restarts_after_reload(
+        self, data_dir, monkeypatch
+    ) -> None:
+        app.save_settings(
+            {
+                "break_timer": {
+                    "duration_seconds": 60,
+                    "absence_reset_percent": 20,
+                    "fired": True,
+                }
+            }
+        )
+        monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+        monkeypatch.setattr(app.rumps, "notification", lambda *args, **kwargs: None)
+        inst = app.MooditoApp()
+        alerts = []
+        monkeypatch.setattr(inst, "_show_break_timer_alert", lambda: alerts.append(True))
+
+        inst._update_break_timer(True, now=0.0)
+        inst._update_break_timer(True, now=59.9)
+        assert alerts == []
+        inst._update_break_timer(True, now=60.0)
+
+        assert inst._break_timer["fired"] is False
+        assert alerts == [True]
+        assert inst._break_timer_menu._menuitem.image() is not None
+
+    def test_applying_finished_settings_explicitly_restarts_timer(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda settings: None)
+        full_app._break_timer = {
+            "duration_seconds": 60,
+            "absence_reset_percent": 20,
+            "fired": True,
+        }
+        full_app._break_timer_elapsed = 60.0
+
+        assert full_app._apply_break_timer(60, 20) is True
+        assert full_app._break_timer["fired"] is False
+        assert full_app._break_timer_elapsed == 0.0
+
+    def test_finished_timer_opens_break_reminder(self, full_app, monkeypatch) -> None:
+        import AppKit
+
+        captured = {"buttons": [], "modal": False}
+
+        class FakeAlert:
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def init(self):
+                return self
+
+            def setMessageText_(self, value) -> None:
+                captured["title"] = value
+
+            def setInformativeText_(self, value) -> None:
+                captured["message"] = value
+
+            def addButtonWithTitle_(self, value) -> None:
+                captured["buttons"].append(value)
+
+            def setIcon_(self, _value) -> None:
+                captured["icon"] = True
+
+            def runModal(self) -> None:
+                captured["modal"] = True
+
+        class FakeImage:
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def initByReferencingFile_(self, _path):
+                return None
+
+        fake_ns_app = type(
+            "FakeNSApp",
+            (),
+            {"activateIgnoringOtherApps_": lambda self, _active: None},
+        )()
+        monkeypatch.setattr(AppKit, "NSAlert", FakeAlert)
+        monkeypatch.setattr(AppKit, "NSImage", FakeImage)
+        monkeypatch.setattr(AppKit, "NSApp", fake_ns_app)
+
+        full_app._show_break_timer_alert()
+
+        assert captured == {
+            "buttons": ["OK"],
+            "modal": True,
+            "title": "Break Time",
+            "message": (
+                "Your break timer has finished. It is time to take a break."
+            ),
+        }
+
+    def test_dismissing_break_reminder_starts_next_countdown(
+        self, full_app, monkeypatch
+    ) -> None:
+        saved = []
+        alerts = []
+        monkeypatch.setattr(app, "save_settings", lambda settings: saved.append(settings))
+        monkeypatch.setattr(
+            full_app,
+            "_show_break_timer_alert",
+            lambda: alerts.append("break"),
+        )
+
+        assert full_app._apply_break_timer(10, 25) is True
+        full_app._update_break_timer(True, now=100.0)
+        full_app._update_break_timer(True, now=109.9)
+        assert alerts == []
+        full_app._update_break_timer(True, now=110.0)
+        assert alerts == ["break"]
+        assert full_app._break_timer["fired"] is False
+        assert full_app._break_timer_elapsed == 0.0
+
+        full_app._update_break_timer(True, now=200.0)
+        full_app._update_break_timer(True, now=209.9)
+        assert alerts == ["break"]
+        full_app._update_break_timer(True, now=210.0)
+
+        assert alerts == ["break", "break"]
+        assert full_app._break_timer == {
+            "duration_seconds": 10,
+            "absence_reset_percent": 25,
+            "fired": False,
+        }
+        assert saved[-1]["break_timer"] == full_app._break_timer
+
+    def test_long_absence_resets_and_waits_for_face(
+        self, full_app, monkeypatch
+    ) -> None:
+        alerts = []
+        monkeypatch.setattr(app, "save_settings", lambda settings: None)
+        monkeypatch.setattr(
+            full_app,
+            "_show_break_timer_alert",
+            lambda: alerts.append("break"),
+        )
+        full_app._apply_break_timer(100, 20)
+
+        full_app._update_break_timer(True, now=0.0)
+        full_app._update_break_timer(True, now=50.0)
+        full_app._update_break_timer(False, now=60.0)
+        full_app._update_break_timer(False, now=80.1)
+        assert full_app._break_timer_elapsed == 0.0
+        assert full_app._break_timer_waiting_for_face is True
+
+        full_app._update_break_timer(False, now=200.0)
+        assert alerts == []
+        full_app._update_break_timer(True, now=201.0)
+        full_app._update_break_timer(True, now=300.9)
+        assert alerts == []
+        full_app._update_break_timer(True, now=301.0)
+        assert alerts == ["break"]
+
+    def test_zero_percent_resets_after_any_continuous_absence(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda settings: None)
+        full_app._apply_break_timer(100, 0)
+
+        full_app._update_break_timer(True, now=0.0)
+        full_app._update_break_timer(False, now=10.0)
+        assert full_app._break_timer_waiting_for_face is False
+        full_app._update_break_timer(False, now=10.1)
+        assert full_app._break_timer_waiting_for_face is True
+        assert full_app._break_timer_elapsed == 0.0
+
+    def test_short_absence_does_not_reset_countdown(
+        self, full_app, monkeypatch
+    ) -> None:
+        alerts = []
+        monkeypatch.setattr(app, "save_settings", lambda settings: None)
+        monkeypatch.setattr(
+            full_app,
+            "_show_break_timer_alert",
+            lambda: alerts.append("break"),
+        )
+        full_app._apply_break_timer(100, 20)
+
+        full_app._update_break_timer(True, now=0.0)
+        full_app._update_break_timer(False, now=50.0)
+        full_app._update_break_timer(False, now=69.9)
+        full_app._update_break_timer(True, now=70.0)
+        assert full_app._break_timer_waiting_for_face is False
+        full_app._update_break_timer(True, now=100.0)
+
+        assert alerts == ["break"]
 
 
 class TestAIProvider:

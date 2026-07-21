@@ -181,6 +181,10 @@ MAX_PRIVACY_SECONDS = (
 DEFAULT_PRIVACY_MICROPHONE_SECONDS = 0
 DEFAULT_PRIVACY_SPEAKERS_SECONDS = 0
 DEFAULT_PRIVACY_LOCK_SCREEN_SECONDS = 0
+DEFAULT_BREAK_TIMER_SECONDS = 0
+DEFAULT_BREAK_TIMER_RESET_PERCENT = 0
+MAX_BREAK_TIMER_RESET_PERCENT = 99
+BREAK_TIMER_STATUS_SYMBOL = "⏱"
 PAUSE_SYMBOL = "pause.fill"
 PRIVACY_NOTIFICATION_TITLE = "Moodito Privacy"
 NO_FACE_NOTIFICATION_MESSAGE = "No face was detected."
@@ -806,18 +810,18 @@ def _mood_tip_handler_class():
     return _MoodTipHandler
 
 
-# Lazily-created target for the Privacy dialog's numeric fields and steppers.
-_PRIVACY_STEPPER_HANDLER_CLASS = None
+# Lazily-created target for bounded numeric fields and steppers.
+_BOUNDED_STEPPER_HANDLER_CLASS = None
 
 
-def _privacy_stepper_handler_class():
-    """Return the NSObject subclass that synchronizes Privacy counters."""
-    global _PRIVACY_STEPPER_HANDLER_CLASS
-    if _PRIVACY_STEPPER_HANDLER_CLASS is not None:
-        return _PRIVACY_STEPPER_HANDLER_CLASS
+def _bounded_stepper_handler_class():
+    """Return the NSObject subclass that synchronizes bounded counters."""
+    global _BOUNDED_STEPPER_HANDLER_CLASS
+    if _BOUNDED_STEPPER_HANDLER_CLASS is not None:
+        return _BOUNDED_STEPPER_HANDLER_CLASS
     from AppKit import NSObject
 
-    class _PrivacyStepperHandler(NSObject):
+    class _BoundedStepperHandler(NSObject):
         def stepperChanged_(self, sender) -> None:
             index = int(sender.tag())
             self.fields[index].setIntegerValue_(sender.integerValue())
@@ -828,8 +832,8 @@ def _privacy_stepper_handler_class():
             sender.setIntegerValue_(value)
             self.steppers[index].setIntegerValue_(value)
 
-    _PRIVACY_STEPPER_HANDLER_CLASS = _PrivacyStepperHandler
-    return _PrivacyStepperHandler
+    _BOUNDED_STEPPER_HANDLER_CLASS = _BoundedStepperHandler
+    return _BoundedStepperHandler
 
 
 _NOTIFICATION_SETTINGS_HANDLER_CLASS = None
@@ -1772,6 +1776,13 @@ class MooditoApp(rumps.App):
         self._privacy_audio_states: dict[str, AudioState] = {}
         self._privacy_changed_channels: set[str] = set()
         self._privacy_stepper_handler = None
+        # Break Timer is persisted and restarts after each reminder is dismissed.
+        self._break_timer = self._load_break_timer()
+        self._break_timer_elapsed = 0.0
+        self._break_timer_last_update: float | None = None
+        self._break_timer_no_face_since: float | None = None
+        self._break_timer_waiting_for_face = False
+        self._break_timer_stepper_handler = None
         # AI provider configuration (selected service + its credentials),
         # restored from settings.
         self._ai_provider = self._load_ai_provider()
@@ -1953,6 +1964,9 @@ class MooditoApp(rumps.App):
         self._privacy_menu = rumps.MenuItem(
             "Privacy…", callback=self.open_privacy_window
         )
+        self._break_timer_menu = rumps.MenuItem(
+            "Break Timer…", callback=self.open_break_timer_window
+        )
         # AI provider is configured in a native NSAlert dialog (built each time
         # it is opened) — see open_ai_provider_window. The title shows which
         # provider is currently selected.
@@ -1989,6 +2003,7 @@ class MooditoApp(rumps.App):
             self._notifications_menu,
             self._sensitivity_menu,
             self._privacy_menu,
+            self._break_timer_menu,
             self._ai_provider_menu,
             rumps.MenuItem("Pause", callback=self.toggle_pause),
             None,
@@ -2028,6 +2043,7 @@ class MooditoApp(rumps.App):
         set_symbol_icon(self._notifications_menu, "bell")
         set_symbol_icon(self._sensitivity_menu, "slider.horizontal.3")
         set_symbol_icon(self._privacy_menu, "lock.shield")
+        self._update_break_timer_menu()
         set_symbol_icon(self._ai_provider_menu, "sparkles")
         set_symbol_icon(self._mood_tip_menu, "text.bubble")
         set_symbol_icon(self._pause_item, PAUSE_SYMBOL)
@@ -2064,14 +2080,21 @@ class MooditoApp(rumps.App):
         empty state where rumps falls back to showing the app name. Repeated
         identical renders are skipped so the status item does not flicker.
         """
-        if (icon_path, title) == self._last_render:
+        display_title = title
+        if self._break_timer["duration_seconds"]:
+            display_title = (
+                f"{title} {BREAK_TIMER_STATUS_SYMBOL}"
+                if title
+                else BREAK_TIMER_STATUS_SYMBOL
+            )
+        if (icon_path, display_title) == self._last_render:
             return
-        self._last_render = (icon_path, title)
+        self._last_render = (icon_path, display_title)
         if icon_path is not None:
             self.icon = icon_path
-            self.title = title
+            self.title = display_title
         else:
-            self.title = title
+            self.title = display_title
             self.icon = None
 
     def open_about_window(self, _sender) -> None:
@@ -2187,19 +2210,23 @@ class MooditoApp(rumps.App):
 
         if self._paused:
             self._reset_privacy()
+            self._pause_break_timer()
             self._accumulate_stats("paused")
             return
 
         error = self._worker.error
         if error:
             self._reset_privacy()
+            self._pause_break_timer()
             self._set_menubar(None, "⚠️ Moodito")
             self._detected_item.title = f"Detected: error ({error})"
             self._accumulate_stats("error")
             return
 
         result = self._worker.result
-        self._update_privacy(result.label != NO_FACE_LABEL)
+        face_present = result.label != NO_FACE_LABEL
+        self._update_privacy(face_present)
+        self._update_break_timer(face_present)
         if self._worker.ready:
             self._notify_emotion_transition(result.label)
         self._render_emotion(result)
@@ -3240,7 +3267,7 @@ class MooditoApp(rumps.App):
                 steppers.append(stepper)
                 maximums.append(maximum)
 
-        handler = _privacy_stepper_handler_class().alloc().init()
+        handler = _bounded_stepper_handler_class().alloc().init()
         handler.fields = fields
         handler.steppers = steppers
         handler.maximums = maximums
@@ -3253,6 +3280,318 @@ class MooditoApp(rumps.App):
         self._privacy_stepper_handler = handler
 
         return view, controls
+
+    def _load_break_timer(self) -> dict:
+        """Load the persisted recurring Break Timer configuration."""
+        timer = {
+            "duration_seconds": DEFAULT_BREAK_TIMER_SECONDS,
+            "absence_reset_percent": DEFAULT_BREAK_TIMER_RESET_PERCENT,
+            "fired": False,
+        }
+        stored = self._settings.get("break_timer")
+        if not isinstance(stored, dict):
+            return timer
+        duration = stored.get("duration_seconds")
+        reset_percent = stored.get("absence_reset_percent")
+        if self._valid_privacy_delay(duration):
+            timer["duration_seconds"] = duration
+        if (
+            isinstance(reset_percent, int)
+            and not isinstance(reset_percent, bool)
+            and 0 <= reset_percent <= MAX_BREAK_TIMER_RESET_PERCENT
+        ):
+            timer["absence_reset_percent"] = reset_percent
+        # Older versions persisted a terminal fired state. Timers are recurring
+        # now, so any configured timer starts a fresh countdown after launch.
+        timer["fired"] = False
+        return timer
+
+    def open_break_timer_window(self, _sender) -> None:
+        """Show the native Break Timer duration and reset settings dialog."""
+        try:
+            from AppKit import NSAlert, NSAlertFirstButtonReturn, NSApp, NSImage
+
+            view, controls = self._build_break_timer_accessory()
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Break Timer")
+            alert.setInformativeText_(
+                "Set a recurring countdown. A continuous no-face period longer "
+                "than the reset percentage restarts it when your face returns. "
+                "Set the duration to all zeros to disable."
+            )
+            alert.addButtonWithTitle_("Apply")
+            alert.addButtonWithTitle_("Cancel")
+            icon = NSImage.alloc().initByReferencingFile_(resource_path(MENUBAR_ICON))
+            if icon is not None and icon.isValid():
+                alert.setIcon_(icon)
+            alert.setAccessoryView_(view)
+            NSApp.activateIgnoringOtherApps_(True)
+            if (
+                alert.runModal() == NSAlertFirstButtonReturn
+                and not self._apply_break_timer_from_controls(controls)
+            ):
+                rumps.alert(
+                    "Break Timer",
+                    "Use 0-23 hours, 0-59 minutes, 0-59 seconds, and a reset "
+                    "percentage from 0 to 99.",
+                )
+        except Exception:  # noqa: BLE001 - never let a UI glitch crash the menu
+            pass
+
+    def _apply_break_timer_from_controls(self, controls: dict) -> bool:
+        """Validate and apply the values selected in the Break Timer dialog."""
+        hours = int(controls["hours"].integerValue())
+        minutes = int(controls["minutes"].integerValue())
+        seconds = int(controls["seconds"].integerValue())
+        reset_percent = int(controls["reset_percent"].integerValue())
+        if not (
+            0 <= hours <= MAX_PRIVACY_HOURS
+            and 0 <= minutes <= MAX_PRIVACY_MINUTES
+            and 0 <= seconds <= MAX_PRIVACY_COMPONENT_SECONDS
+        ):
+            return False
+        return self._apply_break_timer(
+            hours * 3600 + minutes * 60 + seconds,
+            reset_percent,
+        )
+
+    def _build_break_timer_accessory(self):
+        """Build H/M/S duration and no-face reset percentage controls."""
+        from AppKit import (
+            NSFont,
+            NSImage,
+            NSImageView,
+            NSStepper,
+            NSTextField,
+            NSView,
+        )
+        from Foundation import NSMakeRect, NSNumberFormatter
+
+        width = 480.0
+        height = 104.0
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, width, height))
+
+        def add_label(text: str, x: float, y: float, label_width: float) -> None:
+            label = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(x, y, label_width, 22.0)
+            )
+            label.setStringValue_(text)
+            label.setBezeled_(False)
+            label.setDrawsBackground_(False)
+            label.setEditable_(False)
+            label.setSelectable_(False)
+            label.setFont_(NSFont.systemFontOfSize_(13.0))
+            view.addSubview_(label)
+
+        def add_icon(symbol_name: str, description: str, y: float) -> None:
+            image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                symbol_name, description
+            )
+            if image is None:
+                return
+            image.setTemplate_(True)
+            image_view = NSImageView.alloc().initWithFrame_(
+                NSMakeRect(0.0, y + 8.0, 18.0, 18.0)
+            )
+            image_view.setImage_(image)
+            view.addSubview_(image_view)
+
+        controls = {}
+        fields = []
+        steppers = []
+        maximums = []
+
+        components = (
+            ("hours", MAX_PRIVACY_HOURS, 166.0),
+            ("minutes", MAX_PRIVACY_MINUTES, 278.0),
+            ("seconds", MAX_PRIVACY_COMPONENT_SECONDS, 390.0),
+        )
+        for component, _maximum, x in components:
+            add_label(component.capitalize(), x, 82.0, 76.0)
+
+        duration = self._break_timer["duration_seconds"]
+        hours, remainder = divmod(duration, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        values = {"hours": hours, "minutes": minutes, "seconds": seconds}
+        add_icon("clock", "Countdown duration", 42.0)
+        add_label("Countdown", 28.0, 49.0, 128.0)
+
+        def add_counter(key: str, value: int, maximum: int, x: float, y: float):
+            tag = len(fields)
+            formatter = NSNumberFormatter.alloc().init()
+            formatter.setAllowsFloats_(False)
+            formatter.setMinimum_(0)
+            formatter.setMaximum_(maximum)
+            field = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(x, y + 5.0, 48.0, 24.0)
+            )
+            field.setFormatter_(formatter)
+            field.setIntegerValue_(value)
+            field.setTag_(tag)
+            view.addSubview_(field)
+
+            stepper = NSStepper.alloc().initWithFrame_(
+                NSMakeRect(x + 52.0, y + 3.0, 20.0, 27.0)
+            )
+            stepper.setMinValue_(0.0)
+            stepper.setMaxValue_(float(maximum))
+            stepper.setIncrement_(1.0)
+            stepper.setValueWraps_(False)
+            stepper.setAutorepeat_(True)
+            stepper.setIntegerValue_(value)
+            stepper.setTag_(tag)
+            view.addSubview_(stepper)
+
+            controls[key] = field
+            controls[f"{key}_stepper"] = stepper
+            fields.append(field)
+            steppers.append(stepper)
+            maximums.append(maximum)
+
+        for component, maximum, x in components:
+            add_counter(component, values[component], maximum, x, 42.0)
+
+        add_icon("arrow.counterclockwise", "No-face reset threshold", 0.0)
+        add_label("Reset after no face", 28.0, 7.0, 128.0)
+        add_counter(
+            "reset_percent",
+            self._break_timer["absence_reset_percent"],
+            MAX_BREAK_TIMER_RESET_PERCENT,
+            166.0,
+            0.0,
+        )
+        add_label("% of countdown", 244.0, 7.0, 110.0)
+
+        handler = _bounded_stepper_handler_class().alloc().init()
+        handler.fields = fields
+        handler.steppers = steppers
+        handler.maximums = maximums
+        for field in fields:
+            field.setTarget_(handler)
+            field.setAction_("fieldChanged:")
+        for stepper in steppers:
+            stepper.setTarget_(handler)
+            stepper.setAction_("stepperChanged:")
+        self._break_timer_stepper_handler = handler
+        return view, controls
+
+    def _reset_break_timer_runtime(self) -> None:
+        """Reset transient countdown and continuous-absence state."""
+        self._break_timer_elapsed = 0.0
+        self._break_timer_last_update = None
+        self._break_timer_no_face_since = None
+        self._break_timer_waiting_for_face = False
+
+    def _apply_break_timer(self, duration_seconds: int, reset_percent: int) -> bool:
+        """Validate, persist, and explicitly start a fresh Break Timer."""
+        if not self._valid_privacy_delay(duration_seconds) or not (
+            isinstance(reset_percent, int)
+            and not isinstance(reset_percent, bool)
+            and 0 <= reset_percent <= MAX_BREAK_TIMER_RESET_PERCENT
+        ):
+            return False
+        self._break_timer = {
+            "duration_seconds": duration_seconds,
+            "absence_reset_percent": reset_percent,
+            "fired": False,
+        }
+        self._reset_break_timer_runtime()
+        self._settings["break_timer"] = dict(self._break_timer)
+        save_settings(self._settings)
+        self._update_break_timer_menu()
+        return True
+
+    def _update_break_timer_menu(self) -> None:
+        """Keep the Break Timer menu option identifiable with a clock icon."""
+        set_symbol_icon(self._break_timer_menu, "clock")
+
+    def _update_break_timer(
+        self, face_present: bool, now: float | None = None
+    ) -> None:
+        """Advance the countdown and reset it after a long absence."""
+        duration = self._break_timer["duration_seconds"]
+        if duration == 0 or self._break_timer["fired"]:
+            return
+        current_time = time.monotonic() if now is None else now
+        if self._break_timer_last_update is None:
+            self._break_timer_last_update = current_time
+            self._break_timer_no_face_since = None if face_present else current_time
+            return
+
+        delta = max(0.0, current_time - self._break_timer_last_update)
+        self._break_timer_last_update = current_time
+        if self._break_timer_waiting_for_face:
+            self._resume_break_timer_after_absence(face_present, current_time)
+            return
+
+        self._break_timer_elapsed += delta
+        if self._reset_break_timer_for_absence(face_present, current_time, duration):
+            return
+
+        if self._break_timer_elapsed >= duration:
+            self._finish_break_timer()
+
+    def _resume_break_timer_after_absence(
+        self, face_present: bool, current_time: float
+    ) -> None:
+        """Start a fresh countdown when a face returns after an absence reset."""
+        if not face_present:
+            return
+        self._reset_break_timer_runtime()
+        self._break_timer_last_update = current_time
+
+    def _reset_break_timer_for_absence(
+        self, face_present: bool, current_time: float, duration: int
+    ) -> bool:
+        """Reset and hold the timer after a qualifying continuous absence."""
+        if face_present:
+            self._break_timer_no_face_since = None
+            return False
+        if self._break_timer_no_face_since is None:
+            self._break_timer_no_face_since = current_time
+        absence = current_time - self._break_timer_no_face_since
+        reset_after = duration * self._break_timer["absence_reset_percent"] / 100.0
+        if absence <= reset_after:
+            return False
+        self._break_timer_elapsed = 0.0
+        self._break_timer_waiting_for_face = True
+        return True
+
+    def _finish_break_timer(self) -> None:
+        """Show the reminder, then start a fresh countdown after dismissal."""
+        self._break_timer["fired"] = True
+        try:
+            self._show_break_timer_alert()
+        finally:
+            self._break_timer["fired"] = False
+            self._reset_break_timer_runtime()
+            self._settings["break_timer"] = dict(self._break_timer)
+            save_settings(self._settings)
+
+    def _pause_break_timer(self) -> None:
+        """Exclude paused/error time from the active countdown."""
+        self._break_timer_last_update = None
+        if not self._break_timer_waiting_for_face:
+            self._break_timer_no_face_since = None
+
+    def _show_break_timer_alert(self) -> None:
+        """Tell the user that the configured countdown has finished."""
+        try:
+            from AppKit import NSAlert, NSApp, NSImage
+
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Break Time")
+            alert.setInformativeText_(
+                "Your break timer has finished. It is time to take a break."
+            )
+            alert.addButtonWithTitle_("OK")
+            icon = NSImage.alloc().initByReferencingFile_(resource_path(MENUBAR_ICON))
+            if icon is not None and icon.isValid():
+                alert.setIcon_(icon)
+            NSApp.activateIgnoringOtherApps_(True)
+            alert.runModal()
+        except Exception:  # noqa: BLE001 - never let an alert crash the menu
+            pass
 
     def _load_ai_provider(self) -> dict:
         """Return the AI provider config, restored from settings.
