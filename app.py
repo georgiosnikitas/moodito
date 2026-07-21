@@ -170,7 +170,14 @@ SAMPLE_INTERVAL = 0.15
 # Privacy is opt-in so upgrading Moodito never changes the system unexpectedly.
 PRIVACY_CHANNELS = ("microphone", "speakers")
 PRIVACY_ACTIONS = (*PRIVACY_CHANNELS, "lock_screen")
-MAX_PRIVACY_SECONDS = 600
+MAX_PRIVACY_HOURS = 23
+MAX_PRIVACY_MINUTES = 59
+MAX_PRIVACY_COMPONENT_SECONDS = 59
+MAX_PRIVACY_SECONDS = (
+    MAX_PRIVACY_HOURS * 3600
+    + MAX_PRIVACY_MINUTES * 60
+    + MAX_PRIVACY_COMPONENT_SECONDS
+)
 DEFAULT_PRIVACY_MICROPHONE_SECONDS = 0
 DEFAULT_PRIVACY_SPEAKERS_SECONDS = 0
 DEFAULT_PRIVACY_LOCK_SCREEN_SECONDS = 0
@@ -817,7 +824,7 @@ def _privacy_stepper_handler_class():
 
         def fieldChanged_(self, sender) -> None:
             index = int(sender.tag())
-            value = max(0, min(MAX_PRIVACY_SECONDS, int(sender.integerValue())))
+            value = max(0, min(self.maximums[index], int(sender.integerValue())))
             sender.setIntegerValue_(value)
             self.steppers[index].setIntegerValue_(value)
 
@@ -1323,6 +1330,15 @@ def format_duration(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {secs:02d}s"
     return f"{secs}s"
+
+
+def format_privacy_delay(seconds: int) -> str:
+    """Format a Privacy delay with all H/M/S components, or Disabled for zero."""
+    if seconds == 0:
+        return "Disabled"
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}h {minutes}m {secs}s"
 
 
 # Hourly activity chart: a small text bar chart of app usage per hour of day.
@@ -2946,7 +2962,7 @@ class MooditoApp(rumps.App):
 
     @staticmethod
     def _valid_privacy_delay(value) -> bool:
-        """Whether a Privacy channel delay is an integer from 0 to 600."""
+        """Whether a Privacy delay is between 00:00:00 and 23:59:59."""
         return (
             isinstance(value, int)
             and not isinstance(value, bool)
@@ -2981,15 +2997,9 @@ class MooditoApp(rumps.App):
         self._privacy = privacy
         self._settings["privacy"] = dict(privacy)
         save_settings(self._settings)
-        microphone_text = (
-            f"{microphone_seconds} seconds" if microphone_seconds else "Disabled"
-        )
-        speakers_text = (
-            f"{speakers_seconds} seconds" if speakers_seconds else "Disabled"
-        )
-        lock_screen_text = (
-            f"{lock_screen_seconds} seconds" if lock_screen_seconds else "Disabled"
-        )
+        microphone_text = format_privacy_delay(microphone_seconds)
+        speakers_text = format_privacy_delay(speakers_seconds)
+        lock_screen_text = format_privacy_delay(lock_screen_seconds)
         self._send_notification(
             "privacy_settings_changed",
             f"Microphone: {microphone_text}; Speakers: {speakers_text}; "
@@ -3089,7 +3099,8 @@ class MooditoApp(rumps.App):
             alert = NSAlert.alloc().init()
             alert.setMessageText_("Privacy")
             alert.setInformativeText_(
-                "Set each no-face delay from 0 to 600 seconds. Set 0 to disable."
+                "Set each no-face delay using 0-23 hours, 0-59 minutes, and "
+                "0-59 seconds. All zeros disables that action."
             )
             alert.addButtonWithTitle_("Apply")
             alert.addButtonWithTitle_("Cancel")
@@ -3104,21 +3115,36 @@ class MooditoApp(rumps.App):
             ):
                 rumps.alert(
                     "Privacy",
-                    "Enter a whole number from 0 to 600 for each action.",
+                    "Use whole numbers: 0-23 hours, 0-59 minutes, and "
+                    "0-59 seconds.",
                 )
         except Exception:  # noqa: BLE001 - never let a UI glitch crash the menu
             pass
 
     def _apply_privacy_from_controls(self, controls: dict) -> bool:
         """Commit values selected in the Privacy dialog controls."""
-        return self._apply_privacy(
-            int(controls["microphone_seconds"].integerValue()),
-            int(controls["speakers_seconds"].integerValue()),
-            int(controls["lock_screen_seconds"].integerValue()),
+        def total_seconds(action: str) -> int | None:
+            hours = int(controls[f"{action}_hours"].integerValue())
+            minutes = int(controls[f"{action}_minutes"].integerValue())
+            seconds = int(controls[f"{action}_seconds"].integerValue())
+            if not (
+                0 <= hours <= MAX_PRIVACY_HOURS
+                and 0 <= minutes <= MAX_PRIVACY_MINUTES
+                and 0 <= seconds <= MAX_PRIVACY_COMPONENT_SECONDS
+            ):
+                return None
+            return hours * 3600 + minutes * 60 + seconds
+
+        delays = tuple(
+            total_seconds(action) for action in ("microphone", "speakers", "lock_screen")
         )
+        if any(delay is None for delay in delays):
+            return False
+
+        return self._apply_privacy(*delays)
 
     def _build_privacy_accessory(self):
-        """Build independent 0-600 second counters for Privacy actions."""
+        """Build independent H/M/S counters for each Privacy action."""
         from AppKit import (
             NSFont,
             NSImage,
@@ -3129,9 +3155,10 @@ class MooditoApp(rumps.App):
         )
         from Foundation import NSMakeRect, NSNumberFormatter
 
-        width = 420.0
+        width = 480.0
+        header_height = 28.0
         row_height = 38.0
-        height = len(PRIVACY_ACTIONS) * row_height
+        height = header_height + len(PRIVACY_ACTIONS) * row_height
         view = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, width, height))
 
         def add_label(text: str, x: float, y: float, label_width: float) -> None:
@@ -3149,13 +3176,22 @@ class MooditoApp(rumps.App):
         controls = {}
         fields = []
         steppers = []
+        maximums = []
         rows = (
-            ("Mute microphone", "microphone_seconds", "mic.fill"),
-            ("Mute speakers", "speakers_seconds", "speaker.wave.2.fill"),
-            ("Lock screen", "lock_screen_seconds", "lock.fill"),
+            ("Mute microphone", "microphone", "mic.fill"),
+            ("Mute speakers", "speakers", "speaker.wave.2.fill"),
+            ("Lock screen", "lock_screen", "lock.fill"),
         )
-        for index, (title, key, symbol_name) in enumerate(rows):
-            row_y = height - (index + 1) * row_height
+        components = (
+            ("hours", MAX_PRIVACY_HOURS, 166.0),
+            ("minutes", MAX_PRIVACY_MINUTES, 278.0),
+            ("seconds", MAX_PRIVACY_COMPONENT_SECONDS, 390.0),
+        )
+        for component, _maximum, x in components:
+            add_label(component.capitalize(), x, height - 22.0, 76.0)
+
+        for index, (title, action, symbol_name) in enumerate(rows):
+            row_y = height - header_height - (index + 1) * row_height
             image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
                 symbol_name, title
             )
@@ -3166,41 +3202,48 @@ class MooditoApp(rumps.App):
                 )
                 image_view.setImage_(image)
                 view.addSubview_(image_view)
-            add_label(title, 28.0, row_y + 7.0, 138.0)
+            add_label(title, 28.0, row_y + 7.0, 128.0)
 
-            formatter = NSNumberFormatter.alloc().init()
-            formatter.setAllowsFloats_(False)
-            formatter.setMinimum_(0)
-            formatter.setMaximum_(MAX_PRIVACY_SECONDS)
-            field = NSTextField.alloc().initWithFrame_(
-                NSMakeRect(174.0, row_y + 5.0, 72.0, 24.0)
-            )
-            field.setFormatter_(formatter)
-            field.setIntegerValue_(self._privacy[key])
-            field.setTag_(index)
-            view.addSubview_(field)
+            hours, remainder = divmod(self._privacy[f"{action}_seconds"], 3600)
+            minutes, seconds = divmod(remainder, 60)
+            values = {"hours": hours, "minutes": minutes, "seconds": seconds}
+            for component, maximum, x in components:
+                tag = len(fields)
+                key = f"{action}_{component}"
+                formatter = NSNumberFormatter.alloc().init()
+                formatter.setAllowsFloats_(False)
+                formatter.setMinimum_(0)
+                formatter.setMaximum_(maximum)
+                field = NSTextField.alloc().initWithFrame_(
+                    NSMakeRect(x, row_y + 5.0, 48.0, 24.0)
+                )
+                field.setFormatter_(formatter)
+                field.setIntegerValue_(values[component])
+                field.setTag_(tag)
+                view.addSubview_(field)
 
-            stepper = NSStepper.alloc().initWithFrame_(
-                NSMakeRect(250.0, row_y + 3.0, 20.0, 27.0)
-            )
-            stepper.setMinValue_(0.0)
-            stepper.setMaxValue_(float(MAX_PRIVACY_SECONDS))
-            stepper.setIncrement_(1.0)
-            stepper.setValueWraps_(False)
-            stepper.setAutorepeat_(True)
-            stepper.setIntegerValue_(self._privacy[key])
-            stepper.setTag_(index)
-            view.addSubview_(stepper)
-            add_label("seconds", 280.0, row_y + 7.0, 58.0)
+                stepper = NSStepper.alloc().initWithFrame_(
+                    NSMakeRect(x + 52.0, row_y + 3.0, 20.0, 27.0)
+                )
+                stepper.setMinValue_(0.0)
+                stepper.setMaxValue_(float(maximum))
+                stepper.setIncrement_(1.0)
+                stepper.setValueWraps_(False)
+                stepper.setAutorepeat_(True)
+                stepper.setIntegerValue_(values[component])
+                stepper.setTag_(tag)
+                view.addSubview_(stepper)
 
-            controls[key] = field
-            controls[f"{key}_stepper"] = stepper
-            fields.append(field)
-            steppers.append(stepper)
+                controls[key] = field
+                controls[f"{key}_stepper"] = stepper
+                fields.append(field)
+                steppers.append(stepper)
+                maximums.append(maximum)
 
         handler = _privacy_stepper_handler_class().alloc().init()
         handler.fields = fields
         handler.steppers = steppers
+        handler.maximums = maximums
         for field in fields:
             field.setTarget_(handler)
             field.setAction_("fieldChanged:")

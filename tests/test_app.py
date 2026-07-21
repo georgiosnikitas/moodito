@@ -2044,8 +2044,8 @@ class TestPrivacy:
         assert notifications == [
             (
                 "privacy_settings_changed",
-                "Microphone: 15 seconds; Speakers: 90 seconds; "
-                "Lock screen: 300 seconds.",
+                "Microphone: 0h 0m 15s; Speakers: 0h 1m 30s; "
+                "Lock screen: 0h 5m 0s.",
             )
         ]
 
@@ -2063,7 +2063,7 @@ class TestPrivacy:
         assert notifications == [
             (
                 "privacy_settings_changed",
-                "Microphone: Disabled; Speakers: 30 seconds; "
+                "Microphone: Disabled; Speakers: 0h 0m 30s; "
                 "Lock screen: Disabled.",
             )
         ]
@@ -2092,9 +2092,9 @@ class TestPrivacy:
             (-1, 0, 0),
             (0, -1, 0),
             (0, 0, -1),
-            (601, 0, 0),
-            (0, 601, 0),
-            (0, 0, 601),
+            (86400, 0, 0),
+            (0, 86400, 0),
+            (0, 0, 86400),
             (True, 1, 1),
         ],
     )
@@ -2123,47 +2123,92 @@ class TestPrivacy:
     ) -> None:
         monkeypatch.setattr(app, "save_settings", lambda settings: None)
         controls = {
-            "microphone_seconds": _FakeIntegerControl(125),
-            "speakers_seconds": _FakeIntegerControl(350),
-            "lock_screen_seconds": _FakeIntegerControl(600),
+            "microphone_hours": _FakeIntegerControl(1),
+            "microphone_minutes": _FakeIntegerControl(2),
+            "microphone_seconds": _FakeIntegerControl(3),
+            "speakers_hours": _FakeIntegerControl(0),
+            "speakers_minutes": _FakeIntegerControl(59),
+            "speakers_seconds": _FakeIntegerControl(59),
+            "lock_screen_hours": _FakeIntegerControl(23),
+            "lock_screen_minutes": _FakeIntegerControl(59),
+            "lock_screen_seconds": _FakeIntegerControl(59),
         }
         assert full_app._apply_privacy_from_controls(controls) is True
         assert full_app._privacy == {
-            "microphone_seconds": 125,
-            "speakers_seconds": 350,
-            "lock_screen_seconds": 600,
+            "microphone_seconds": 3723,
+            "speakers_seconds": 3599,
+            "lock_screen_seconds": 86399,
         }
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("microphone_hours", 24),
+            ("microphone_minutes", 60),
+            ("microphone_seconds", 60),
+            ("microphone_hours", -1),
+        ],
+    )
+    def test_apply_from_controls_rejects_out_of_range_component(
+        self, full_app, monkeypatch, key, value
+    ) -> None:
+        saved = []
+        monkeypatch.setattr(app, "save_settings", lambda settings: saved.append(settings))
+        controls = {
+            f"{action}_{component}": _FakeIntegerControl(0)
+            for action in app.PRIVACY_ACTIONS
+            for component in ("hours", "minutes", "seconds")
+        }
+        controls[key] = _FakeIntegerControl(value)
+
+        assert full_app._apply_privacy_from_controls(controls) is False
+        assert saved == []
 
     def test_build_accessory_restores_current_values(self, full_app) -> None:
         full_app._privacy = {
-            "microphone_seconds": 180,
-            "speakers_seconds": 12,
-            "lock_screen_seconds": 600,
+            "microphone_seconds": 3723,
+            "speakers_seconds": 3598,
+            "lock_screen_seconds": 86399,
         }
         _view, controls = full_app._build_privacy_accessory()
-        assert controls["microphone_seconds"].integerValue() == 180
-        assert controls["speakers_seconds"].integerValue() == 12
-        assert controls["lock_screen_seconds"].integerValue() == 600
-        for key in (
-            "microphone_seconds",
-            "speakers_seconds",
-            "lock_screen_seconds",
-        ):
-            stepper = controls[f"{key}_stepper"]
-            assert stepper.minValue() == 0
-            assert stepper.maxValue() == app.MAX_PRIVACY_SECONDS
+        assert controls["microphone_hours"].integerValue() == 1
+        assert controls["microphone_minutes"].integerValue() == 2
+        assert controls["microphone_seconds"].integerValue() == 3
+        assert controls["speakers_hours"].integerValue() == 0
+        assert controls["speakers_minutes"].integerValue() == 59
+        assert controls["speakers_seconds"].integerValue() == 58
+        assert controls["lock_screen_hours"].integerValue() == 23
+        assert controls["lock_screen_minutes"].integerValue() == 59
+        assert controls["lock_screen_seconds"].integerValue() == 59
+        maximums = {
+            "hours": app.MAX_PRIVACY_HOURS,
+            "minutes": app.MAX_PRIVACY_MINUTES,
+            "seconds": app.MAX_PRIVACY_COMPONENT_SECONDS,
+        }
+        for action in app.PRIVACY_ACTIONS:
+            for component, maximum in maximums.items():
+                stepper = controls[f"{action}_{component}_stepper"]
+                assert stepper.minValue() == 0
+                assert stepper.maxValue() == maximum
 
     def test_stepper_updates_counter_and_clamps_typed_value(self, full_app) -> None:
         _view, controls = full_app._build_privacy_accessory()
-        field = controls["microphone_seconds"]
-        stepper = controls["microphone_seconds_stepper"]
-        stepper.setIntegerValue_(125)
+        field = controls["microphone_hours"]
+        stepper = controls["microphone_hours_stepper"]
+        stepper.setIntegerValue_(20)
         full_app._privacy_stepper_handler.stepperChanged_(stepper)
-        assert field.integerValue() == 125
-        field.setIntegerValue_(700)
+        assert field.integerValue() == 20
+        field.setIntegerValue_(30)
         full_app._privacy_stepper_handler.fieldChanged_(field)
-        assert field.integerValue() == 600
-        assert stepper.integerValue() == 600
+        assert field.integerValue() == 23
+        assert stepper.integerValue() == 23
+
+        minute_field = controls["microphone_minutes"]
+        minute_stepper = controls["microphone_minutes_stepper"]
+        minute_field.setIntegerValue_(70)
+        full_app._privacy_stepper_handler.fieldChanged_(minute_field)
+        assert minute_field.integerValue() == 59
+        assert minute_stepper.integerValue() == 59
 
     def test_load_restores_per_channel_settings(self, data_dir, monkeypatch) -> None:
         app.save_settings(
