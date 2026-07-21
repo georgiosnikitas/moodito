@@ -2521,6 +2521,36 @@ class TestBreakTimer:
         full_app._apply_break_timer(0, 20)
         assert full_app._break_timer_menu._menuitem.image() is not None
 
+    def test_menu_title_shows_remaining_hh_mm_ss(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda settings: None)
+        assert full_app._break_timer_menu.title == "Break Timer…"
+
+        full_app._apply_break_timer(3661, 20)
+        assert full_app._break_timer_menu.title == "Break Timer… [01:01:01]"
+        full_app._update_break_timer(True, now=100.0)
+        full_app._update_break_timer(True, now=100.1)
+        assert full_app._break_timer_menu.title == "Break Timer… [01:01:01]"
+        full_app._update_break_timer(True, now=101.0)
+        assert full_app._break_timer_menu.title == "Break Timer… [01:01:00]"
+
+        full_app._apply_break_timer(0, 20)
+        assert full_app._break_timer_menu.title == "Break Timer…"
+
+    def test_absence_reset_restores_full_menu_countdown(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda settings: None)
+        full_app._apply_break_timer(100, 20)
+        full_app._update_break_timer(True, now=0.0)
+        full_app._update_break_timer(True, now=50.0)
+        assert full_app._break_timer_menu.title == "Break Timer… [00:00:50]"
+
+        full_app._update_break_timer(False, now=60.0)
+        full_app._update_break_timer(False, now=80.1)
+        assert full_app._break_timer_menu.title == "Break Timer… [00:01:40]"
+
     def test_apply_from_controls_reads_duration_and_percentage(
         self, full_app, monkeypatch
     ) -> None:
@@ -2701,6 +2731,7 @@ class TestBreakTimer:
         assert alerts == ["break"]
         assert full_app._break_timer["fired"] is False
         assert full_app._break_timer_elapsed == 0.0
+        assert full_app._break_timer_menu.title == "Break Timer… [00:00:10]"
 
         full_app._update_break_timer(True, now=200.0)
         full_app._update_break_timer(True, now=209.9)
@@ -2804,6 +2835,11 @@ class TestAIProvider:
     def test_defaults_to_default_provider_with_no_values(self, full_app) -> None:
         assert full_app._ai_provider["provider"] == app.DEFAULT_AI_PROVIDER
         assert full_app._ai_provider["providers"] == {}
+
+    def test_menu_item_follows_mood_tip(self, full_app) -> None:
+        menu_titles = list(full_app.menu.keys())
+        mood_tip_index = menu_titles.index(full_app._mood_tip_menu.title)
+        assert menu_titles[mood_tip_index + 1] == full_app._ai_provider_menu.title
 
     def test_menu_item_is_a_single_window_opener(self, full_app) -> None:
         assert "AI Provider" in full_app._ai_provider_menu.title

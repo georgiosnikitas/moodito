@@ -60,9 +60,10 @@ Everything lives in the menu bar dropdown — small, fast, and out of your way.
   returns, Moodito restores the exact audio levels and speaker mute state that
   were active before Privacy engaged.
 - **⏱️ Break Timer** — set a countdown in hours, minutes, and seconds. An active
-  timer shows a clock in the macOS menu bar. When it finishes, Moodito opens a
-  reminder to take a break, then starts a fresh countdown after you dismiss it.
-  A configurable `0–99%` no-face threshold resets the countdown after a
+  timer shows a clock in the macOS menu bar and its remaining time beside the
+  Break Timer option as `[hh:mm:ss]`. When it finishes, Moodito opens a reminder
+  to take a break, then starts a fresh countdown after you dismiss it. A
+  configurable `0–99%` no-face threshold resets the countdown after a
   sufficiently long time away.
 - **🔔 Configurable notifications** — independently control notifications for
   Privacy audio, Break Timer start/finish, data-range and export actions, Mood

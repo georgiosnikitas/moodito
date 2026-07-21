@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import csv
 import json
+import math
 import os
 import socket
 import subprocess
@@ -186,6 +187,7 @@ DEFAULT_BREAK_TIMER_RESET_PERCENT = 0
 MAX_BREAK_TIMER_RESET_PERCENT = 99
 BREAK_TIMER_STATUS_SYMBOL = "⏱"
 BREAK_TIMER_LABEL = "Break Timer"
+BREAK_TIMER_MENU_TITLE = f"{BREAK_TIMER_LABEL}…"
 PAUSE_SYMBOL = "pause.fill"
 PRIVACY_NOTIFICATION_TITLE = "Moodito Privacy"
 BREAK_TIMER_NOTIFICATION_TITLE = "Moodito Break Timer"
@@ -1979,7 +1981,7 @@ class MooditoApp(rumps.App):
             "Privacy…", callback=self.open_privacy_window
         )
         self._break_timer_menu = rumps.MenuItem(
-            "Break Timer…", callback=self.open_break_timer_window
+            BREAK_TIMER_MENU_TITLE, callback=self.open_break_timer_window
         )
         # AI provider is configured in a native NSAlert dialog (built each time
         # it is opened) — see open_ai_provider_window. The title shows which
@@ -2008,6 +2010,7 @@ class MooditoApp(rumps.App):
             self._stats_live_item,
             self._stats_menu,
             self._mood_tip_menu,
+            self._ai_provider_menu,
             self._stats_export_item,
             self._stats_reset_item,
             None,
@@ -2018,7 +2021,6 @@ class MooditoApp(rumps.App):
             self._sensitivity_menu,
             self._privacy_menu,
             self._break_timer_menu,
-            self._ai_provider_menu,
             rumps.MenuItem("Pause", callback=self.toggle_pause),
             None,
             self._license_menu,
@@ -3518,7 +3520,15 @@ class MooditoApp(rumps.App):
         return True
 
     def _update_break_timer_menu(self) -> None:
-        """Keep the Break Timer menu option identifiable with a clock icon."""
+        """Show the permanent clock icon and configured remaining duration."""
+        title = BREAK_TIMER_MENU_TITLE
+        duration = self._break_timer["duration_seconds"]
+        if duration:
+            remaining = max(0, math.ceil(duration - self._break_timer_elapsed))
+            hours, remainder = divmod(remaining, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            title = f"{title} [{hours:02d}:{minutes:02d}:{seconds:02d}]"
+        self._break_timer_menu.title = title
         set_symbol_icon(self._break_timer_menu, "clock")
 
     def _update_break_timer(
@@ -3543,8 +3553,10 @@ class MooditoApp(rumps.App):
 
         self._break_timer_elapsed += delta
         if self._reset_break_timer_for_absence(face_present, current_time, duration):
+            self._update_break_timer_menu()
             return
 
+        self._update_break_timer_menu()
         if self._break_timer_elapsed >= duration:
             self._finish_break_timer()
 
@@ -3556,6 +3568,7 @@ class MooditoApp(rumps.App):
             return
         self._reset_break_timer_runtime(start_pending=True)
         self._break_timer_last_update = current_time
+        self._update_break_timer_menu()
         self._notify_break_timer_started()
 
     def _reset_break_timer_for_absence(
@@ -3586,6 +3599,7 @@ class MooditoApp(rumps.App):
             self._reset_break_timer_runtime(start_pending=True)
             self._settings["break_timer"] = dict(self._break_timer)
             save_settings(self._settings)
+            self._update_break_timer_menu()
             self._notify_break_timer_started()
 
     def _notify_break_timer_started(self) -> None:
