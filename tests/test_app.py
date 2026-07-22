@@ -71,7 +71,25 @@ class TestEnsureModel:
             lambda url, path: calls.append((url, path)),
         )
         app.ensure_model()
-        assert calls == [(app.MODEL_URL, app.MODEL_PATH)]
+        assert calls[0][0] == app.MODEL_URL
+        assert calls[0][1] != app.MODEL_PATH
+        assert (data_dir / "model.task").exists()
+
+    def test_failed_download_removes_partial_file(
+        self, data_dir, monkeypatch
+    ) -> None:
+        def fail_download(_url, path):
+            with open(path, "wb") as model_file:
+                model_file.write(b"partial")
+            raise OSError("connection dropped")
+
+        monkeypatch.setattr(app.urllib.request, "urlretrieve", fail_download)
+
+        with pytest.raises(OSError, match="connection dropped"):
+            app.ensure_model()
+
+        assert not (data_dir / "model.task").exists()
+        assert list(data_dir.iterdir()) == []
 
 
 class TestSettings:
@@ -195,7 +213,7 @@ class TestRawFileSize:
 
 class TestAppendRawSamples:
     def test_empty_rows_writes_nothing(self, data_dir) -> None:
-        app.append_raw_samples([])
+        assert app.append_raw_samples([]) is True
         assert not (data_dir / "raw_data.csv").exists()
 
     def test_writes_header_then_rows(self, data_dir) -> None:
@@ -219,7 +237,7 @@ class TestAppendRawSamples:
             raise OSError("disk full")
 
         monkeypatch.setattr(app.os, "makedirs", boom)
-        app.append_raw_samples([("t", "happy", "0.9")])  # must not raise
+        assert app.append_raw_samples([("t", "happy", "0.9")]) is False
 
 
 class TestCameraAccess:
@@ -673,7 +691,7 @@ class TestStatsAccumulation:
     def test_periodic_save_flushes(self, monkeypatch) -> None:
         saved = []
         monkeypatch.setattr(app, "save_stats", lambda *a, **k: saved.append(a))
-        monkeypatch.setattr(app, "append_raw_samples", lambda *a, **k: None)
+        monkeypatch.setattr(app, "append_raw_samples", lambda *a, **k: True)
         inst = _bare_app()
         ticks = int(10 / app.UI_REFRESH_INTERVAL) + 1
         for _ in range(ticks):
@@ -711,7 +729,7 @@ class TestRawRecording:
         flushed = []
         monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
         monkeypatch.setattr(
-            app, "append_raw_samples", lambda rows: flushed.extend(rows)
+            app, "append_raw_samples", lambda rows: flushed.extend(rows) or True
         )
         inst = _bare_app()
         ticks = int(10 / app.UI_REFRESH_INTERVAL) + 1
@@ -719,6 +737,19 @@ class TestRawRecording:
             inst._accumulate_stats("happy", 0.5)
         assert flushed  # raw samples were flushed
         assert inst._raw_buffer == []  # buffer cleared after flush
+
+    def test_periodic_flush_retains_buffer_on_write_failure(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
+        monkeypatch.setattr(app, "append_raw_samples", lambda _rows: False)
+        inst = _bare_app()
+        ticks = int(10 / app.UI_REFRESH_INTERVAL) + 1
+
+        for _ in range(ticks):
+            inst._accumulate_stats("happy", 0.5)
+
+        assert len(inst._raw_buffer) == ticks
 
 
 class TestStatsRange:
@@ -1109,6 +1140,29 @@ class TestExportCsv:
         exported = list((data_dir / "Downloads").glob("moodito-raw-*.csv"))
         assert "happy" in exported[0].read_text()
 
+    def test_failed_buffer_flush_aborts_export(
+        self, data_dir, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("HOME", str(data_dir))
+        (data_dir / "Downloads").mkdir()
+        monkeypatch.setattr(app, "append_raw_samples", lambda _rows: False)
+        inst = _bare_app()
+        inst._raw_buffer = [("2026-06-21T22:30:00.000", "happy", "0.9")]
+        notifications = []
+        monkeypatch.setattr(
+            inst,
+            "_deliver_notification",
+            lambda *args: notifications.append(args),
+        )
+
+        inst.export_csv(None)
+
+        assert inst._raw_buffer == [
+            ("2026-06-21T22:30:00.000", "happy", "0.9")
+        ]
+        assert list((data_dir / "Downloads").iterdir()) == []
+        assert notifications[0][0] == "csv_export_failed"
+
     def test_writes_header_only_when_no_raw_file(
         self, data_dir, monkeypatch
     ) -> None:
@@ -1179,7 +1233,7 @@ class TestQuitApp:
         flushed = []
         monkeypatch.setattr(app, "save_stats", lambda *a, **k: saved.append(a))
         monkeypatch.setattr(
-            app, "append_raw_samples", lambda rows: flushed.extend(rows)
+            app, "append_raw_samples", lambda rows: flushed.extend(rows) or True
         )
         monkeypatch.setattr(app.rumps, "quit_application", lambda: None)
         inst = _bare_app()
@@ -1191,6 +1245,80 @@ class TestQuitApp:
         assert flushed == [("t", "happy", "0.9")]
         assert inst._raw_buffer == []
         assert saved
+
+    def test_write_failure_keeps_app_running_and_buffered(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
+        monkeypatch.setattr(app, "append_raw_samples", lambda _rows: False)
+        alerts = []
+        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: alerts.append(a))
+        quit_calls = []
+        monkeypatch.setattr(
+            app.rumps, "quit_application", lambda: quit_calls.append(True)
+        )
+        inst = _bare_app()
+        stopped = []
+        inst._worker = type("W", (), {"stop": lambda self: stopped.append(True)})()
+        inst._raw_buffer = [("t", "happy", "0.9")]
+
+        inst.quit_app(None)
+
+        assert inst._raw_buffer == [("t", "happy", "0.9")]
+        assert stopped == []
+        assert quit_calls == []
+        assert alerts
+
+    def test_privacy_restore_failure_keeps_app_running_by_default(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
+        append_calls = []
+        monkeypatch.setattr(
+            app,
+            "append_raw_samples",
+            lambda rows: append_calls.append(rows) or True,
+        )
+        alerts = []
+
+        def stay_open(*args, **kwargs):
+            alerts.append((args, kwargs))
+            return 1
+
+        monkeypatch.setattr(app.rumps, "alert", stay_open)
+        quit_calls = []
+        monkeypatch.setattr(
+            app.rumps, "quit_application", lambda: quit_calls.append(True)
+        )
+        inst = _bare_app()
+        monkeypatch.setattr(inst, "_reset_privacy", lambda: False)
+        stopped = []
+        inst._worker = type("W", (), {"stop": lambda self: stopped.append(True)})()
+
+        inst.quit_app(None)
+
+        assert append_calls == []
+        assert stopped == []
+        assert quit_calls == []
+        assert alerts[0][1] == {"ok": "Stay Open", "cancel": "Quit Anyway"}
+
+    def test_privacy_restore_failure_can_be_overridden(self, monkeypatch) -> None:
+        monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
+        monkeypatch.setattr(app, "append_raw_samples", lambda _rows: True)
+        monkeypatch.setattr(app.rumps, "alert", lambda *a, **k: 0)
+        quit_calls = []
+        monkeypatch.setattr(
+            app.rumps, "quit_application", lambda: quit_calls.append(True)
+        )
+        inst = _bare_app()
+        monkeypatch.setattr(inst, "_reset_privacy", lambda: False)
+        stopped = []
+        inst._worker = type("W", (), {"stop": lambda self: stopped.append(True)})()
+
+        inst.quit_app(None)
+
+        assert stopped == [True]
+        assert quit_calls == [True]
 
 
 class TestLicensePersistence:
@@ -1314,6 +1442,24 @@ class TestLicenseApi:
             "_license_api_request",
             lambda *a, **k: (_ for _ in ()).throw(OSError("offline")),
         )
+        assert app.validate_license("key-1", "iid") == app.LICENSE_UNREACHABLE
+
+    @pytest.mark.parametrize("status", [429, 503])
+    def test_validate_transient_http_error_is_unreachable(
+        self, monkeypatch, status
+    ) -> None:
+        import io
+
+        def fake_urlopen(request, timeout):
+            raise app.urllib.error.HTTPError(
+                request.full_url,
+                status,
+                "Temporarily unavailable",
+                {},
+                io.BytesIO(b'{"error": "try again"}'),
+            )
+
+        monkeypatch.setattr(app.urllib.request, "urlopen", fake_urlopen)
         assert app.validate_license("key-1", "iid") == app.LICENSE_UNREACHABLE
 
     def test_deactivate_success(self, monkeypatch) -> None:
@@ -4315,6 +4461,50 @@ class TestFaceWorkerRun:
         worker.run()
         assert "model download failed" in worker.error
 
+    def test_run_redownloads_model_after_initialization_failure(
+        self, data_dir, monkeypatch
+    ) -> None:
+        model_path = data_dir / "model.task"
+        model_path.write_bytes(b"invalid")
+        ensure_calls = []
+
+        def fake_ensure_model() -> None:
+            ensure_calls.append(True)
+            if not model_path.exists():
+                model_path.write_bytes(b"fresh")
+
+        class FakeLandmarkerContext:
+            def __enter__(self):
+                return object()
+
+            def __exit__(self, *_args):
+                return False
+
+        def fake_create(_options):
+            if model_path.read_bytes() == b"invalid":
+                raise RuntimeError("invalid model")
+            return FakeLandmarkerContext()
+
+        monkeypatch.setattr(app, "ensure_model", fake_ensure_model)
+        monkeypatch.setattr(
+            app.vision,
+            "FaceLandmarkerOptions",
+            lambda **options: options,
+        )
+        monkeypatch.setattr(
+            app.vision.FaceLandmarker,
+            "create_from_options",
+            fake_create,
+        )
+        worker = app.FaceWorker()
+        worker.stop()
+
+        worker.run()
+
+        assert ensure_calls == [True, True]
+        assert model_path.read_bytes() == b"fresh"
+        assert worker.error is None
+
     def test_landmarker_is_configured_for_multiple_faces(self, monkeypatch) -> None:
         captured = {}
         monkeypatch.setattr(app, "ensure_model", lambda: None)
@@ -4363,6 +4553,30 @@ class TestFaceWorkerRun:
         cap = _FakeCap(worker, frames=2)
         worker._run_capture_loop(cap, landmarker)
         assert worker.result == EmotionResult("happy", 0.9)
+
+    def test_capture_loop_preserves_timestamp_across_reconnects(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app.cv2, "cvtColor", lambda *a, **k: "rgb")
+        monkeypatch.setattr(app.cv2, "COLOR_BGR2RGB", 0, raising=False)
+        monkeypatch.setattr(app.mp, "Image", lambda **k: "image")
+        timestamps = []
+        worker = app.FaceWorker()
+        landmarker = type(
+            "L",
+            (),
+            {
+                "detect_for_video": lambda self, img, ts: (
+                    timestamps.append(ts) or _Detection(0)
+                )
+            },
+        )()
+
+        worker._run_capture_loop(_FakeCap(worker, frames=1), landmarker)
+        worker._stop.clear()
+        worker._run_capture_loop(_FakeCap(worker, frames=1), landmarker)
+
+        assert timestamps == [150, 300]
 
     def test_capture_loop_handles_no_face(self, monkeypatch) -> None:
         monkeypatch.setattr(app.cv2, "cvtColor", lambda *a, **k: "rgb")
@@ -4824,7 +5038,9 @@ class TestRequestedNotificationEvents:
             app, "save_stats", lambda *args, **kwargs: order.append("saved")
         )
         monkeypatch.setattr(
-            app, "append_raw_samples", lambda rows: order.append("flushed")
+            app,
+            "append_raw_samples",
+            lambda rows: order.append("flushed") or True,
         )
         monkeypatch.setattr(
             app.rumps, "quit_application", lambda: order.append("quit")
@@ -4836,6 +5052,6 @@ class TestRequestedNotificationEvents:
         inst.quit_app(None)
 
         assert [call[1] for call in calls] == ["Moodito quit"]
-        assert order == ["stopped", "saved", "flushed", "quit"]
+        assert order == ["saved", "flushed", "stopped", "quit"]
 
 

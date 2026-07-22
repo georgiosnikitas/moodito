@@ -15,6 +15,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -383,7 +384,24 @@ def ensure_model() -> None:
     if os.path.exists(MODEL_PATH):
         return
     os.makedirs(DATA_DIR, exist_ok=True)
-    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    download_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=DATA_DIR,
+            prefix=f".{MODEL_FILENAME}.",
+            suffix=".download",
+            delete=False,
+        ) as download:
+            download_path = download.name
+        urllib.request.urlretrieve(MODEL_URL, download_path)
+        os.replace(download_path, MODEL_PATH)
+    except Exception:
+        if download_path is not None:
+            try:
+                os.remove(download_path)
+            except OSError:
+                pass
+        raise
 
 
 def load_settings() -> dict:
@@ -478,6 +496,8 @@ def _license_api_request(action: str, params: dict) -> dict:
         with urllib.request.urlopen(request, timeout=LICENSE_API_TIMEOUT) as response:
             return json.load(response)
     except urllib.error.HTTPError as exc:
+        if exc.code == 429 or 500 <= exc.code < 600:
+            raise
         try:
             return json.load(exc)
         except ValueError:
@@ -1362,13 +1382,14 @@ def raw_file_size() -> int:
         return 0
 
 
-def append_raw_samples(rows: list[tuple]) -> None:
-    """Append raw detection samples to the raw CSV log (best-effort).
+def append_raw_samples(rows: list[tuple]) -> bool:
+    """Append raw detection samples to the raw CSV log.
 
-    Writes the column-label header row the first time the file is created.
+    Writes the column-label header row the first time the file is created and
+    returns whether all rows were written successfully.
     """
     if not rows:
-        return
+        return True
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         write_header = not os.path.exists(RAW_PATH) or os.path.getsize(RAW_PATH) == 0
@@ -1377,8 +1398,9 @@ def append_raw_samples(rows: list[tuple]) -> None:
             if write_header:
                 writer.writerow(RAW_HEADER)
             writer.writerows(rows)
+        return True
     except OSError:
-        pass
+        return False
 
 
 def format_duration(seconds: float) -> str:
@@ -1769,6 +1791,7 @@ class FaceWorker(threading.Thread):
         self._error: str | None = None
         self._ready = False
         self._sensitivity: dict[str, str] = {}
+        self._timestamp_ms = 0
 
     @property
     def result(self) -> EmotionResult:
@@ -1824,7 +1847,21 @@ class FaceWorker(threading.Thread):
             running_mode=vision.RunningMode.VIDEO,
         )
 
-        with vision.FaceLandmarker.create_from_options(options) as landmarker:
+        try:
+            landmarker_context = vision.FaceLandmarker.create_from_options(options)
+        except Exception:  # noqa: BLE001 - retry once with a fresh model file
+            try:
+                os.remove(MODEL_PATH)
+            except OSError:
+                pass
+            try:
+                ensure_model()
+                landmarker_context = vision.FaceLandmarker.create_from_options(options)
+            except Exception as exc:  # noqa: BLE001 - surface initialization failure
+                self._set_error(f"model initialization failed: {exc}")
+                return
+
+        with landmarker_context as landmarker:
             while not self._stop.is_set():
                 cap = cv2.VideoCapture(self._camera_index)
                 if not cap.isOpened():
@@ -1837,7 +1874,6 @@ class FaceWorker(threading.Thread):
                 cap.release()
 
     def _run_capture_loop(self, cap, landmarker) -> None:
-        timestamp_ms = 0
         failures = 0
         while not self._stop.is_set():
             ok, frame = cap.read()
@@ -1854,8 +1890,8 @@ class FaceWorker(threading.Thread):
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms += int(SAMPLE_INTERVAL * 1000)
-            detection = landmarker.detect_for_video(mp_image, timestamp_ms)
+            self._timestamp_ms += int(SAMPLE_INTERVAL * 1000)
+            detection = landmarker.detect_for_video(mp_image, self._timestamp_ms)
 
             face_count = len(detection.face_blendshapes)
             if face_count > 1:
@@ -2381,6 +2417,13 @@ class MooditoApp(rumps.App):
         )
         self._accumulate_stats(result.label, result.score)
 
+    def _flush_raw_buffer(self) -> bool:
+        """Persist pending raw samples and clear them only after success."""
+        if not append_raw_samples(self._raw_buffer):
+            return False
+        self._raw_buffer.clear()
+        return True
+
     def _accumulate_stats(self, label: str, score: float | None = None) -> None:
         """Add elapsed time to the current emotion and persist periodically."""
         # Record the raw per-sample reading for the raw data export.
@@ -2416,8 +2459,7 @@ class MooditoApp(rumps.App):
         if self._ticks_since_save * UI_REFRESH_INTERVAL >= 10:
             self._ticks_since_save = 0
             save_stats(self._stats, self._stats_started_at)
-            append_raw_samples(self._raw_buffer)
-            self._raw_buffer.clear()
+            self._flush_raw_buffer()
             if self._stats_live_24h:
                 # Re-aggregate so samples older than 24h drop out of the window.
                 self._recompute_range_stats()
@@ -4802,8 +4844,15 @@ class MooditoApp(rumps.App):
         """Export the raw detection log for the selected date range to a CSV
         file in the Downloads folder."""
         # Flush any buffered samples first so the export includes everything.
-        append_raw_samples(self._raw_buffer)
-        self._raw_buffer.clear()
+        if not self._flush_raw_buffer():
+            self._deliver_notification(
+                "csv_export_failed",
+                "Moodito",
+                "Export failed",
+                "Recent detection data could not be written. Check available "
+                "disk space and try again.",
+            )
+            return
         start = self._stats_range_start
         end = self._stats_range_end if self._stats_range_end is not None else datetime.now()
         downloads = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -4865,11 +4914,26 @@ class MooditoApp(rumps.App):
         self._send_notification("data_erased")
 
     def quit_app(self, _sender) -> None:
-        self._reset_privacy()
-        self._worker.stop()
+        if not self._reset_privacy():
+            stay_open = rumps.alert(
+                PRIVACY_NOTIFICATION_TITLE,
+                "Moodito could not restore one or more audio or display "
+                "settings. Staying open lets it retry automatically. Quit "
+                "anyway only if you will restore them manually.",
+                ok="Stay Open",
+                cancel="Quit Anyway",
+            )
+            if stay_open:
+                return
         save_stats(self._stats, self._stats_started_at)
-        append_raw_samples(self._raw_buffer)
-        self._raw_buffer.clear()
+        if not self._flush_raw_buffer():
+            rumps.alert(
+                "Moodito",
+                "Recent detection data could not be saved. Check available "
+                "disk space and try quitting again.",
+            )
+            return
+        self._worker.stop()
         self._send_notification("app_quit")
         rumps.quit_application()
 
