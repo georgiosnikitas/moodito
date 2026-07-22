@@ -254,6 +254,11 @@ NOTIFICATION_GROUPS = (
             ("emotion_angry", "Angry detected", "bolt.fill"),
             ("emotion_sad", "Sad detected", "cloud.rain"),
             ("emotion_no_face", "No face detected", "eye.slash"),
+            (
+                "emotion_multiple_faces",
+                "Multiple faces detected",
+                "person.2.fill",
+            ),
         ),
     ),
     (
@@ -297,6 +302,7 @@ NOTIFICATION_MESSAGES = {
     "emotion_angry": ("Moodito", "Angry detected", "Moodito now detects an angry expression."),
     "emotion_sad": ("Moodito", "Sad detected", "Moodito now detects a sad expression."),
     "emotion_no_face": ("Moodito", "No face detected", "No face is currently visible."),
+    "emotion_multiple_faces": ("Moodito", "Multiple faces detected", "Multiple faces are currently visible."),
     "license_activated": ("Moodito", "License activated", "Your Moodito license is active."),
     "license_deactivated": ("Moodito", "License deactivated", "Your Moodito license is no longer active."),
     "app_quit": ("Moodito", "Moodito quit", "Tracking has stopped."),
@@ -308,6 +314,7 @@ EMOTION_NOTIFICATION_EVENTS = {
     "angry": "emotion_angry",
     "sad": "emotion_sad",
     NO_FACE_LABEL: "emotion_no_face",
+    MULTI_FACE_LABEL: "emotion_multiple_faces",
 }
 
 
@@ -2348,7 +2355,7 @@ class MooditoApp(rumps.App):
         self._update_privacy(face_present)
         self._update_break_timer(face_present)
         if self._worker.ready:
-            self._notify_emotion_transition(result.label)
+            self._notify_emotion_transition(result.label, result.face_count)
         self._render_emotion(result)
         self._detected_item.title = (
             f"Detected: {result.display_label}"
@@ -2766,7 +2773,7 @@ class MooditoApp(rumps.App):
         """Compatibility wrapper for Privacy transition notifications."""
         self._send_notification(event)
 
-    def _notify_emotion_transition(self, label: str) -> None:
+    def _notify_emotion_transition(self, label: str, face_count: int = 1) -> None:
         """Notify once when the detected facial state changes."""
         if label == self._last_notified_emotion:
             return
@@ -2774,7 +2781,12 @@ class MooditoApp(rumps.App):
         event = EMOTION_NOTIFICATION_EVENTS.get(label)
         if event is None:
             return
-        self._send_notification(event)
+        message = (
+            f"{face_count} faces are currently visible."
+            if label == MULTI_FACE_LABEL and face_count > 1
+            else None
+        )
+        self._send_notification(event, message)
 
     def open_notifications_window(self, _sender) -> None:
         """Show the native grouped notification preferences dialog."""

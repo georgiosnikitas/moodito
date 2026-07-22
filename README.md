@@ -74,9 +74,9 @@ Everything lives in the menu bar dropdown — small, fast, and out of your way.
 - **🔔 Configurable notifications** — independently control notifications for
   Privacy audio and screen brightness, Break Timer start/finish, data-range and
   export actions, Mood Tips and PDFs, settings changes, pause/resume, each
-  detected emotion, license changes, and quitting. The grouped, scrollable
-  settings window includes Enable All / Disable All controls and a live enabled
-  count.
+  detected emotion, multiple-face detection, license changes, and quitting. The
+  grouped, scrollable settings window includes Enable All / Disable All controls
+  and a live enabled count.
 - **🖼️ Customisable display** — toggle **Show Emojis** and **Show Labels**
   independently, or fall back to the clean Moodito icon.
 - **⏸️ Pause / Resume** — instantly stop processing webcam frames whenever you

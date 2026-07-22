@@ -1753,6 +1753,10 @@ class TestRefresh:
     def test_multiple_faces_update_menu_detected_row_and_insights_state(
         self, full_app
     ) -> None:
+        transitions = []
+        full_app._notify_emotion_transition = (
+            lambda label, face_count=1: transitions.append((label, face_count))
+        )
         full_app._worker._set_result(
             EmotionResult(app.MULTI_FACE_LABEL, 1.0, face_count=3)
         )
@@ -1763,6 +1767,7 @@ class TestRefresh:
         assert full_app._detected_item.title == "Detected: 3 faces"
         assert full_app._raw_buffer[-1][1] == app.MULTI_FACE_LABEL
         assert full_app._stats[app.MULTI_FACE_LABEL]["count"] == 1
+        assert transitions == [(app.MULTI_FACE_LABEL, 3)]
 
     def test_paused_records_paused_state(self, full_app) -> None:
         full_app._paused = True
@@ -1929,6 +1934,16 @@ class TestNotifications:
             for event in app.NOTIFICATION_KEYS
             if not event.startswith("emotion_")
         )
+
+    def test_multiple_faces_notification_is_in_detected_emotion_group(self) -> None:
+        detected_options = next(
+            options
+            for group, options in app.NOTIFICATION_GROUPS
+            if group == "Detected Emotion"
+        )
+        keys = [key for key, _label, _icon in detected_options]
+        assert keys[-2:] == ["emotion_no_face", "emotion_multiple_faces"]
+        assert app.DEFAULT_NOTIFICATIONS["emotion_multiple_faces"] is False
 
     def test_menu_item_precedes_sensitivity(self, full_app) -> None:
         menu_titles = list(full_app.menu.keys())
@@ -4316,6 +4331,7 @@ class TestRequestedNotificationEvents:
             "emotion_angry",
             "emotion_sad",
             "emotion_no_face",
+            "emotion_multiple_faces",
             "license_activated",
             "license_deactivated",
             "app_quit",
@@ -4350,6 +4366,25 @@ class TestRequestedNotificationEvents:
         full_app._notify_emotion_transition("happy")
 
         assert [call[1] for call in calls] == ["Happy detected", "Happy detected"]
+
+    def test_multiple_faces_notify_once_per_transition_with_live_count(
+        self, full_app, monkeypatch
+    ) -> None:
+        calls = _capture_notifications(
+            full_app,
+            monkeypatch,
+            "emotion_multiple_faces",
+        )
+
+        full_app._notify_emotion_transition(app.MULTI_FACE_LABEL, face_count=3)
+        full_app._notify_emotion_transition(app.MULTI_FACE_LABEL, face_count=4)
+        full_app._notify_emotion_transition("happy")
+        full_app._notify_emotion_transition(app.MULTI_FACE_LABEL, face_count=2)
+
+        assert calls == [
+            ("Moodito", "Multiple faces detected", "3 faces are currently visible."),
+            ("Moodito", "Multiple faces detected", "2 faces are currently visible."),
+        ]
 
     def test_pause_resume_sensitivity_and_ai_provider_notify(
         self, full_app, monkeypatch
