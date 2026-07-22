@@ -170,7 +170,7 @@ UI_REFRESH_INTERVAL = 0.3
 SAMPLE_INTERVAL = 0.15
 # Privacy is opt-in so upgrading Moodito never changes the system unexpectedly.
 PRIVACY_CHANNELS = ("microphone", "speakers")
-PRIVACY_ACTIONS = (*PRIVACY_CHANNELS, "lock_screen")
+PRIVACY_ACTIONS = (*PRIVACY_CHANNELS, "screen_brightness", "lock_screen")
 MAX_PRIVACY_HOURS = 23
 MAX_PRIVACY_MINUTES = 59
 MAX_PRIVACY_COMPONENT_SECONDS = 59
@@ -181,6 +181,7 @@ MAX_PRIVACY_SECONDS = (
 )
 DEFAULT_PRIVACY_MICROPHONE_SECONDS = 0
 DEFAULT_PRIVACY_SPEAKERS_SECONDS = 0
+DEFAULT_PRIVACY_SCREEN_BRIGHTNESS_SECONDS = 0
 DEFAULT_PRIVACY_LOCK_SCREEN_SECONDS = 0
 DEFAULT_BREAK_TIMER_SECONDS = 0
 DEFAULT_BREAK_TIMER_RESET_PERCENT = 0
@@ -192,15 +193,18 @@ PAUSE_SYMBOL = "pause.fill"
 PRIVACY_NOTIFICATION_TITLE = "Moodito Privacy"
 BREAK_TIMER_NOTIFICATION_TITLE = "Moodito Break Timer"
 NO_FACE_NOTIFICATION_MESSAGE = "No face was detected."
+FACE_VISIBLE_NOTIFICATION_MESSAGE = "Your face is visible again."
 # Notification events grouped in the order shown in the settings dialog.
 NOTIFICATION_GROUPS = (
     (
-        "Privacy Audio",
+        "Privacy",
         (
             ("microphone_muted", "Microphone muted", "mic.slash.fill"),
             ("microphone_unmuted", "Microphone unmuted", "mic.fill"),
             ("speakers_off", "Speakers volume off", "speaker.slash.fill"),
             ("speakers_on", "Speakers volume on", "speaker.wave.2.fill"),
+            ("brightness_dimmed", "Brightness dimmed", "sun.min.fill"),
+            ("brightness_restored", "Brightness restored", "sun.max.fill"),
         ),
     ),
     (
@@ -259,9 +263,11 @@ DEFAULT_NOTIFICATIONS = {
 }
 NOTIFICATION_MESSAGES = {
     "microphone_muted": (PRIVACY_NOTIFICATION_TITLE, "Microphone muted", NO_FACE_NOTIFICATION_MESSAGE),
-    "microphone_unmuted": (PRIVACY_NOTIFICATION_TITLE, "Microphone unmuted", "Your face is visible again."),
+    "microphone_unmuted": (PRIVACY_NOTIFICATION_TITLE, "Microphone unmuted", FACE_VISIBLE_NOTIFICATION_MESSAGE),
     "speakers_off": (PRIVACY_NOTIFICATION_TITLE, "Speakers volume off", NO_FACE_NOTIFICATION_MESSAGE),
-    "speakers_on": (PRIVACY_NOTIFICATION_TITLE, "Speakers volume on", "Your face is visible again."),
+    "speakers_on": (PRIVACY_NOTIFICATION_TITLE, "Speakers volume on", FACE_VISIBLE_NOTIFICATION_MESSAGE),
+    "brightness_dimmed": (PRIVACY_NOTIFICATION_TITLE, "Brightness dimmed", NO_FACE_NOTIFICATION_MESSAGE),
+    "brightness_restored": (PRIVACY_NOTIFICATION_TITLE, "Brightness restored", FACE_VISIBLE_NOTIFICATION_MESSAGE),
     "break_timer_started": (BREAK_TIMER_NOTIFICATION_TITLE, "Break Timer started", "Your break countdown is running."),
     "break_timer_finished": (BREAK_TIMER_NOTIFICATION_TITLE, "Break Timer finished", "It is time to take a break."),
     "data_range_changed": ("Moodito", "Data range changed", "Insights now use the selected date range."),
@@ -309,6 +315,14 @@ class PrivacyMuteResult:
 
     state: AudioState
     applied: bool
+
+
+@dataclass(frozen=True)
+class ScreenBrightnessState:
+    """Display brightness captured before Privacy dims the screen."""
+
+    display_id: int
+    level: float
 
 
 def resource_path(name: str) -> str:
@@ -1579,6 +1593,79 @@ def lock_screen_for_privacy() -> bool:
         return False
 
 
+def _screen_brightness_api():
+    """Load the native functions used to read and change display brightness."""
+    core_graphics = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+    )
+    display_services = ctypes.CDLL(
+        "/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices"
+    )
+    get_online_displays = core_graphics.CGGetOnlineDisplayList
+    get_online_displays.argtypes = [
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    get_online_displays.restype = ctypes.c_int32
+    get_brightness = display_services.DisplayServicesGetBrightness
+    get_brightness.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_float)]
+    get_brightness.restype = ctypes.c_int32
+    set_brightness = display_services.DisplayServicesSetBrightness
+    set_brightness.argtypes = [ctypes.c_uint32, ctypes.c_float]
+    set_brightness.restype = ctypes.c_int32
+    return get_online_displays, get_brightness, set_brightness
+
+
+def _online_display_ids(get_online_displays) -> tuple[int, ...]:
+    """Return the Core Graphics IDs of all online displays."""
+    count = ctypes.c_uint32()
+    if get_online_displays(0, None, ctypes.byref(count)) != 0 or count.value == 0:
+        return ()
+    display_ids = (ctypes.c_uint32 * count.value)()
+    actual_count = ctypes.c_uint32()
+    if (
+        get_online_displays(count.value, display_ids, ctypes.byref(actual_count))
+        != 0
+    ):
+        return ()
+    return tuple(
+        int(display_ids[index])
+        for index in range(min(count.value, actual_count.value))
+    )
+
+
+def dim_screens_for_privacy() -> tuple[ScreenBrightnessState, ...]:
+    """Set every supported online display to zero and return prior levels."""
+    try:
+        get_online_displays, get_brightness, set_brightness = _screen_brightness_api()
+        display_ids = _online_display_ids(get_online_displays)
+    except (AttributeError, OSError, ctypes.ArgumentError):
+        return ()
+
+    states = []
+    for display_id in display_ids:
+        level = ctypes.c_float()
+        try:
+            if get_brightness(display_id, ctypes.byref(level)) != 0:
+                continue
+            if set_brightness(display_id, 0.0) != 0:
+                continue
+        except (OSError, ctypes.ArgumentError):
+            continue
+        states.append(ScreenBrightnessState(display_id=display_id, level=level.value))
+    return tuple(states)
+
+
+def restore_screen_brightness(state: ScreenBrightnessState) -> bool:
+    """Restore a display brightness level captured by Privacy."""
+    try:
+        _get_online_displays, _get_brightness, set_brightness = _screen_brightness_api()
+        return set_brightness(state.display_id, state.level) == 0
+    except (AttributeError, OSError, ctypes.ArgumentError):
+        return False
+
+
 def _capture_audio_state(microphone: bool, speakers: bool) -> AudioState | None:
     """Read the current macOS audio state for the channels Privacy will mute."""
     ok, output = _run_osascript(
@@ -1773,7 +1860,7 @@ class MooditoApp(rumps.App):
         legacy_icon_only = bool(self._settings.get("icon_only", False))
         self._show_emojis = bool(self._settings.get("show_emojis", not legacy_icon_only))
         self._show_labels = bool(self._settings.get("show_labels", not legacy_icon_only))
-        # Each Privacy audio transition has its own persisted notification toggle.
+        # Each Privacy transition has its own persisted notification toggle.
         self._notifications = self._load_notifications()
         self._notifications_handler = None
         self._last_notified_emotion: str | None = None
@@ -1788,6 +1875,7 @@ class MooditoApp(rumps.App):
         self._privacy_attempted: set[str] = set()
         self._privacy_audio_states: dict[str, AudioState] = {}
         self._privacy_changed_channels: set[str] = set()
+        self._privacy_brightness_states: tuple[ScreenBrightnessState, ...] = ()
         self._privacy_stepper_handler = None
         # Break Timer is persisted and restarts after each reminder is dismissed.
         self._break_timer = self._load_break_timer()
@@ -2968,6 +3056,7 @@ class MooditoApp(rumps.App):
         privacy = {
             "microphone_seconds": DEFAULT_PRIVACY_MICROPHONE_SECONDS,
             "speakers_seconds": DEFAULT_PRIVACY_SPEAKERS_SECONDS,
+            "screen_brightness_seconds": DEFAULT_PRIVACY_SCREEN_BRIGHTNESS_SECONDS,
             "lock_screen_seconds": DEFAULT_PRIVACY_LOCK_SCREEN_SECONDS,
         }
         stored = self._settings.get("privacy")
@@ -3016,6 +3105,7 @@ class MooditoApp(rumps.App):
         self,
         microphone_seconds: int,
         speakers_seconds: int,
+        screen_brightness_seconds: int,
         lock_screen_seconds: int,
     ) -> bool:
         """Validate, apply, and persist Privacy settings."""
@@ -3024,6 +3114,7 @@ class MooditoApp(rumps.App):
             for value in (
                 microphone_seconds,
                 speakers_seconds,
+                screen_brightness_seconds,
                 lock_screen_seconds,
             )
         ):
@@ -3031,6 +3122,7 @@ class MooditoApp(rumps.App):
         privacy = {
             "microphone_seconds": microphone_seconds,
             "speakers_seconds": speakers_seconds,
+            "screen_brightness_seconds": screen_brightness_seconds,
             "lock_screen_seconds": lock_screen_seconds,
         }
         if privacy == self._privacy:
@@ -3042,11 +3134,12 @@ class MooditoApp(rumps.App):
         save_settings(self._settings)
         microphone_text = format_privacy_delay(microphone_seconds)
         speakers_text = format_privacy_delay(speakers_seconds)
+        screen_brightness_text = format_privacy_delay(screen_brightness_seconds)
         lock_screen_text = format_privacy_delay(lock_screen_seconds)
         self._send_notification(
             "privacy_settings_changed",
             f"Microphone: {microphone_text}; Speakers: {speakers_text}; "
-            f"Lock screen: {lock_screen_text}.",
+            f"Brightness: {screen_brightness_text}; Lock screen: {lock_screen_text}.",
         )
         return True
 
@@ -3071,10 +3164,27 @@ class MooditoApp(rumps.App):
         return restored_all
 
     def _reset_privacy(self) -> bool:
-        """Cancel the absence timer and restore audio if Privacy was active."""
+        """Cancel the absence timer and restore active Privacy changes."""
         self._privacy_no_face_since = None
         self._privacy_attempted.clear()
-        return self._restore_privacy_audio()
+        audio_restored = self._restore_privacy_audio()
+        brightness_restored = self._restore_privacy_screen_brightness()
+        return audio_restored and brightness_restored
+
+    def _restore_privacy_screen_brightness(self) -> bool:
+        """Restore every brightness level captured when Privacy dimmed screens."""
+        states = self._privacy_brightness_states
+        if not states:
+            return True
+        failed_states = tuple(
+            state for state in states if not restore_screen_brightness(state)
+        )
+        self._privacy_brightness_states = failed_states
+        if failed_states:
+            return False
+        if any(state.level > 0 for state in states):
+            self._send_privacy_notification("brightness_restored")
+        return True
 
     def _update_privacy(self, face_present: bool, now: float | None = None) -> None:
         """Advance Privacy for the current face-presence observation."""
@@ -3088,6 +3198,7 @@ class MooditoApp(rumps.App):
         elapsed = current_time - self._privacy_no_face_since
         for channel in PRIVACY_CHANNELS:
             self._activate_privacy_channel(channel, elapsed)
+        self._activate_privacy_screen_brightness(elapsed)
         self._activate_privacy_screen_lock(elapsed)
 
     def _activate_privacy_channel(self, channel: str, elapsed: float) -> None:
@@ -3118,6 +3229,24 @@ class MooditoApp(rumps.App):
             self._privacy_changed_channels.add(channel)
             event = "microphone_muted" if microphone else "speakers_off"
             self._send_privacy_notification(event)
+
+    def _activate_privacy_screen_brightness(self, elapsed: float) -> None:
+        """Dim the screen once its configured no-face delay has elapsed."""
+        action = "screen_brightness"
+        delay = self._privacy[f"{action}_seconds"]
+        if (
+            delay == 0
+            or elapsed < delay
+            or action in self._privacy_attempted
+            or bool(self._privacy_brightness_states)
+        ):
+            return
+        self._privacy_attempted.add(action)
+        states = dim_screens_for_privacy()
+        if states:
+            self._privacy_brightness_states = states
+            if any(state.level > 0 for state in states):
+                self._send_privacy_notification("brightness_dimmed")
 
     def _activate_privacy_screen_lock(self, elapsed: float) -> None:
         """Lock the screen once its configured no-face delay has elapsed."""
@@ -3178,9 +3307,7 @@ class MooditoApp(rumps.App):
                 return None
             return hours * 3600 + minutes * 60 + seconds
 
-        delays = tuple(
-            total_seconds(action) for action in ("microphone", "speakers", "lock_screen")
-        )
+        delays = tuple(total_seconds(action) for action in PRIVACY_ACTIONS)
         if any(delay is None for delay in delays):
             return False
 
@@ -3223,6 +3350,7 @@ class MooditoApp(rumps.App):
         rows = (
             ("Mute microphone", "microphone", "mic.fill"),
             ("Mute speakers", "speakers", "speaker.wave.2.fill"),
+            ("Dim screen", "screen_brightness", "sun.min.fill"),
             ("Lock screen", "lock_screen", "lock.fill"),
         )
         components = (

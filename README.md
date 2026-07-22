@@ -55,9 +55,10 @@ Everything lives in the menu bar dropdown — small, fast, and out of your way.
 - **🎚️ Adjustable sensitivity** — fine-tune detection per emotion (Low / Normal /
   High) so Moodito reads *your* face the way you want.
 - **🔒 Automatic Privacy** — set independent no-face delays for microphone mute,
-  speaker mute, and screen lock using hours (`0–23`), minutes (`0–59`), and
-  seconds (`0–59`). All three at `0` disables that action. When your face
-  returns, Moodito restores the exact audio levels and speaker mute state that
+  speaker mute, dimming every connected screen, and screen lock using hours
+  (`0–23`), minutes (`0–59`), and seconds (`0–59`). Setting all three counters
+  to `0` disables that action. When your face returns, Moodito restores each
+  screen's exact brightness, plus the audio levels and speaker mute state that
   were active before Privacy engaged.
 - **⏱️ Break Timer** — set a countdown in hours, minutes, and seconds. An active
   timer shows a clock in the macOS menu bar and its remaining time beside the
@@ -66,10 +67,11 @@ Everything lives in the menu bar dropdown — small, fast, and out of your way.
   configurable `0–99%` no-face threshold resets the countdown after a
   sufficiently long time away.
 - **🔔 Configurable notifications** — independently control notifications for
-  Privacy audio, Break Timer start/finish, data-range and export actions, Mood
-  Tips and PDFs, settings changes, pause/resume, each detected emotion, license
-  changes, and quitting. The grouped, scrollable settings window includes
-  Enable All / Disable All controls and a live enabled count.
+  Privacy audio and screen brightness, Break Timer start/finish, data-range and
+  export actions, Mood Tips and PDFs, settings changes, pause/resume, each
+  detected emotion, license changes, and quitting. The grouped, scrollable
+  settings window includes Enable All / Disable All controls and a live enabled
+  count.
 - **🖼️ Customisable display** — toggle **Show Emojis** and **Show Labels**
   independently, or fall back to the clean Moodito icon.
 - **⏸️ Pause / Resume** — instantly stop processing webcam frames whenever you

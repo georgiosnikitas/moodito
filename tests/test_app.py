@@ -363,6 +363,119 @@ class TestPrivacyAudio:
         monkeypatch.setattr(app.ctypes, "CDLL", unavailable)
         assert app.lock_screen_for_privacy() is False
 
+    def test_dim_screens_captures_levels_and_sets_all_brightness_to_zero(
+        self, monkeypatch
+    ) -> None:
+        calls = []
+
+        class FakeFunction:
+            def __init__(self, callback):
+                self.callback = callback
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                return self.callback(*args)
+
+        def get_online_displays(max_displays, display_ids, display_count):
+            calls.append(("online", max_displays))
+            display_count._obj.value = 2
+            if display_ids is not None:
+                display_ids[0] = 42
+                display_ids[1] = 84
+            return 0
+
+        def get_brightness(display_id, level_pointer):
+            calls.append(("get", display_id))
+            level_pointer._obj.value = {42: 0.75, 84: 0.5}[display_id]
+            return 0
+
+        def set_brightness(display_id, level):
+            calls.append(("set", display_id, level))
+            return 0
+
+        core_graphics = type(
+            "FakeCoreGraphics",
+            (),
+            {"CGGetOnlineDisplayList": FakeFunction(get_online_displays)},
+        )()
+        display_services = type(
+            "FakeDisplayServices",
+            (),
+            {
+                "DisplayServicesGetBrightness": FakeFunction(get_brightness),
+                "DisplayServicesSetBrightness": FakeFunction(set_brightness),
+            },
+        )()
+
+        def load_framework(path):
+            if path.endswith("CoreGraphics.framework/CoreGraphics"):
+                return core_graphics
+            if path.endswith("DisplayServices.framework/DisplayServices"):
+                return display_services
+            raise OSError(path)
+
+        monkeypatch.setattr(app.ctypes, "CDLL", load_framework)
+
+        assert app.dim_screens_for_privacy() == (
+            app.ScreenBrightnessState(display_id=42, level=0.75),
+            app.ScreenBrightnessState(display_id=84, level=0.5),
+        )
+        assert calls == [
+            ("online", 0),
+            ("online", 2),
+            ("get", 42),
+            ("set", 42, 0.0),
+            ("get", 84),
+            ("set", 84, 0.0),
+        ]
+
+    def test_dim_screens_skips_external_and_dims_mirrored_builtin(
+        self, monkeypatch
+    ) -> None:
+        calls = []
+
+        def get_brightness(display_id, level_pointer):
+            calls.append(("get", display_id))
+            if display_id == 2:
+                return 1
+            level_pointer._obj.value = 0.5
+            return 0
+
+        def set_brightness(display_id, level):
+            calls.append(("set", display_id, level))
+            return 0
+
+        monkeypatch.setattr(
+            app,
+            "_screen_brightness_api",
+            lambda: (object(), get_brightness, set_brightness),
+        )
+        monkeypatch.setattr(app, "_online_display_ids", lambda _function: (2, 1))
+
+        assert app.dim_screens_for_privacy() == (
+            app.ScreenBrightnessState(display_id=1, level=0.5),
+        )
+        assert calls == [("get", 2), ("get", 1), ("set", 1, 0.0)]
+
+    def test_restore_screen_brightness_uses_captured_display_and_level(
+        self, monkeypatch
+    ) -> None:
+        calls = []
+        monkeypatch.setattr(
+            app,
+            "_screen_brightness_api",
+            lambda: (
+                None,
+                None,
+                lambda display_id, level: calls.append((display_id, level)) or 0,
+            ),
+        )
+
+        state = app.ScreenBrightnessState(display_id=42, level=0.75)
+        assert app.restore_screen_brightness(state) is True
+        assert calls == [(42, 0.75)]
+
     def test_capture_reads_only_selected_channels(self, monkeypatch) -> None:
         monkeypatch.setattr(
             app,
@@ -471,12 +584,14 @@ def _bare_app():
     inst._privacy = {
         "microphone_seconds": app.DEFAULT_PRIVACY_MICROPHONE_SECONDS,
         "speakers_seconds": app.DEFAULT_PRIVACY_SPEAKERS_SECONDS,
-            "lock_screen_seconds": app.DEFAULT_PRIVACY_LOCK_SCREEN_SECONDS,
+        "screen_brightness_seconds": app.DEFAULT_PRIVACY_SCREEN_BRIGHTNESS_SECONDS,
+        "lock_screen_seconds": app.DEFAULT_PRIVACY_LOCK_SCREEN_SECONDS,
     }
     inst._privacy_no_face_since = None
     inst._privacy_attempted = set()
     inst._privacy_audio_states = {}
     inst._privacy_changed_channels = set()
+    inst._privacy_brightness_states = ()
     inst._privacy_stepper_handler = None
     inst._license_active = True
     inst._range_stats = {k: {"seconds": 0.0, "count": 0} for k in app.STAT_KEYS}
@@ -1866,6 +1981,7 @@ class TestNotifications:
         full_app._privacy = {
             "microphone_seconds": 1,
             "speakers_seconds": 1,
+            "screen_brightness_seconds": 0,
             "lock_screen_seconds": 0,
         }
 
@@ -1898,12 +2014,91 @@ class TestNotifications:
             "Speakers volume on",
         ]
 
+    def test_brightness_transition_sends_dimmed_and_restored_notifications(
+        self, full_app, monkeypatch
+    ) -> None:
+        full_app._privacy = {
+            "microphone_seconds": 0,
+            "speakers_seconds": 0,
+            "screen_brightness_seconds": 1,
+            "lock_screen_seconds": 0,
+        }
+        brightness_states = (
+            app.ScreenBrightnessState(display_id=42, level=0.75),
+            app.ScreenBrightnessState(display_id=84, level=0.4),
+        )
+        monkeypatch.setattr(app, "dim_screens_for_privacy", lambda: brightness_states)
+        monkeypatch.setattr(app, "restore_screen_brightness", lambda state: True)
+        events = []
+        monkeypatch.setattr(
+            full_app,
+            "_send_privacy_notification",
+            lambda event: events.append(event),
+        )
+
+        full_app._update_privacy(False, now=1.0)
+        full_app._update_privacy(False, now=2.0)
+        full_app._update_privacy(True, now=3.0)
+
+        assert events == ["brightness_dimmed", "brightness_restored"]
+
+    def test_brightness_notifications_use_expected_messages(
+        self, full_app, monkeypatch
+    ) -> None:
+        calls = []
+        monkeypatch.setattr(
+            app.rumps,
+            "notification",
+            lambda *args, **kwargs: calls.append(args),
+        )
+
+        full_app._send_privacy_notification("brightness_dimmed")
+        full_app._send_privacy_notification("brightness_restored")
+
+        assert calls == [
+            ("Moodito Privacy", "Brightness dimmed", "No face was detected."),
+            (
+                "Moodito Privacy",
+                "Brightness restored",
+                "Your face is visible again.",
+            ),
+        ]
+
+    def test_already_dimmed_screen_does_not_notify(
+        self, full_app, monkeypatch
+    ) -> None:
+        full_app._privacy = {
+            "microphone_seconds": 0,
+            "speakers_seconds": 0,
+            "screen_brightness_seconds": 1,
+            "lock_screen_seconds": 0,
+        }
+        brightness_states = (
+            app.ScreenBrightnessState(display_id=42, level=0.0),
+            app.ScreenBrightnessState(display_id=84, level=0.0),
+        )
+        monkeypatch.setattr(app, "dim_screens_for_privacy", lambda: brightness_states)
+        monkeypatch.setattr(app, "restore_screen_brightness", lambda state: True)
+        events = []
+        monkeypatch.setattr(
+            full_app,
+            "_send_privacy_notification",
+            lambda event: events.append(event),
+        )
+
+        full_app._update_privacy(False, now=1.0)
+        full_app._update_privacy(False, now=2.0)
+        full_app._update_privacy(True, now=3.0)
+
+        assert events == []
+
     def test_already_silent_channels_do_not_notify(
         self, full_app, monkeypatch
     ) -> None:
         full_app._privacy = {
             "microphone_seconds": 1,
             "speakers_seconds": 1,
+            "screen_brightness_seconds": 0,
             "lock_screen_seconds": 0,
         }
 
@@ -2070,8 +2265,12 @@ class TestPrivacy:
         assert full_app._privacy == {
             "microphone_seconds": 0,
             "speakers_seconds": 0,
+            "screen_brightness_seconds": 0,
             "lock_screen_seconds": 0,
         }
+
+    def test_brightness_action_precedes_screen_lock(self) -> None:
+        assert app.PRIVACY_ACTIONS[-2:] == ("screen_brightness", "lock_screen")
 
     def test_menu_item_opens_window(self, full_app) -> None:
         assert full_app._privacy_menu.title.startswith("Privacy")
@@ -2090,10 +2289,11 @@ class TestPrivacy:
             "_send_notification",
             lambda event, message=None: notifications.append((event, message)),
         )
-        assert full_app._apply_privacy(15, 90, 300) is True
+        assert full_app._apply_privacy(15, 90, 120, 300) is True
         assert full_app._privacy == {
             "microphone_seconds": 15,
             "speakers_seconds": 90,
+            "screen_brightness_seconds": 120,
             "lock_screen_seconds": 300,
         }
         assert saved[-1]["privacy"] == full_app._privacy
@@ -2101,7 +2301,7 @@ class TestPrivacy:
             (
                 "privacy_settings_changed",
                 "Microphone: 0h 0m 15s; Speakers: 0h 1m 30s; "
-                "Lock screen: 0h 5m 0s.",
+                "Brightness: 0h 2m 0s; Lock screen: 0h 5m 0s.",
             )
         ]
 
@@ -2115,12 +2315,12 @@ class TestPrivacy:
             "_send_notification",
             lambda event, message=None: notifications.append((event, message)),
         )
-        assert full_app._apply_privacy(0, 30, 0) is True
+        assert full_app._apply_privacy(0, 30, 0, 0) is True
         assert notifications == [
             (
                 "privacy_settings_changed",
                 "Microphone: Disabled; Speakers: 0h 0m 30s; "
-                "Lock screen: Disabled.",
+                "Brightness: Disabled; Lock screen: Disabled.",
             )
         ]
 
@@ -2133,25 +2333,27 @@ class TestPrivacy:
             "_send_notification",
             lambda event, message=None: notifications.append((event, message)),
         )
-        assert full_app._apply_privacy(0, 0, 0) is True
-        assert full_app._apply_privacy(-1, 0, 0) is False
+        assert full_app._apply_privacy(0, 0, 0, 0) is True
+        assert full_app._apply_privacy(-1, 0, 0, 0) is False
         full_app._privacy_audio_states = {
             "microphone": app.AudioState(input_volume=55)
         }
         monkeypatch.setattr(app, "restore_audio_state", lambda state: False)
-        assert full_app._apply_privacy(10, 0, 0) is False
+        assert full_app._apply_privacy(10, 0, 0, 0) is False
         assert notifications == []
 
     @pytest.mark.parametrize(
-        "microphone_seconds,speakers_seconds,lock_screen_seconds",
+        "microphone_seconds,speakers_seconds,screen_brightness_seconds,lock_screen_seconds",
         [
-            (-1, 0, 0),
-            (0, -1, 0),
-            (0, 0, -1),
-            (86400, 0, 0),
-            (0, 86400, 0),
-            (0, 0, 86400),
-            (True, 1, 1),
+            (-1, 0, 0, 0),
+            (0, -1, 0, 0),
+            (0, 0, -1, 0),
+            (0, 0, 0, -1),
+            (86400, 0, 0, 0),
+            (0, 86400, 0, 0),
+            (0, 0, 86400, 0),
+            (0, 0, 0, 86400),
+            (True, 1, 1, 1),
         ],
     )
     def test_apply_rejects_invalid_delay(
@@ -2160,6 +2362,7 @@ class TestPrivacy:
         monkeypatch,
         microphone_seconds,
         speakers_seconds,
+        screen_brightness_seconds,
         lock_screen_seconds,
     ) -> None:
         saved = []
@@ -2168,6 +2371,7 @@ class TestPrivacy:
             full_app._apply_privacy(
                 microphone_seconds,
                 speakers_seconds,
+                screen_brightness_seconds,
                 lock_screen_seconds,
             )
             is False
@@ -2185,6 +2389,9 @@ class TestPrivacy:
             "speakers_hours": _FakeIntegerControl(0),
             "speakers_minutes": _FakeIntegerControl(59),
             "speakers_seconds": _FakeIntegerControl(59),
+            "screen_brightness_hours": _FakeIntegerControl(4),
+            "screen_brightness_minutes": _FakeIntegerControl(5),
+            "screen_brightness_seconds": _FakeIntegerControl(6),
             "lock_screen_hours": _FakeIntegerControl(23),
             "lock_screen_minutes": _FakeIntegerControl(59),
             "lock_screen_seconds": _FakeIntegerControl(59),
@@ -2193,6 +2400,7 @@ class TestPrivacy:
         assert full_app._privacy == {
             "microphone_seconds": 3723,
             "speakers_seconds": 3599,
+            "screen_brightness_seconds": 14706,
             "lock_screen_seconds": 86399,
         }
 
@@ -2224,6 +2432,7 @@ class TestPrivacy:
         full_app._privacy = {
             "microphone_seconds": 3723,
             "speakers_seconds": 3598,
+            "screen_brightness_seconds": 7322,
             "lock_screen_seconds": 86399,
         }
         _view, controls = full_app._build_privacy_accessory()
@@ -2233,6 +2442,9 @@ class TestPrivacy:
         assert controls["speakers_hours"].integerValue() == 0
         assert controls["speakers_minutes"].integerValue() == 59
         assert controls["speakers_seconds"].integerValue() == 58
+        assert controls["screen_brightness_hours"].integerValue() == 2
+        assert controls["screen_brightness_minutes"].integerValue() == 2
+        assert controls["screen_brightness_seconds"].integerValue() == 2
         assert controls["lock_screen_hours"].integerValue() == 23
         assert controls["lock_screen_minutes"].integerValue() == 59
         assert controls["lock_screen_seconds"].integerValue() == 59
@@ -2272,6 +2484,7 @@ class TestPrivacy:
                 "privacy": {
                     "microphone_seconds": 240,
                     "speakers_seconds": 20,
+                    "screen_brightness_seconds": 75,
                     "lock_screen_seconds": 450,
                 }
             }
@@ -2282,6 +2495,30 @@ class TestPrivacy:
         assert inst._privacy == {
             "microphone_seconds": 240,
             "speakers_seconds": 20,
+            "screen_brightness_seconds": 75,
+            "lock_screen_seconds": 450,
+        }
+
+    def test_load_existing_settings_defaults_brightness_to_disabled(
+        self, data_dir, monkeypatch
+    ) -> None:
+        app.save_settings(
+            {
+                "privacy": {
+                    "microphone_seconds": 240,
+                    "speakers_seconds": 20,
+                    "lock_screen_seconds": 450,
+                }
+            }
+        )
+        monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+
+        inst = app.MooditoApp()
+        assert inst._privacy == {
+            "microphone_seconds": 240,
+            "speakers_seconds": 20,
+            "screen_brightness_seconds": 0,
             "lock_screen_seconds": 450,
         }
 
@@ -2304,6 +2541,7 @@ class TestPrivacy:
         assert inst._privacy == {
             "microphone_seconds": 125,
             "speakers_seconds": 0,
+            "screen_brightness_seconds": 0,
             "lock_screen_seconds": 0,
         }
 
@@ -2324,6 +2562,7 @@ class TestPrivacy:
         assert inst._privacy == {
             "microphone_seconds": app.DEFAULT_PRIVACY_MICROPHONE_SECONDS,
             "speakers_seconds": app.DEFAULT_PRIVACY_SPEAKERS_SECONDS,
+            "screen_brightness_seconds": app.DEFAULT_PRIVACY_SCREEN_BRIGHTNESS_SECONDS,
             "lock_screen_seconds": app.DEFAULT_PRIVACY_LOCK_SCREEN_SECONDS,
         }
 
@@ -2333,6 +2572,7 @@ class TestPrivacy:
         full_app._privacy = {
             "microphone_seconds": 5,
             "speakers_seconds": 10,
+            "screen_brightness_seconds": 0,
             "lock_screen_seconds": 0,
         }
         calls = []
@@ -2365,6 +2605,7 @@ class TestPrivacy:
         full_app._privacy = {
             "microphone_seconds": 0,
             "speakers_seconds": 5,
+            "screen_brightness_seconds": 0,
             "lock_screen_seconds": 0,
         }
         calls = []
@@ -2386,6 +2627,7 @@ class TestPrivacy:
         full_app._privacy = {
             "microphone_seconds": 0,
             "speakers_seconds": 0,
+            "screen_brightness_seconds": 0,
             "lock_screen_seconds": 5,
         }
         calls = []
@@ -2407,12 +2649,70 @@ class TestPrivacy:
         full_app._update_privacy(False, now=25.0)
         assert calls == ["lock", "lock"]
 
+    def test_screen_dims_before_lock_and_restores_when_face_returns(
+        self, full_app, monkeypatch
+    ) -> None:
+        full_app._privacy = {
+            "microphone_seconds": 0,
+            "speakers_seconds": 0,
+            "screen_brightness_seconds": 5,
+            "lock_screen_seconds": 5,
+        }
+        full_app._privacy_brightness_states = ()
+        brightness_states = (
+            app.ScreenBrightnessState(display_id=42, level=0.75),
+            app.ScreenBrightnessState(display_id=84, level=0.4),
+        )
+        calls = []
+        monkeypatch.setattr(
+            app,
+            "dim_screens_for_privacy",
+            lambda: calls.append("dim") or brightness_states,
+        )
+        monkeypatch.setattr(
+            app,
+            "lock_screen_for_privacy",
+            lambda: calls.append("lock") or True,
+        )
+        monkeypatch.setattr(
+            app,
+            "restore_screen_brightness",
+            lambda state: calls.append(("restore", state.display_id)) or True,
+        )
+
+        full_app._update_privacy(False, now=10.0)
+        full_app._update_privacy(False, now=15.0)
+        assert calls == ["dim", "lock"]
+
+        full_app._update_privacy(True, now=16.0)
+        assert calls == ["dim", "lock", ("restore", 42), ("restore", 84)]
+        assert full_app._privacy_brightness_states == ()
+
+    def test_failed_display_restore_is_retained_for_retry(
+        self, full_app, monkeypatch
+    ) -> None:
+        first_state = app.ScreenBrightnessState(display_id=42, level=0.75)
+        second_state = app.ScreenBrightnessState(display_id=84, level=0.4)
+        full_app._privacy_brightness_states = (first_state, second_state)
+        attempts = []
+
+        def restore(state):
+            attempts.append(state.display_id)
+            return state.display_id == 42
+
+        monkeypatch.setattr(app, "restore_screen_brightness", restore)
+
+        assert full_app._restore_privacy_screen_brightness() is False
+        assert attempts == [42, 84]
+        assert full_app._privacy_brightness_states == (second_state,)
+
     def test_screen_lock_retries_after_failed_attempt(
         self, full_app, monkeypatch
     ) -> None:
         full_app._privacy = {
             "microphone_seconds": 0,
             "speakers_seconds": 0,
+            "screen_brightness_seconds": 0,
             "lock_screen_seconds": 1,
         }
         results = iter((False, True))
@@ -2453,6 +2753,7 @@ class TestPrivacy:
         full_app._privacy = {
             "microphone_seconds": 0,
             "speakers_seconds": 5,
+            "screen_brightness_seconds": 0,
             "lock_screen_seconds": 0,
         }
         calls = []
@@ -2478,6 +2779,7 @@ class TestPrivacy:
         full_app._privacy = {
             "microphone_seconds": 1,
             "speakers_seconds": 0,
+            "screen_brightness_seconds": 0,
             "lock_screen_seconds": 0,
         }
         calls = []
@@ -3885,6 +4187,8 @@ class TestRequestedNotificationEvents:
             "microphone_unmuted",
             "speakers_off",
             "speakers_on",
+            "brightness_dimmed",
+            "brightness_restored",
             "break_timer_started",
             "break_timer_finished",
             "data_range_changed",
