@@ -22,22 +22,27 @@ lives one click away in your menu bar.
 
 Emotion recognition is powered by **Google's MediaPipe Face Landmarker**, which
 produces ARKit-style facial *blendshapes*. Moodito maps those blendshapes to a
-small set of coarse emotions: happy, sad, surprised, angry, and neutral.
+small set of coarse emotions: happy, sad, surprised, angry, and neutral. It can
+detect up to five faces in a frame and switches to a live face count whenever
+more than one person is visible.
 
 ## Features
 
 Everything lives in the menu bar dropdown — small, fast, and out of your way.
 
 - **🙂 Live emotion in the menu bar** — your current mood shown as an emoji +
-  label (e.g. `😀 happy`), refreshed several times a second. The top **Detected**
-  row shows the recognised emotion and its confidence.
+  label (e.g. `😀 happy`), refreshed several times a second. With multiple
+  people in view it shows the multi-face icon and count (e.g. `👥 3 faces`). The
+  top **Detected** row shows the recognised emotion and its confidence, or the
+  current face count.
 - **📊 Insights submenu** — a rich, at-a-glance dashboard built entirely from
   your own on-device history:
   - **Activity chart** — how much you've been at your Mac, by hour of day.
   - **Emotion heatmap** — a per-emotion grid across the hours of the day, so you
     can spot when you tend to be happy, stressed, or focused.
-  - **Statistics table** — time spent and occurrences for every state (happy,
-    sad, surprised, angry, neutral, no face, paused, error) plus totals.
+  - **Statistics table** — time spent and occurrences for every state (neutral,
+    happy, surprised, angry, sad, no face, 2+ faces, paused, error) plus totals.
+    The multi-face row appears immediately after no-face.
 - **🕒 Selectable date range** — by default the insights cover a live, sliding
   **Last 24 Hours** window. With an active license you can turn that off and use
   **Since** / **Range…** to compute the insights over any custom start/end you

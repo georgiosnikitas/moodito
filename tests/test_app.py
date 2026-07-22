@@ -615,6 +615,28 @@ def _bare_app():
 
 
 class TestStatsAccumulation:
+    def test_insights_rows_follow_display_order(self, full_app) -> None:
+        expected = [
+            "neutral",
+            "happy",
+            "surprised",
+            "angry",
+            "sad",
+            app.NO_FACE_LABEL,
+            app.MULTI_FACE_LABEL,
+            "paused",
+            "error",
+        ]
+        assert app.STAT_KEYS == expected
+        assert list(full_app._stats_heatmap_items) == expected
+        assert list(full_app._stats_items) == expected
+        assert app.STAT_EMOJI[app.MULTI_FACE_LABEL] == "👥"
+        assert full_app._stats_items[app.MULTI_FACE_LABEL]._menuitem.image() is not None
+        assert (
+            full_app._stats_heatmap_items[app.MULTI_FACE_LABEL]._menuitem.image()
+            is not None
+        )
+
     def test_accumulate_adds_time_and_counts_changes(self, monkeypatch) -> None:
         monkeypatch.setattr(app, "save_stats", lambda *a, **k: None)
         inst = _bare_app()
@@ -1728,6 +1750,20 @@ class TestRefresh:
         assert "happy" in full_app._detected_item.title
         assert full_app._raw_buffer[-1][1] == "happy"
 
+    def test_multiple_faces_update_menu_detected_row_and_insights_state(
+        self, full_app
+    ) -> None:
+        full_app._worker._set_result(
+            EmotionResult(app.MULTI_FACE_LABEL, 1.0, face_count=3)
+        )
+
+        full_app.refresh(None)
+
+        assert full_app.title == "👥 3 faces"
+        assert full_app._detected_item.title == "Detected: 3 faces"
+        assert full_app._raw_buffer[-1][1] == app.MULTI_FACE_LABEL
+        assert full_app._stats[app.MULTI_FACE_LABEL]["count"] == 1
+
     def test_paused_records_paused_state(self, full_app) -> None:
         full_app._paused = True
         full_app.refresh(None)
@@ -1767,6 +1803,18 @@ class TestRenderStatus:
         full_app._last_render = None
         full_app._render_emotion(EmotionResult("happy", 0.8))
         assert full_app.title == "😀 happy"
+        assert full_app.icon is None
+
+    def test_multiple_faces_show_icon_and_dynamic_count(self, full_app) -> None:
+        full_app._show_emojis = True
+        full_app._show_labels = True
+        full_app._last_render = None
+
+        full_app._render_emotion(
+            EmotionResult(app.MULTI_FACE_LABEL, 1.0, face_count=3)
+        )
+
+        assert full_app.title == "👥 3 faces"
         assert full_app.icon is None
 
     def test_emojis_only_shows_emoji(self, full_app) -> None:
@@ -3964,8 +4012,8 @@ class _Blendshape:
 
 
 class _Detection:
-    def __init__(self, has_face=True) -> None:
-        self.face_blendshapes = [[_Blendshape()]] if has_face else []
+    def __init__(self, face_count=1) -> None:
+        self.face_blendshapes = [[_Blendshape()] for _ in range(face_count)]
 
 
 class TestFaceWorkerRun:
@@ -3978,6 +4026,40 @@ class TestFaceWorkerRun:
         worker.run()
         assert "model download failed" in worker.error
 
+    def test_landmarker_is_configured_for_multiple_faces(self, monkeypatch) -> None:
+        captured = {}
+        monkeypatch.setattr(app, "ensure_model", lambda: None)
+        monkeypatch.setattr(
+            app.vision,
+            "FaceLandmarkerOptions",
+            lambda **options: captured.update(options) or options,
+        )
+
+        class FakeLandmarkerContext:
+            def __enter__(self):
+                return object()
+
+            def __exit__(self, *_args):
+                return False
+
+        fake_landmarker = type(
+            "FakeFaceLandmarker",
+            (),
+            {
+                "create_from_options": staticmethod(
+                    lambda _options: FakeLandmarkerContext()
+                )
+            },
+        )
+        monkeypatch.setattr(app.vision, "FaceLandmarker", fake_landmarker)
+        worker = app.FaceWorker()
+        worker.stop()
+
+        worker.run()
+
+        assert captured["num_faces"] == app.MAX_DETECTED_FACES
+        assert captured["num_faces"] > 1
+
     def test_capture_loop_processes_face_frame(self, monkeypatch) -> None:
         monkeypatch.setattr(app.cv2, "cvtColor", lambda *a, **k: "rgb")
         monkeypatch.setattr(app.cv2, "COLOR_BGR2RGB", 0, raising=False)
@@ -3987,7 +4069,7 @@ class TestFaceWorkerRun:
         )
         worker = app.FaceWorker()
         landmarker = type(
-            "L", (), {"detect_for_video": lambda self, img, ts: _Detection(True)}
+            "L", (), {"detect_for_video": lambda self, img, ts: _Detection(1)}
         )()
         cap = _FakeCap(worker, frames=2)
         worker._run_capture_loop(cap, landmarker)
@@ -3999,11 +4081,38 @@ class TestFaceWorkerRun:
         monkeypatch.setattr(app.mp, "Image", lambda **k: "image")
         worker = app.FaceWorker()
         landmarker = type(
-            "L", (), {"detect_for_video": lambda self, img, ts: _Detection(False)}
+            "L", (), {"detect_for_video": lambda self, img, ts: _Detection(0)}
         )()
         cap = _FakeCap(worker, frames=2)
         worker._run_capture_loop(cap, landmarker)
-        assert worker.result == EmotionResult("no face", 0.0)
+        assert worker.result == EmotionResult("no face", 0.0, face_count=0)
+
+    def test_capture_loop_reports_multiple_faces_without_emotion_inference(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app.cv2, "cvtColor", lambda *a, **k: "rgb")
+        monkeypatch.setattr(app.cv2, "COLOR_BGR2RGB", 0, raising=False)
+        monkeypatch.setattr(app.mp, "Image", lambda **k: "image")
+        infer_calls = []
+        monkeypatch.setattr(
+            app,
+            "infer_emotion",
+            lambda *args, **kwargs: infer_calls.append((args, kwargs)),
+        )
+        worker = app.FaceWorker()
+        landmarker = type(
+            "L", (), {"detect_for_video": lambda self, img, ts: _Detection(3)}
+        )()
+        cap = _FakeCap(worker, frames=2)
+
+        worker._run_capture_loop(cap, landmarker)
+
+        assert worker.result == EmotionResult(
+            app.MULTI_FACE_LABEL,
+            1.0,
+            face_count=3,
+        )
+        assert infer_calls == []
 
     def test_capture_loop_reopens_after_many_read_failures(self, monkeypatch) -> None:
         worker = app.FaceWorker()
@@ -4230,6 +4339,17 @@ class TestRequestedNotificationEvents:
             "Sad detected",
             "No face detected",
         ]
+
+    def test_multiple_faces_reset_emotion_notification_transition(
+        self, full_app, monkeypatch
+    ) -> None:
+        calls = _capture_notifications(full_app, monkeypatch, "emotion_happy")
+
+        full_app._notify_emotion_transition("happy")
+        full_app._notify_emotion_transition(app.MULTI_FACE_LABEL)
+        full_app._notify_emotion_transition("happy")
+
+        assert [call[1] for call in calls] == ["Happy detected", "Happy detected"]
 
     def test_pause_resume_sensitivity_and_ai_provider_notify(
         self, full_app, monkeypatch

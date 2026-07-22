@@ -32,6 +32,7 @@ from mediapipe.tasks.python import vision
 from emotion import (
     DEFAULT_SENSITIVITY,
     EMOTION_EMOJI,
+    MULTI_FACE_LABEL,
     SENSITIVITY_EMOTIONS,
     SENSITIVITY_LEVELS,
     EmotionResult,
@@ -81,13 +82,21 @@ RAW_PATH = os.path.join(DATA_DIR, "raw_data.csv")
 RAW_HEADER = ["timestamp", "state", "score"]
 # Emotions accumulated in the statistics.
 NO_FACE_LABEL = "no face"
-TRACKED_EMOTIONS = ["happy", "sad", "surprised", "angry", "neutral", NO_FACE_LABEL]
+TRACKED_EMOTIONS = [
+    "neutral",
+    "happy",
+    "surprised",
+    "angry",
+    "sad",
+    NO_FACE_LABEL,
+    MULTI_FACE_LABEL,
+]
 # Non-emotion states that are also tracked.
 EXTRA_STATES = ["paused", "error"]
 # All statistic rows, in display order.
 STAT_KEYS = TRACKED_EMOTIONS + EXTRA_STATES
-# The genuine facial emotions (excludes "no face"/paused/error). Used to count
-# how many emotions a generated report is actually based on.
+# The genuine facial emotions (excludes face-count/paused/error states). Used to
+# count how many emotions a generated report is actually based on.
 REPORT_EMOTIONS = ("happy", "sad", "surprised", "angry", "neutral")
 # Emoji shown for each statistic row (emotions reuse EMOTION_EMOJI).
 STAT_EMOJI = {**EMOTION_EMOJI, "paused": "⏸️", "error": "⚠️"}
@@ -168,6 +177,8 @@ ABOUT_BOLD_PHRASES = (
 UI_REFRESH_INTERVAL = 0.3
 # Target webcam sampling rate (seconds between processed frames).
 SAMPLE_INTERVAL = 0.15
+# Maximum faces MediaPipe detects in one camera frame.
+MAX_DETECTED_FACES = 5
 # Privacy is opt-in so upgrading Moodito never changes the system unexpectedly.
 PRIVACY_CHANNELS = ("microphone", "speakers")
 PRIVACY_ACTIONS = (*PRIVACY_CHANNELS, "screen_brightness", "lock_screen")
@@ -1790,7 +1801,7 @@ class FaceWorker(threading.Thread):
         options = vision.FaceLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
             output_face_blendshapes=True,
-            num_faces=1,
+            num_faces=MAX_DETECTED_FACES,
             running_mode=vision.RunningMode.VIDEO,
         )
 
@@ -1827,14 +1838,19 @@ class FaceWorker(threading.Thread):
             timestamp_ms += int(SAMPLE_INTERVAL * 1000)
             detection = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-            if detection.face_blendshapes:
+            face_count = len(detection.face_blendshapes)
+            if face_count > 1:
+                self._set_result(
+                    EmotionResult(MULTI_FACE_LABEL, 1.0, face_count=face_count)
+                )
+            elif face_count == 1:
                 scores = {
                     category.category_name: category.score
                     for category in detection.face_blendshapes[0]
                 }
                 self._set_result(infer_emotion(scores, self.sensitivity))
             else:
-                self._set_result(EmotionResult(NO_FACE_LABEL, 0.0))
+                self._set_result(EmotionResult(NO_FACE_LABEL, 0.0, face_count=0))
 
             self._stop.wait(SAMPLE_INTERVAL)
 
@@ -2297,11 +2313,11 @@ class MooditoApp(rumps.App):
         """
         if self._show_emojis:
             title = (
-                f"{result.emoji} {result.label}" if self._show_labels else result.emoji
+                result.title if self._show_labels else result.emoji
             )
             self._set_menubar(None, title)
         else:
-            label = result.label if self._show_labels else None
+            label = result.display_label if self._show_labels else None
             self._set_menubar(self._icon_path, label)
 
     @rumps.timer(UI_REFRESH_INTERVAL)
@@ -2334,7 +2350,11 @@ class MooditoApp(rumps.App):
         if self._worker.ready:
             self._notify_emotion_transition(result.label)
         self._render_emotion(result)
-        self._detected_item.title = f"Detected: {result.label} ({result.score:.0%})"
+        self._detected_item.title = (
+            f"Detected: {result.display_label}"
+            if result.face_count > 1
+            else f"Detected: {result.label} ({result.score:.0%})"
+        )
         self._accumulate_stats(result.label, result.score)
 
     def _accumulate_stats(self, label: str, score: float | None = None) -> None:
@@ -2748,10 +2768,12 @@ class MooditoApp(rumps.App):
 
     def _notify_emotion_transition(self, label: str) -> None:
         """Notify once when the detected facial state changes."""
-        event = EMOTION_NOTIFICATION_EVENTS.get(label)
-        if event is None or label == self._last_notified_emotion:
+        if label == self._last_notified_emotion:
             return
         self._last_notified_emotion = label
+        event = EMOTION_NOTIFICATION_EVENTS.get(label)
+        if event is None:
+            return
         self._send_notification(event)
 
     def open_notifications_window(self, _sender) -> None:

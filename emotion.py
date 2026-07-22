@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+MULTI_FACE_LABEL = "2+ faces"
+
 # Emoji shown in the menu bar for each emotion label.
 EMOTION_EMOJI = {
     "happy": "😀",
@@ -18,6 +20,7 @@ EMOTION_EMOJI = {
     "surprised": "😮",
     "angry": "😠",
     "neutral": "😐",
+    MULTI_FACE_LABEL: "👥",
     "no face": "🫥",
 }
 
@@ -38,6 +41,13 @@ _SENSITIVITY_MULTIPLIER = {"low": 1.4, "normal": 1.0, "high": 0.6}
 class EmotionResult:
     label: str
     score: float  # confidence of the winning emotion, 0..1
+    face_count: int = 1
+
+    @property
+    def display_label(self) -> str:
+        if self.face_count > 1:
+            return f"{self.face_count} faces"
+        return self.label
 
     @property
     def emoji(self) -> str:
@@ -45,7 +55,7 @@ class EmotionResult:
 
     @property
     def title(self) -> str:
-        return f"{self.emoji} {self.label}"
+        return f"{self.emoji} {self.display_label}"
 
 
 def _get(scores: dict[str, float], *names: str) -> float:

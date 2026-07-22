@@ -5,6 +5,7 @@ import pytest
 
 from emotion import (
     EMOTION_EMOJI,
+    MULTI_FACE_LABEL,
     EmotionResult,
     _deadzone,
     _get,
@@ -21,6 +22,12 @@ class TestEmotionResult:
 
     def test_title_combines_emoji_and_label(self) -> None:
         assert EmotionResult("sad", 0.4).title == "😢 sad"
+
+    def test_multiple_faces_title_uses_dynamic_count(self) -> None:
+        result = EmotionResult(MULTI_FACE_LABEL, 1.0, face_count=3)
+        assert result.emoji == "👥"
+        assert result.display_label == "3 faces"
+        assert result.title == "👥 3 faces"
 
 
 class TestGet:
