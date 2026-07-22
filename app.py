@@ -2153,9 +2153,9 @@ class MooditoApp(rumps.App):
             None,
             self._license_menu,
             self._bmc_menu,
-            rumps.MenuItem("Quit", callback=self.quit_app),
             None,
             self._version_item,
+            rumps.MenuItem("Quit", callback=self.quit_app),
         ]
         self._detected_item = self.menu["Detected: …"]
         self._pause_item = self.menu["Pause"]

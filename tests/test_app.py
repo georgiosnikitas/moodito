@@ -1664,6 +1664,13 @@ class TestMooditoAppInit:
         assert full_app._version_item.title == f"Moodito {app.app_version()}"
         assert full_app._version_item.callback is not None
 
+    def test_about_precedes_final_quit_command(self, full_app) -> None:
+        menu_titles = list(full_app.menu.keys())
+        assert menu_titles[-2:] == [
+            full_app._version_item.title,
+            full_app._quit_item.title,
+        ]
+
     def test_about_accessory_contains_supplied_description(self, full_app) -> None:
         _view, text_view = full_app._build_about_accessory()
         text = str(text_view.string())
