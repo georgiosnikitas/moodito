@@ -59,12 +59,14 @@ Everything lives in the menu bar dropdown — small, fast, and out of your way.
   before you save.
 - **🎚️ Adjustable sensitivity** — fine-tune detection per emotion (Low / Normal /
   High) so Moodito reads *your* face the way you want.
-- **🔒 Automatic Privacy** — set independent no-face delays for microphone mute,
-  speaker mute, dimming every connected screen, and screen lock using hours
-  (`0–23`), minutes (`0–59`), and seconds (`0–59`). Setting all three counters
-  to `0` disables that action. When your face returns, Moodito restores each
-  screen's exact brightness, plus the audio levels and speaker mute state that
-  were active before Privacy engaged.
+- **🔒 Automatic Privacy** — configure microphone mute, speaker mute, dimming
+  every connected screen, and screen lock independently for **No Face** and
+  **Multiple Faces**. A segmented trigger selector keeps the dialog focused
+  while preserving separate hours (`0–23`), minutes (`0–59`), and seconds
+  (`0–59`) for all eight trigger/action combinations. Setting all three counters
+  to `0` disables that action for that trigger. When the trigger ends, Moodito
+  restores each screen's exact brightness, plus the audio levels and speaker
+  mute state that were active before Privacy engaged.
 - **⏱️ Break Timer** — set a countdown in hours, minutes, and seconds. An active
   timer shows a clock in the macOS menu bar and its remaining time beside the
   Break Timer option as `[hh:mm:ss]`. When it finishes, Moodito opens a reminder

@@ -182,6 +182,11 @@ MAX_DETECTED_FACES = 5
 # Privacy is opt-in so upgrading Moodito never changes the system unexpectedly.
 PRIVACY_CHANNELS = ("microphone", "speakers")
 PRIVACY_ACTIONS = (*PRIVACY_CHANNELS, "screen_brightness", "lock_screen")
+PRIVACY_TRIGGERS = ("no_face", "multi_face")
+PRIVACY_TRIGGER_LABELS = {
+    "no_face": "No Face",
+    "multi_face": "Multiple Faces",
+}
 MAX_PRIVACY_HOURS = 23
 MAX_PRIVACY_MINUTES = 59
 MAX_PRIVACY_COMPONENT_SECONDS = 59
@@ -205,6 +210,8 @@ PRIVACY_NOTIFICATION_TITLE = "Moodito Privacy"
 BREAK_TIMER_NOTIFICATION_TITLE = "Moodito Break Timer"
 NO_FACE_NOTIFICATION_MESSAGE = "No face was detected."
 FACE_VISIBLE_NOTIFICATION_MESSAGE = "Your face is visible again."
+MULTI_FACE_NOTIFICATION_MESSAGE = "Multiple faces were detected."
+MULTI_FACE_ENDED_NOTIFICATION_MESSAGE = "Multiple faces are no longer detected."
 # Notification events grouped in the order shown in the settings dialog.
 NOTIFICATION_GROUPS = (
     (
@@ -876,6 +883,11 @@ def _bounded_stepper_handler_class():
             value = max(0, min(self.maximums[index], int(sender.integerValue())))
             sender.setIntegerValue_(value)
             self.steppers[index].setIntegerValue_(value)
+
+        def triggerChanged_(self, sender) -> None:
+            selected = int(sender.selectedSegment())
+            for index, panel in enumerate(self.trigger_panels):
+                panel.setHidden_(index != selected)
 
     _BOUNDED_STEPPER_HANDLER_CLASS = _BoundedStepperHandler
     return _BoundedStepperHandler
@@ -1891,11 +1903,16 @@ class MooditoApp(rumps.App):
         # with the worker thread that runs inference.
         self._sensitivity = self._load_sensitivity()
         self._worker.sensitivity = self._sensitivity
-        # Privacy can mute either audio channel after a continuous period with
-        # no face. Runtime state is kept separately from persisted preferences.
+        # Privacy actions can run after continuous no-face or multi-face states.
+        # Runtime state is kept separately from persisted preferences.
         self._privacy = self._load_privacy()
-        self._privacy_no_face_since: float | None = None
-        self._privacy_attempted: set[str] = set()
+        self._privacy_trigger_since: dict[str, float | None] = dict.fromkeys(
+            PRIVACY_TRIGGERS
+        )
+        self._privacy_active_trigger: str | None = None
+        self._privacy_attempted: dict[str, set[str]] = {
+            trigger: set() for trigger in PRIVACY_TRIGGERS
+        }
         self._privacy_audio_states: dict[str, AudioState] = {}
         self._privacy_changed_channels: set[str] = set()
         self._privacy_brightness_states: tuple[ScreenBrightnessState, ...] = ()
@@ -2352,7 +2369,7 @@ class MooditoApp(rumps.App):
 
         result = self._worker.result
         face_present = result.label != NO_FACE_LABEL
-        self._update_privacy(face_present)
+        self._update_privacy(result.label)
         self._update_break_timer(face_present)
         if self._worker.ready:
             self._notify_emotion_transition(result.label, result.face_count)
@@ -2769,9 +2786,11 @@ class MooditoApp(rumps.App):
         except Exception:  # noqa: BLE001 - notification details are best-effort
             pass
 
-    def _send_privacy_notification(self, event: str) -> None:
+    def _send_privacy_notification(
+        self, event: str, message: str | None = None
+    ) -> None:
         """Compatibility wrapper for Privacy transition notifications."""
-        self._send_notification(event)
+        self._send_notification(event, message)
 
     def _notify_emotion_transition(self, label: str, face_count: int = 1) -> None:
         """Notify once when the detected facial state changes."""
@@ -3085,30 +3104,27 @@ class MooditoApp(rumps.App):
 
         return view, controls
 
-    def _load_privacy(self) -> dict:
-        """Return per-action delays, migrating the former shared-delay shape."""
-        privacy = {
+    @staticmethod
+    def _default_privacy_group() -> dict[str, int]:
+        """Return disabled defaults for one Privacy trigger."""
+        return {
             "microphone_seconds": DEFAULT_PRIVACY_MICROPHONE_SECONDS,
             "speakers_seconds": DEFAULT_PRIVACY_SPEAKERS_SECONDS,
             "screen_brightness_seconds": DEFAULT_PRIVACY_SCREEN_BRIGHTNESS_SECONDS,
             "lock_screen_seconds": DEFAULT_PRIVACY_LOCK_SCREEN_SECONDS,
         }
-        stored = self._settings.get("privacy")
-        if not isinstance(stored, dict):
-            return privacy
 
-        new_keys = tuple(privacy)
-        if any(key in stored for key in new_keys):
-            for key in new_keys:
-                value = stored.get(key)
-                if self._valid_privacy_delay(value):
-                    privacy[key] = value
-            return privacy
+    def _validated_privacy_group(self, stored: dict) -> dict[str, int]:
+        """Overlay valid persisted delays onto one trigger's defaults."""
+        group = self._default_privacy_group()
+        for key in group:
+            value = stored.get(key)
+            if self._valid_privacy_delay(value):
+                group[key] = value
+        return group
 
-        # Versions before per-channel counters stored one minutes/seconds delay
-        # plus channel toggles. Preserve enabled channels, clamped to the new
-        # range; an old immediate (0-second) delay becomes the closest valid
-        # enabled value because zero now explicitly means disabled.
+    def _migrate_legacy_privacy_group(self, stored: dict) -> dict[str, int] | None:
+        """Migrate the oldest shared-delay and channel-toggle settings shape."""
         minutes = stored.get("minutes")
         seconds = stored.get("seconds")
         if not (
@@ -3119,11 +3135,43 @@ class MooditoApp(rumps.App):
             and not isinstance(seconds, bool)
             and 0 <= seconds < 60
         ):
-            return privacy
+            return None
+        group = self._default_privacy_group()
         migrated_delay = max(1, min(MAX_PRIVACY_SECONDS, minutes * 60 + seconds))
         for channel in PRIVACY_CHANNELS:
             if stored.get(channel) is True:
-                privacy[f"{channel}_seconds"] = migrated_delay
+                group[f"{channel}_seconds"] = migrated_delay
+        return group
+
+    def _load_privacy(self) -> dict:
+        """Return per-trigger action delays, migrating older settings shapes."""
+        privacy = {
+            trigger: self._default_privacy_group() for trigger in PRIVACY_TRIGGERS
+        }
+        stored = self._settings.get("privacy")
+        if not isinstance(stored, dict):
+            return privacy
+
+        loaded_group = False
+        for trigger in PRIVACY_TRIGGERS:
+            group = stored.get(trigger)
+            if not isinstance(group, dict):
+                continue
+            loaded_group = True
+            privacy[trigger] = self._validated_privacy_group(group)
+
+        # Versions with one set of four per-action delays used a flat shape.
+        # Those settings remain the no-face configuration after upgrading.
+        flat_keys = tuple(self._default_privacy_group())
+        loaded_flat = any(key in stored for key in flat_keys)
+        if not isinstance(stored.get("no_face"), dict) and loaded_flat:
+            privacy["no_face"] = self._validated_privacy_group(stored)
+        if loaded_group or loaded_flat:
+            return privacy
+
+        legacy_group = self._migrate_legacy_privacy_group(stored)
+        if legacy_group is not None:
+            privacy["no_face"] = legacy_group
         return privacy
 
     @staticmethod
@@ -3135,49 +3183,76 @@ class MooditoApp(rumps.App):
             and 0 <= value <= MAX_PRIVACY_SECONDS
         )
 
-    def _apply_privacy(
-        self,
-        microphone_seconds: int,
-        speakers_seconds: int,
-        screen_brightness_seconds: int,
-        lock_screen_seconds: int,
-    ) -> bool:
+    def _apply_privacy(self, privacy: dict) -> bool:
         """Validate, apply, and persist Privacy settings."""
-        if not all(
-            self._valid_privacy_delay(value)
-            for value in (
-                microphone_seconds,
-                speakers_seconds,
-                screen_brightness_seconds,
-                lock_screen_seconds,
-            )
-        ):
-            return False
-        privacy = {
-            "microphone_seconds": microphone_seconds,
-            "speakers_seconds": speakers_seconds,
-            "screen_brightness_seconds": screen_brightness_seconds,
-            "lock_screen_seconds": lock_screen_seconds,
-        }
-        if privacy == self._privacy:
+        normalized = {}
+        for trigger in PRIVACY_TRIGGERS:
+            group = privacy.get(trigger)
+            if not isinstance(group, dict):
+                return False
+            normalized[trigger] = {}
+            for action in PRIVACY_ACTIONS:
+                key = f"{action}_seconds"
+                value = group.get(key)
+                if not self._valid_privacy_delay(value):
+                    return False
+                normalized[trigger][key] = value
+        if normalized == self._privacy:
             return True
         if not self._reset_privacy():
             return False
-        self._privacy = privacy
-        self._settings["privacy"] = dict(privacy)
+        self._privacy = normalized
+        self._settings["privacy"] = {
+            trigger: dict(group) for trigger, group in normalized.items()
+        }
         save_settings(self._settings)
-        microphone_text = format_privacy_delay(microphone_seconds)
-        speakers_text = format_privacy_delay(speakers_seconds)
-        screen_brightness_text = format_privacy_delay(screen_brightness_seconds)
-        lock_screen_text = format_privacy_delay(lock_screen_seconds)
+
+        action_labels = {
+            "microphone": "Microphone",
+            "speakers": "Speakers",
+            "screen_brightness": "Brightness",
+            "lock_screen": "Lock screen",
+        }
+        summaries = []
+        for trigger in PRIVACY_TRIGGERS:
+            enabled = [
+                f"{action_labels[action]} "
+                f"{format_privacy_delay(normalized[trigger][f'{action}_seconds'])}"
+                for action in PRIVACY_ACTIONS
+                if normalized[trigger][f"{action}_seconds"] > 0
+            ]
+            summaries.append(
+                f"{PRIVACY_TRIGGER_LABELS[trigger]}: "
+                f"{', '.join(enabled) if enabled else 'Disabled'}"
+            )
         self._send_notification(
             "privacy_settings_changed",
-            f"Microphone: {microphone_text}; Speakers: {speakers_text}; "
-            f"Brightness: {screen_brightness_text}; Lock screen: {lock_screen_text}.",
+            "; ".join(summaries) + ".",
         )
         return True
 
-    def _restore_privacy_audio(self) -> bool:
+    @staticmethod
+    def _privacy_trigger_message(trigger: str | None, ended: bool = False) -> str | None:
+        """Return notification copy when the multi-face trigger changes."""
+        if trigger != "multi_face":
+            return None
+        return (
+            MULTI_FACE_ENDED_NOTIFICATION_MESSAGE
+            if ended
+            else MULTI_FACE_NOTIFICATION_MESSAGE
+        )
+
+    def _send_triggered_privacy_notification(
+        self, event: str, trigger: str | None, ended: bool = False
+    ) -> None:
+        """Send a Privacy event with trigger-specific copy when necessary."""
+        message = self._privacy_trigger_message(trigger, ended)
+        if message is None:
+            self._send_privacy_notification(event)
+        else:
+            self._send_privacy_notification(event, message)
+
+    def _restore_privacy_audio(self, trigger: str | None = None) -> bool:
         """Restore each channel captured when Privacy activated."""
         restored_all = True
         for channel in PRIVACY_CHANNELS:
@@ -3194,18 +3269,24 @@ class MooditoApp(rumps.App):
                 event = (
                     "microphone_unmuted" if channel == "microphone" else "speakers_on"
                 )
-                self._send_privacy_notification(event)
+                self._send_triggered_privacy_notification(event, trigger, ended=True)
         return restored_all
 
     def _reset_privacy(self) -> bool:
-        """Cancel the absence timer and restore active Privacy changes."""
-        self._privacy_no_face_since = None
-        self._privacy_attempted.clear()
-        audio_restored = self._restore_privacy_audio()
-        brightness_restored = self._restore_privacy_screen_brightness()
-        return audio_restored and brightness_restored
+        """Cancel trigger timers and restore active Privacy changes."""
+        active_trigger = self._privacy_active_trigger
+        for trigger in PRIVACY_TRIGGERS:
+            self._privacy_trigger_since[trigger] = None
+            self._privacy_attempted[trigger].clear()
+        audio_restored = self._restore_privacy_audio(active_trigger)
+        brightness_restored = self._restore_privacy_screen_brightness(active_trigger)
+        restored = audio_restored and brightness_restored
+        self._privacy_active_trigger = None if restored else active_trigger
+        return restored
 
-    def _restore_privacy_screen_brightness(self) -> bool:
+    def _restore_privacy_screen_brightness(
+        self, trigger: str | None = None
+    ) -> bool:
         """Restore every brightness level captured when Privacy dimmed screens."""
         states = self._privacy_brightness_states
         if not states:
@@ -3217,35 +3298,58 @@ class MooditoApp(rumps.App):
         if failed_states:
             return False
         if any(state.level > 0 for state in states):
-            self._send_privacy_notification("brightness_restored")
+            self._send_triggered_privacy_notification(
+                "brightness_restored", trigger, ended=True
+            )
         return True
 
-    def _update_privacy(self, face_present: bool, now: float | None = None) -> None:
-        """Advance Privacy for the current face-presence observation."""
-        if face_present or not any(self._privacy.values()):
+    @staticmethod
+    def _privacy_trigger_for_state(state: str | bool) -> str | None:
+        """Map a detected state to a Privacy trigger.
+
+        Boolean support keeps direct callers from the former face-presence API
+        compatible while the live app passes detected-state labels.
+        """
+        if state is False or state == NO_FACE_LABEL:
+            return "no_face"
+        if state == MULTI_FACE_LABEL:
+            return "multi_face"
+        return None
+
+    def _update_privacy(self, state: str | bool, now: float | None = None) -> None:
+        """Advance Privacy for the current detected state."""
+        trigger = self._privacy_trigger_for_state(state)
+        if trigger is None or not any(self._privacy[trigger].values()):
             self._reset_privacy()
             return
 
-        current_time = time.monotonic() if now is None else now
-        if self._privacy_no_face_since is None:
-            self._privacy_no_face_since = current_time
-        elapsed = current_time - self._privacy_no_face_since
-        for channel in PRIVACY_CHANNELS:
-            self._activate_privacy_channel(channel, elapsed)
-        self._activate_privacy_screen_brightness(elapsed)
-        self._activate_privacy_screen_lock(elapsed)
+        if trigger != self._privacy_active_trigger:
+            if not self._reset_privacy():
+                return
+            self._privacy_active_trigger = trigger
 
-    def _activate_privacy_channel(self, channel: str, elapsed: float) -> None:
-        """Mute one channel once its configured no-face delay has elapsed."""
-        delay = self._privacy[f"{channel}_seconds"]
+        current_time = time.monotonic() if now is None else now
+        if self._privacy_trigger_since[trigger] is None:
+            self._privacy_trigger_since[trigger] = current_time
+        elapsed = current_time - self._privacy_trigger_since[trigger]
+        for channel in PRIVACY_CHANNELS:
+            self._activate_privacy_channel(trigger, channel, elapsed)
+        self._activate_privacy_screen_brightness(trigger, elapsed)
+        self._activate_privacy_screen_lock(trigger, elapsed)
+
+    def _activate_privacy_channel(
+        self, trigger: str, channel: str, elapsed: float
+    ) -> None:
+        """Mute one channel once its configured trigger delay has elapsed."""
+        delay = self._privacy[trigger][f"{channel}_seconds"]
         if (
             delay == 0
             or elapsed < delay
-            or channel in self._privacy_attempted
+            or channel in self._privacy_attempted[trigger]
             or channel in self._privacy_audio_states
         ):
             return
-        self._privacy_attempted.add(channel)
+        self._privacy_attempted[trigger].add(channel)
         microphone = channel == "microphone"
         result = mute_audio_for_privacy(microphone, not microphone)
         if result is None:
@@ -3262,39 +3366,43 @@ class MooditoApp(rumps.App):
         if changed:
             self._privacy_changed_channels.add(channel)
             event = "microphone_muted" if microphone else "speakers_off"
-            self._send_privacy_notification(event)
+            self._send_triggered_privacy_notification(event, trigger)
 
-    def _activate_privacy_screen_brightness(self, elapsed: float) -> None:
-        """Dim the screen once its configured no-face delay has elapsed."""
+    def _activate_privacy_screen_brightness(
+        self, trigger: str, elapsed: float
+    ) -> None:
+        """Dim screens once their configured trigger delay has elapsed."""
         action = "screen_brightness"
-        delay = self._privacy[f"{action}_seconds"]
+        delay = self._privacy[trigger][f"{action}_seconds"]
         if (
             delay == 0
             or elapsed < delay
-            or action in self._privacy_attempted
+            or action in self._privacy_attempted[trigger]
             or bool(self._privacy_brightness_states)
         ):
             return
-        self._privacy_attempted.add(action)
+        self._privacy_attempted[trigger].add(action)
         states = dim_screens_for_privacy()
         if states:
             self._privacy_brightness_states = states
             if any(state.level > 0 for state in states):
-                self._send_privacy_notification("brightness_dimmed")
+                self._send_triggered_privacy_notification(
+                    "brightness_dimmed", trigger
+                )
 
-    def _activate_privacy_screen_lock(self, elapsed: float) -> None:
-        """Lock the screen once its configured no-face delay has elapsed."""
+    def _activate_privacy_screen_lock(self, trigger: str, elapsed: float) -> None:
+        """Lock the screen once its configured trigger delay has elapsed."""
         action = "lock_screen"
-        delay = self._privacy[f"{action}_seconds"]
+        delay = self._privacy[trigger][f"{action}_seconds"]
         if (
             delay == 0
             or elapsed < delay
-            or action in self._privacy_attempted
+            or action in self._privacy_attempted[trigger]
         ):
             return
         if not lock_screen_for_privacy():
             return
-        self._privacy_attempted.add(action)
+        self._privacy_attempted[trigger].add(action)
 
     def open_privacy_window(self, _sender) -> None:
         """Show the native Privacy delay and channel settings dialog."""
@@ -3305,8 +3413,8 @@ class MooditoApp(rumps.App):
             alert = NSAlert.alloc().init()
             alert.setMessageText_("Privacy")
             alert.setInformativeText_(
-                "Set each no-face delay using 0-23 hours, 0-59 minutes, and "
-                "0-59 seconds. All zeros disables that action."
+                "Choose a trigger, then set independent action delays. "
+                "All zeros disables that action for the selected trigger."
             )
             alert.addButtonWithTitle_("Apply")
             alert.addButtonWithTitle_("Cancel")
@@ -3329,10 +3437,11 @@ class MooditoApp(rumps.App):
 
     def _apply_privacy_from_controls(self, controls: dict) -> bool:
         """Commit values selected in the Privacy dialog controls."""
-        def total_seconds(action: str) -> int | None:
-            hours = int(controls[f"{action}_hours"].integerValue())
-            minutes = int(controls[f"{action}_minutes"].integerValue())
-            seconds = int(controls[f"{action}_seconds"].integerValue())
+        def total_seconds(trigger: str, action: str) -> int | None:
+            prefix = f"{trigger}_{action}"
+            hours = int(controls[f"{prefix}_hours"].integerValue())
+            minutes = int(controls[f"{prefix}_minutes"].integerValue())
+            seconds = int(controls[f"{prefix}_seconds"].integerValue())
             if not (
                 0 <= hours <= MAX_PRIVACY_HOURS
                 and 0 <= minutes <= MAX_PRIVACY_MINUTES
@@ -3341,18 +3450,24 @@ class MooditoApp(rumps.App):
                 return None
             return hours * 3600 + minutes * 60 + seconds
 
-        delays = tuple(total_seconds(action) for action in PRIVACY_ACTIONS)
-        if any(delay is None for delay in delays):
-            return False
-
-        return self._apply_privacy(*delays)
+        privacy = {}
+        for trigger in PRIVACY_TRIGGERS:
+            privacy[trigger] = {}
+            for action in PRIVACY_ACTIONS:
+                delay = total_seconds(trigger, action)
+                if delay is None:
+                    return False
+                privacy[trigger][f"{action}_seconds"] = delay
+        return self._apply_privacy(privacy)
 
     def _build_privacy_accessory(self):
-        """Build independent H/M/S counters for each Privacy action."""
+        """Build a two-trigger editor with independent H/M/S action counters."""
         from AppKit import (
             NSFont,
             NSImage,
             NSImageView,
+            NSSegmentedControl,
+            NSSegmentStyleRounded,
             NSStepper,
             NSTextField,
             NSView,
@@ -3362,10 +3477,13 @@ class MooditoApp(rumps.App):
         width = 480.0
         header_height = 28.0
         row_height = 38.0
-        height = header_height + len(PRIVACY_ACTIONS) * row_height
+        panel_height = header_height + len(PRIVACY_ACTIONS) * row_height
+        selector_height = 32.0
+        selector_gap = 10.0
+        height = panel_height + selector_gap + selector_height
         view = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, width, height))
 
-        def add_label(text: str, x: float, y: float, label_width: float) -> None:
+        def add_label(parent, text: str, x: float, y: float, label_width: float) -> None:
             label = NSTextField.alloc().initWithFrame_(
                 NSMakeRect(x, y, label_width, 22.0)
             )
@@ -3375,7 +3493,7 @@ class MooditoApp(rumps.App):
             label.setEditable_(False)
             label.setSelectable_(False)
             label.setFont_(NSFont.systemFontOfSize_(13.0))
-            view.addSubview_(label)
+            parent.addSubview_(label)
 
         controls = {}
         fields = []
@@ -3392,70 +3510,96 @@ class MooditoApp(rumps.App):
             ("minutes", MAX_PRIVACY_MINUTES, 278.0),
             ("seconds", MAX_PRIVACY_COMPONENT_SECONDS, 390.0),
         )
-        for component, _maximum, x in components:
-            add_label(component.capitalize(), x, height - 22.0, 76.0)
+        selector = NSSegmentedControl.alloc().initWithFrame_(
+            NSMakeRect(80.0, panel_height + selector_gap, width - 160.0, selector_height)
+        )
+        selector.setSegmentCount_(len(PRIVACY_TRIGGERS))
+        selector.setSegmentStyle_(NSSegmentStyleRounded)
+        for index, trigger in enumerate(PRIVACY_TRIGGERS):
+            selector.setLabel_forSegment_(PRIVACY_TRIGGER_LABELS[trigger], index)
+            selector.setWidth_forSegment_((width - 160.0) / len(PRIVACY_TRIGGERS), index)
+        selector.setSelectedSegment_(0)
+        view.addSubview_(selector)
 
-        for index, (title, action, symbol_name) in enumerate(rows):
-            row_y = height - header_height - (index + 1) * row_height
-            image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-                symbol_name, title
+        panels = []
+        for trigger_index, trigger in enumerate(PRIVACY_TRIGGERS):
+            panel = NSView.alloc().initWithFrame_(
+                NSMakeRect(0.0, 0.0, width, panel_height)
             )
-            if image is not None:
-                image.setTemplate_(True)
-                image_view = NSImageView.alloc().initWithFrame_(
-                    NSMakeRect(0.0, row_y + 8.0, 18.0, 18.0)
-                )
-                image_view.setImage_(image)
-                view.addSubview_(image_view)
-            add_label(title, 28.0, row_y + 7.0, 128.0)
+            panel.setHidden_(trigger_index != 0)
+            view.addSubview_(panel)
+            panels.append(panel)
+            for component, _maximum, x in components:
+                add_label(panel, component.capitalize(), x, panel_height - 22.0, 76.0)
 
-            hours, remainder = divmod(self._privacy[f"{action}_seconds"], 3600)
-            minutes, seconds = divmod(remainder, 60)
-            values = {"hours": hours, "minutes": minutes, "seconds": seconds}
-            for component, maximum, x in components:
-                tag = len(fields)
-                key = f"{action}_{component}"
-                formatter = NSNumberFormatter.alloc().init()
-                formatter.setAllowsFloats_(False)
-                formatter.setMinimum_(0)
-                formatter.setMaximum_(maximum)
-                field = NSTextField.alloc().initWithFrame_(
-                    NSMakeRect(x, row_y + 5.0, 48.0, 24.0)
+            for row_index, (title, action, symbol_name) in enumerate(rows):
+                row_y = panel_height - header_height - (row_index + 1) * row_height
+                image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                    symbol_name, title
                 )
-                field.setFormatter_(formatter)
-                field.setIntegerValue_(values[component])
-                field.setTag_(tag)
-                view.addSubview_(field)
+                if image is not None:
+                    image.setTemplate_(True)
+                    image_view = NSImageView.alloc().initWithFrame_(
+                        NSMakeRect(0.0, row_y + 8.0, 18.0, 18.0)
+                    )
+                    image_view.setImage_(image)
+                    panel.addSubview_(image_view)
+                add_label(panel, title, 28.0, row_y + 7.0, 128.0)
 
-                stepper = NSStepper.alloc().initWithFrame_(
-                    NSMakeRect(x + 52.0, row_y + 3.0, 20.0, 27.0)
-                )
-                stepper.setMinValue_(0.0)
-                stepper.setMaxValue_(float(maximum))
-                stepper.setIncrement_(1.0)
-                stepper.setValueWraps_(False)
-                stepper.setAutorepeat_(True)
-                stepper.setIntegerValue_(values[component])
-                stepper.setTag_(tag)
-                view.addSubview_(stepper)
+                duration = self._privacy[trigger][f"{action}_seconds"]
+                hours, remainder = divmod(duration, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                values = {"hours": hours, "minutes": minutes, "seconds": seconds}
+                for component, maximum, x in components:
+                    tag = len(fields)
+                    key = f"{trigger}_{action}_{component}"
+                    formatter = NSNumberFormatter.alloc().init()
+                    formatter.setAllowsFloats_(False)
+                    formatter.setMinimum_(0)
+                    formatter.setMaximum_(maximum)
+                    field = NSTextField.alloc().initWithFrame_(
+                        NSMakeRect(x, row_y + 5.0, 48.0, 24.0)
+                    )
+                    field.setFormatter_(formatter)
+                    field.setIntegerValue_(values[component])
+                    field.setTag_(tag)
+                    panel.addSubview_(field)
 
-                controls[key] = field
-                controls[f"{key}_stepper"] = stepper
-                fields.append(field)
-                steppers.append(stepper)
-                maximums.append(maximum)
+                    stepper = NSStepper.alloc().initWithFrame_(
+                        NSMakeRect(x + 52.0, row_y + 3.0, 20.0, 27.0)
+                    )
+                    stepper.setMinValue_(0.0)
+                    stepper.setMaxValue_(float(maximum))
+                    stepper.setIncrement_(1.0)
+                    stepper.setValueWraps_(False)
+                    stepper.setAutorepeat_(True)
+                    stepper.setIntegerValue_(values[component])
+                    stepper.setTag_(tag)
+                    panel.addSubview_(stepper)
+
+                    controls[key] = field
+                    controls[f"{key}_stepper"] = stepper
+                    fields.append(field)
+                    steppers.append(stepper)
+                    maximums.append(maximum)
 
         handler = _bounded_stepper_handler_class().alloc().init()
         handler.fields = fields
         handler.steppers = steppers
         handler.maximums = maximums
+        handler.trigger_panels = panels
         for field in fields:
             field.setTarget_(handler)
             field.setAction_("fieldChanged:")
         for stepper in steppers:
             stepper.setTarget_(handler)
             stepper.setAction_("stepperChanged:")
+        selector.setTarget_(handler)
+        selector.setAction_("triggerChanged:")
         self._privacy_stepper_handler = handler
+
+        controls["_trigger_selector"] = selector
+        controls["_trigger_panels"] = panels
 
         return view, controls
 
