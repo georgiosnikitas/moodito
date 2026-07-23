@@ -12,7 +12,9 @@ import csv
 import json
 import math
 import os
+import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -24,6 +26,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+import certifi
 import cv2
 import mediapipe as mp
 import rumps
@@ -45,6 +48,10 @@ MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
     "face_landmarker/float16/1/face_landmarker.task"
 )
+HTTPS_CONTEXT = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+HTTPS_CONTEXT.minimum_version = ssl.TLSVersion.TLSv1_2
+HTTPS_CONTEXT.load_default_certs()
+HTTPS_CONTEXT.load_verify_locations(cafile=certifi.where())
 # Colored app icon shown in the menu bar when "icon only" mode is enabled.
 MENUBAR_ICON = "assets/moodito.png"
 # Support / tip jar link opened from the menu.
@@ -393,7 +400,9 @@ def ensure_model() -> None:
             delete=False,
         ) as download:
             download_path = download.name
-        urllib.request.urlretrieve(MODEL_URL, download_path)
+        with urllib.request.urlopen(MODEL_URL, context=HTTPS_CONTEXT) as response:
+            with open(download_path, "wb") as model_file:
+                shutil.copyfileobj(response, model_file)
         os.replace(download_path, MODEL_PATH)
     except Exception:
         if download_path is not None:
@@ -493,7 +502,9 @@ def _license_api_request(action: str, params: dict) -> dict:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=LICENSE_API_TIMEOUT) as response:
+        with urllib.request.urlopen(
+            request, timeout=LICENSE_API_TIMEOUT, context=HTTPS_CONTEXT
+        ) as response:
             return json.load(response)
     except urllib.error.HTTPError as exc:
         if exc.code == 429 or 500 <= exc.code < 600:
@@ -601,7 +612,9 @@ def _llm_post_json(url: str, payload: dict, headers: dict | None = None) -> dict
         url, data=body, method="POST", headers=request_headers
     )
     try:
-        with urllib.request.urlopen(request, timeout=LLM_API_TIMEOUT) as response:
+        with urllib.request.urlopen(
+            request, timeout=LLM_API_TIMEOUT, context=HTTPS_CONTEXT
+        ) as response:
             return json.load(response)
     except urllib.error.HTTPError as exc:
         try:

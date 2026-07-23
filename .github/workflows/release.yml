@@ -46,6 +46,9 @@ jobs:
           MOODITO_VERSION: ${{ steps.version.outputs.version }}
         run: python -m PyInstaller --noconfirm --clean moodito.spec
 
+      - name: Verify bundled CA certificates
+        run: test -s "dist/Moodito.app/Contents/Resources/certifi/cacert.pem"
+
       - name: Ad-hoc codesign the .app
         run: codesign --force --deep --sign - dist/Moodito.app
 

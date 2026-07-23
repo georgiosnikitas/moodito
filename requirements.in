@@ -12,6 +12,7 @@
 # Moodito is a macOS-only menu bar app. rumps and pyobjc are macOS-only and
 # their build scripts call /usr/bin/sw_vers, so guard them with a platform
 # marker to keep the set resolvable on non-macOS tooling.
+certifi==2026.6.17
 rumps==0.4.0; sys_platform == "darwin"
 opencv-python==4.13.0.92
 mediapipe==0.10.35

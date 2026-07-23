@@ -6,6 +6,7 @@ only through standalone helpers and bare-instance method calls.
 from __future__ import annotations
 
 import builtins
+import io
 import json
 
 import pytest
@@ -65,25 +66,30 @@ class TestEnsureModel:
 
     def test_downloads_when_model_absent(self, data_dir, monkeypatch) -> None:
         calls = []
-        monkeypatch.setattr(
-            app.urllib.request,
-            "urlretrieve",
-            lambda url, path: calls.append((url, path)),
-        )
+
+        def fake_urlopen(url, *, context):
+            calls.append((url, context))
+            return io.BytesIO(b"model data")
+
+        monkeypatch.setattr(app.urllib.request, "urlopen", fake_urlopen)
         app.ensure_model()
-        assert calls[0][0] == app.MODEL_URL
-        assert calls[0][1] != app.MODEL_PATH
-        assert (data_dir / "model.task").exists()
+        assert calls == [(app.MODEL_URL, app.HTTPS_CONTEXT)]
+        assert (data_dir / "model.task").read_bytes() == b"model data"
 
     def test_failed_download_removes_partial_file(
         self, data_dir, monkeypatch
     ) -> None:
-        def fail_download(_url, path):
-            with open(path, "wb") as model_file:
-                model_file.write(b"partial")
-            raise OSError("connection dropped")
+        class FailingResponse(io.BytesIO):
+            def read(self, size=-1):
+                if self.tell():
+                    raise OSError("connection dropped")
+                return super().read(size)
 
-        monkeypatch.setattr(app.urllib.request, "urlretrieve", fail_download)
+        monkeypatch.setattr(
+            app.urllib.request,
+            "urlopen",
+            lambda _url, *, context: FailingResponse(b"partial"),
+        )
 
         with pytest.raises(OSError, match="connection dropped"):
             app.ensure_model()
@@ -1450,7 +1456,7 @@ class TestLicenseApi:
     ) -> None:
         import io
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout, *, context):
             raise app.urllib.error.HTTPError(
                 request.full_url,
                 status,
@@ -1493,11 +1499,12 @@ class TestLicenseApi:
             def read(self):
                 return b'{"activated": true}'
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout, *, context):
             captured["url"] = request.full_url
             captured["data"] = request.data
             captured["method"] = request.get_method()
             captured["accept"] = request.get_header("Accept")
+            captured["context"] = context
             return FakeResponse()
 
         monkeypatch.setattr(app.urllib.request, "urlopen", fake_urlopen)
@@ -1507,11 +1514,12 @@ class TestLicenseApi:
         assert captured["data"] == b"license_key=k"
         assert captured["method"] == "POST"
         assert captured["accept"] == "application/json"
+        assert captured["context"] is app.HTTPS_CONTEXT
 
     def test_api_request_parses_http_error_body(self, monkeypatch) -> None:
         import io
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout, *, context):
             raise app.urllib.error.HTTPError(
                 request.full_url, 422, "Unprocessable", {},
                 io.BytesIO(b'{"error": "invalid key"}'),

@@ -57,8 +57,10 @@ jobs:
       - name: Build standalone .app (smoke test)
         run: python -m PyInstaller --noconfirm --clean moodito.spec
 
-      - name: Verify bundle exists
-        run: test -d "dist/Moodito.app"
+      - name: Verify bundle contents
+        run: |
+          test -d "dist/Moodito.app"
+          test -s "dist/Moodito.app/Contents/Resources/certifi/cacert.pem"
 
   sonarcloud:
     name: SonarCloud analysis
