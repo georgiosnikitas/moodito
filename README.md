@@ -67,6 +67,18 @@ Everything lives in the menu bar dropdown — small, fast, and out of your way.
   to `0` disables that action for that trigger. When the trigger ends, Moodito
   restores each screen's exact brightness, plus the audio levels and speaker
   mute state that were active before Privacy engaged.
+- **🙂 Command-key face gestures** — hold **⌘ Command** and blink or tilt your
+  head to control macOS. The
+  **Gestures…** window appears directly after **Break Timer…** and lets you
+  enable each mapping independently: double blink opens Apps, long blink shows
+  the Desktop, and head tilts control
+  previous/next Space, Mission Control, and App Exposé. Disable
+  **Require ⌘ Command key** to use gestures without holding a key. Moodito
+  requests Accessibility and Automation for System Events actions. The Command
+  modifier is read without monitoring the keyboard event stream. When Command
+  is required, system actions run as soon as it is released so the held key does
+  not alter their shortcut. Recognition stays in the existing on-device camera
+  pipeline; only the resulting shortcut is sent to macOS.
 - **⏱️ Break Timer** — set a countdown in hours, minutes, and seconds. An active
   timer shows a clock in the macOS menu bar and its remaining time beside the
   Break Timer option as `[hh:mm:ss]`. When it finishes, Moodito opens a reminder
@@ -81,8 +93,8 @@ Everything lives in the menu bar dropdown — small, fast, and out of your way.
   and a live enabled count.
 - **🖼️ Customisable display** — toggle **Show Emojis** and **Show Labels**
   independently, or fall back to the clean Moodito icon.
-- **⏸️ Pause / Resume** — instantly stop processing webcam frames whenever you
-  want privacy or a break.
+- **⏸️ Pause / Resume** — instantly stop processing and release Moodito's
+  webcam handle; Resume reopens it when you are ready.
 - **📷 Camera access helper** — a one-click shortcut to grant or re-grant webcam
   permission.
 - **💾 Export & erase** — **Download (csv)** your raw detection log, or **Erase**
@@ -97,6 +109,8 @@ Everything lives in the menu bar dropdown — small, fast, and out of your way.
 - macOS
 - Python 3.11–3.13 (MediaPipe wheels are not yet published for 3.13+)
 - A webcam
+- Accessibility permission for System Events actions
+- Automation permission for Show Desktop, Spaces, Mission Control, and App Exposé
 
 ## Setup
 
@@ -141,6 +155,12 @@ cp -R dist/Moodito.app /Applications/   # install it
 The app is unsigned, so the first launch may require right-click -> **Open** (or
 allowing it under System Settings -> Privacy & Security). The model is cached in
 `~/Library/Application Support/Moodito/`.
+
+macOS privacy grants apply to the exact signed app copy. If Moodito is installed
+in `/Applications`, replace and launch that copy before granting Automation or
+Accessibility. A packaged copy launched elsewhere redirects to the installed
+app to avoid splitting permissions between two identities. Local ad-hoc rebuilds
+still require a fresh grant when the installed app is replaced.
 
 ## How it works
 

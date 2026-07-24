@@ -42,6 +42,18 @@ from emotion import (
     EmotionResult,
     infer_emotion,
 )
+from gestures import (
+    DEFAULT_GESTURES,
+    DEFAULT_REQUIRE_COMMAND,
+    GESTURE_KEYS,
+    GESTURE_SPECS,
+    SYSTEM_EVENT_GESTURES,
+    GestureDetector,
+    command_key_down,
+    perform_gesture_action,
+    pose_angles_from_matrix,
+    request_accessibility_access,
+)
 
 MODEL_FILENAME = "face_landmarker.task"
 MODEL_URL = (
@@ -77,6 +89,8 @@ LICENSE_UNREACHABLE = "unreachable"  # network/server error (treated as transien
 # Store the model in a writable per-user directory so it works both when run
 # from source and when packaged as a read-only .app bundle.
 DATA_DIR = os.path.expanduser("~/Library/Application Support/Moodito")
+INSTALLED_APP_PATH = "/Applications/Moodito.app"
+APP_BUNDLE_IDENTIFIER = "com.moodito.app"
 MODEL_PATH = os.path.join(DATA_DIR, MODEL_FILENAME)
 # Persisted user preferences (e.g. the "icon only" display mode).
 SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
@@ -185,6 +199,7 @@ ABOUT_BOLD_PHRASES = (
 UI_REFRESH_INTERVAL = 0.3
 # Target webcam sampling rate (seconds between processed frames).
 SAMPLE_INTERVAL = 0.15
+GESTURE_FACE_LOSS_GRACE_SECONDS = 1.0
 # Maximum faces MediaPipe detects in one camera frame.
 MAX_DETECTED_FACES = 5
 # Privacy is opt-in so upgrading Moodito never changes the system unexpectedly.
@@ -1799,11 +1814,20 @@ class FaceWorker(threading.Thread):
         super().__init__(daemon=True)
         self._camera_index = camera_index
         self._stop = threading.Event()
+        self._capture_active = threading.Event()
+        self._capture_active.set()
         self._lock = threading.Lock()
         self._result = EmotionResult("neutral", 0.0)
         self._error: str | None = None
         self._ready = False
         self._sensitivity: dict[str, str] = {}
+        self._gestures = dict(DEFAULT_GESTURES)
+        self._gesture_require_command = DEFAULT_REQUIRE_COMMAND
+        self._gestures_active = True
+        self._gesture_detector = GestureDetector(self._gestures)
+        self._gesture_events: list[str] = []
+        self._pending_system_gesture: str | None = None
+        self._gesture_face_lost_since: float | None = None
         self._timestamp_ms = 0
 
     @property
@@ -1823,6 +1847,107 @@ class FaceWorker(threading.Thread):
             self._sensitivity = dict(value)
 
     @property
+    def gestures(self) -> dict[str, bool]:
+        """Gesture enablement shared with the settings window."""
+        with self._lock:
+            return dict(self._gestures)
+
+    @gestures.setter
+    def gestures(self, value: dict[str, bool]) -> None:
+        with self._lock:
+            self._gestures = {
+                key: value.get(key, DEFAULT_GESTURES[key]) is True
+                for key in GESTURE_KEYS
+            }
+            self._gesture_detector.set_enabled(self._gestures)
+            self._pending_system_gesture = None
+
+    @property
+    def gesture_require_command(self) -> bool:
+        """Whether a physical Command key must activate gesture recognition."""
+        with self._lock:
+            return self._gesture_require_command
+
+    @gesture_require_command.setter
+    def gesture_require_command(self, required: bool) -> None:
+        with self._lock:
+            self._gesture_require_command = required
+            self._pending_system_gesture = None
+            self._gesture_face_lost_since = None
+            self._gesture_detector.reset()
+
+    def consume_gesture_events(self) -> tuple[str, ...]:
+        """Return and clear gestures recognised since the last UI refresh."""
+        with self._lock:
+            events = tuple(self._gesture_events)
+            self._gesture_events.clear()
+            return events
+
+    def set_gestures_active(self, active: bool) -> None:
+        """Enable recognition, resetting partial gestures when suspended."""
+        with self._lock:
+            self._gestures_active = active
+            if not active:
+                self._gesture_events.clear()
+                self._pending_system_gesture = None
+                self._gesture_face_lost_since = None
+                self._gesture_detector.reset()
+
+    def _update_gesture(
+        self,
+        blendshapes: dict[str, float],
+        pose: tuple[float, float] | None,
+        *,
+        single_face: bool = True,
+    ) -> None:
+        with self._lock:
+            if not self._gestures_active or not any(self._gestures.values()):
+                self._pending_system_gesture = None
+                self._gesture_face_lost_since = None
+                self._gesture_detector.reset()
+                return
+            if not single_face:
+                self._handle_missing_gesture_face(time.monotonic())
+                return
+            self._gesture_face_lost_since = None
+            activation_active = (
+                command_key_down() if self._gesture_require_command else True
+            )
+            if self._pending_system_gesture is not None:
+                if not activation_active:
+                    self._gesture_events.append(self._pending_system_gesture)
+                    self._pending_system_gesture = None
+                    self._gesture_detector.reset()
+                return
+            event = self._gesture_detector.update(
+                time.monotonic(),
+                activation_active,
+                blendshapes,
+                pose,
+            )
+            if event is not None:
+                if (
+                    self._gesture_require_command
+                    and event in SYSTEM_EVENT_GESTURES
+                ):
+                    self._pending_system_gesture = event
+                else:
+                    self._gesture_events.append(event)
+
+    def _handle_missing_gesture_face(self, timestamp: float) -> None:
+        self._pending_system_gesture = None
+        if self._gesture_face_lost_since is None:
+            self._gesture_face_lost_since = timestamp
+        missing_for = timestamp - self._gesture_face_lost_since
+        preserve_baseline = (
+            not self._gesture_require_command
+            and missing_for < GESTURE_FACE_LOSS_GRACE_SECONDS
+        )
+        self._gesture_detector.reset(
+            preserve_pose_baseline=preserve_baseline,
+        )
+
+    @property
     def ready(self) -> bool:
         """True once the first frame has been processed (startup complete)."""
         with self._lock:
@@ -1833,6 +1958,18 @@ class FaceWorker(threading.Thread):
         with self._lock:
             return self._error
 
+    @property
+    def capture_active(self) -> bool:
+        """Whether the worker should own and read from the camera."""
+        return self._capture_active.is_set()
+
+    def set_paused(self, paused: bool) -> None:
+        """Release the camera while paused and reopen it after resume."""
+        if paused:
+            self._capture_active.clear()
+        else:
+            self._capture_active.set()
+
     def _set_result(self, result: EmotionResult) -> None:
         with self._lock:
             self._result = result
@@ -1842,9 +1979,14 @@ class FaceWorker(threading.Thread):
     def _set_error(self, message: str) -> None:
         with self._lock:
             self._error = message
+            self._gesture_events.clear()
+            self._pending_system_gesture = None
+            self._gesture_face_lost_since = None
+            self._gesture_detector.reset()
 
     def stop(self) -> None:
         self._stop.set()
+        self._capture_active.set()
 
     def run(self) -> None:
         try:
@@ -1856,6 +1998,7 @@ class FaceWorker(threading.Thread):
         options = vision.FaceLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
             output_face_blendshapes=True,
+            output_facial_transformation_matrixes=True,
             num_faces=MAX_DETECTED_FACES,
             running_mode=vision.RunningMode.VIDEO,
         )
@@ -1876,6 +2019,10 @@ class FaceWorker(threading.Thread):
 
         with landmarker_context as landmarker:
             while not self._stop.is_set():
+                if not self._capture_active.wait(0.2):
+                    continue
+                if self._stop.is_set():
+                    return
                 cap = cv2.VideoCapture(self._camera_index)
                 if not cap.isOpened():
                     cap.release()
@@ -1890,6 +2037,8 @@ class FaceWorker(threading.Thread):
         failures = 0
         while not self._stop.is_set():
             ok, frame = cap.read()
+            if not self._capture_active.is_set():
+                return
             if not ok:
                 failures += 1
                 # A few read failures can be transient; many means the camera
@@ -1908,6 +2057,7 @@ class FaceWorker(threading.Thread):
 
             face_count = len(detection.face_blendshapes)
             if face_count > 1:
+                self._update_gesture({}, None, single_face=False)
                 self._set_result(
                     EmotionResult(MULTI_FACE_LABEL, 1.0, face_count=face_count)
                 )
@@ -1916,8 +2066,16 @@ class FaceWorker(threading.Thread):
                     category.category_name: category.score
                     for category in detection.face_blendshapes[0]
                 }
+                matrices = detection.facial_transformation_matrixes
+                pose = (
+                    pose_angles_from_matrix(matrices[0])
+                    if len(matrices) == 1
+                    else None
+                )
+                self._update_gesture(scores, pose)
                 self._set_result(infer_emotion(scores, self.sensitivity))
             else:
+                self._update_gesture({}, None, single_face=False)
                 self._set_result(EmotionResult(NO_FACE_LABEL, 0.0, face_count=0))
 
             self._stop.wait(SAMPLE_INTERVAL)
@@ -1952,6 +2110,11 @@ class MooditoApp(rumps.App):
         # with the worker thread that runs inference.
         self._sensitivity = self._load_sensitivity()
         self._worker.sensitivity = self._sensitivity
+        self._gestures = self._load_gestures()
+        self._worker.gestures = self._gestures
+        self._gesture_require_command = self._load_gesture_require_command()
+        self._worker.gesture_require_command = self._gesture_require_command
+        self._gesture_accessibility_requested = False
         # Privacy actions can run after continuous no-face or multi-face states.
         # Runtime state is kept separately from persisted preferences.
         self._privacy = self._load_privacy()
@@ -2157,6 +2320,9 @@ class MooditoApp(rumps.App):
         self._privacy_menu = rumps.MenuItem(
             "Privacy…", callback=self.open_privacy_window
         )
+        self._gestures_menu = rumps.MenuItem(
+            "Gestures…", callback=self.open_gestures_window
+        )
         self._break_timer_menu = rumps.MenuItem(
             BREAK_TIMER_MENU_TITLE, callback=self.open_break_timer_window
         )
@@ -2198,6 +2364,7 @@ class MooditoApp(rumps.App):
             self._sensitivity_menu,
             self._privacy_menu,
             self._break_timer_menu,
+            self._gestures_menu,
             rumps.MenuItem("Pause", callback=self.toggle_pause),
             None,
             self._license_menu,
@@ -2236,6 +2403,7 @@ class MooditoApp(rumps.App):
         set_symbol_icon(self._notifications_menu, "bell")
         set_symbol_icon(self._sensitivity_menu, "slider.horizontal.3")
         set_symbol_icon(self._privacy_menu, "lock.shield")
+        set_symbol_icon(self._gestures_menu, "face.dashed")
         self._update_break_timer_menu()
         set_symbol_icon(self._ai_provider_menu, "sparkles")
         set_symbol_icon(self._mood_tip_menu, "text.bubble")
@@ -2401,6 +2569,8 @@ class MooditoApp(rumps.App):
         # Apply any license state change made by a background license thread.
         self._consume_license_updates()
 
+        gesture_events = self._worker.consume_gesture_events()
+
         if self._paused:
             self._reset_privacy()
             self._pause_break_timer()
@@ -2415,6 +2585,16 @@ class MooditoApp(rumps.App):
             self._detected_item.title = f"Detected: error ({error})"
             self._accumulate_stats("error")
             return
+
+        for gesture in gesture_events:
+            if (
+                self._gestures.get(gesture, False)
+                and not perform_gesture_action(gesture)
+                and gesture in SYSTEM_EVENT_GESTURES
+                and not self._gesture_accessibility_requested
+            ):
+                self._gesture_accessibility_requested = True
+                request_accessibility_access()
 
         result = self._worker.result
         face_present = result.label != NO_FACE_LABEL
@@ -3658,6 +3838,178 @@ class MooditoApp(rumps.App):
 
         return view, controls
 
+    def _load_gestures(self) -> dict[str, bool]:
+        """Return validated face-gesture preferences from settings."""
+        gestures = dict(DEFAULT_GESTURES)
+        stored = self._settings.get("gestures")
+        if isinstance(stored, dict):
+            for key in GESTURE_KEYS:
+                if isinstance(stored.get(key), bool):
+                    gestures[key] = stored[key]
+        return gestures
+
+    def _load_gesture_require_command(self) -> bool:
+        """Return whether gestures require a held Command key."""
+        stored = self._settings.get("gesture_require_command")
+        return stored if isinstance(stored, bool) else DEFAULT_REQUIRE_COMMAND
+
+    def _apply_gestures(
+        self,
+        gestures: dict,
+        require_command: bool | None = None,
+    ) -> bool:
+        """Validate, apply, and persist all face-gesture toggles."""
+        if not all(isinstance(gestures.get(key), bool) for key in GESTURE_KEYS):
+            return False
+        if require_command is None:
+            require_command = self._gesture_require_command
+        if not isinstance(require_command, bool):
+            return False
+        updated = {key: gestures[key] for key in GESTURE_KEYS}
+        if (
+            updated != self._gestures
+            or require_command != self._gesture_require_command
+        ):
+            self._gestures = updated
+            self._gesture_require_command = require_command
+            self._worker.gestures = updated
+            self._worker.gesture_require_command = require_command
+            self._settings["gestures"] = dict(updated)
+            self._settings["gesture_require_command"] = require_command
+            save_settings(self._settings)
+        if any(updated[key] for key in SYSTEM_EVENT_GESTURES):
+            self._gesture_accessibility_requested = True
+            request_accessibility_access()
+        return True
+
+    def open_gestures_window(self, _sender) -> None:
+        """Show face gestures, their actions, and their macOS shortcuts."""
+        try:
+            from AppKit import NSAlert, NSAlertFirstButtonReturn, NSApp, NSImage
+
+            view, controls = self._build_gestures_accessory()
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Gestures")
+            alert.setInformativeText_(
+                "Enable face gestures and choose whether they require "
+                "the ⌘ Command key."
+            )
+            alert.addButtonWithTitle_("Apply")
+            alert.addButtonWithTitle_("Cancel")
+            icon = NSImage.alloc().initByReferencingFile_(resource_path(MENUBAR_ICON))
+            if icon is not None and icon.isValid():
+                alert.setIcon_(icon)
+            alert.setAccessoryView_(view)
+            NSApp.activateIgnoringOtherApps_(True)
+            if alert.runModal() == NSAlertFirstButtonReturn:
+                self._apply_gestures_from_controls(controls)
+        except Exception:  # noqa: BLE001 - never let a UI glitch crash the menu
+            pass
+
+    def _apply_gestures_from_controls(self, controls: dict) -> bool:
+        """Commit gesture toggles selected in the Gestures dialog."""
+        return self._apply_gestures(
+            {key: bool(controls[key].state()) for key in GESTURE_KEYS},
+            bool(controls["_require_command"].state()),
+        )
+
+    def _build_gestures_accessory(self):
+        """Build the Face Gesture, Action, and Shortcut settings table."""
+        from AppKit import (
+            NSButton,
+            NSControlStateValueOn,
+            NSFont,
+            NSSwitchButton,
+            NSTextField,
+            NSView,
+        )
+        from Foundation import NSMakeRect
+
+        width = 620.0
+        header_height = 28.0
+        row_height = 32.0
+        command_height = 38.0
+        height = command_height + header_height + len(GESTURE_SPECS) * row_height
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, width, height))
+
+        def add_label(
+            text: str,
+            x: float,
+            y: float,
+            label_width: float,
+            *,
+            bold: bool = False,
+            monospaced: bool = False,
+        ) -> None:
+            label = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(x, y, label_width, 22.0)
+            )
+            label.setStringValue_(text)
+            label.setBezeled_(False)
+            label.setDrawsBackground_(False)
+            label.setEditable_(False)
+            label.setSelectable_(False)
+            if bold:
+                label.setFont_(NSFont.boldSystemFontOfSize_(12.0))
+            elif monospaced:
+                label.setFont_(NSFont.userFixedPitchFontOfSize_(12.0))
+            else:
+                label.setFont_(NSFont.systemFontOfSize_(13.0))
+            view.addSubview_(label)
+
+        face_x = 0.0
+        action_x = 215.0
+        shortcut_x = 465.0
+        command_toggle = NSButton.alloc().initWithFrame_(
+            NSMakeRect(0.0, height - 30.0, width, 24.0)
+        )
+        command_toggle.setButtonType_(NSSwitchButton)
+        command_toggle.setTitle_("Require ⌘ Command key")
+        command_toggle.setAllowsMixedState_(False)
+        command_toggle.setState_(
+            NSControlStateValueOn if self._gesture_require_command else 0
+        )
+        command_toggle.setToolTip_(
+            "When disabled, enabled gestures work without holding Command"
+        )
+        view.addSubview_(command_toggle)
+
+        header_y = height - command_height - 22.0
+        add_label("Face Gesture", face_x, header_y, 200.0, bold=True)
+        add_label("Action", action_x, header_y, 235.0, bold=True)
+        add_label("Shortcut", shortcut_x, header_y, 155.0, bold=True)
+
+        controls = {"_require_command": command_toggle}
+        for row_index, spec in enumerate(GESTURE_SPECS):
+            row_y = (
+                height
+                - command_height
+                - header_height
+                - (row_index + 1) * row_height
+            )
+            toggle = NSButton.alloc().initWithFrame_(
+                NSMakeRect(face_x, row_y + 4.0, 205.0, 24.0)
+            )
+            toggle.setButtonType_(NSSwitchButton)
+            toggle.setTitle_(spec.face_gesture)
+            toggle.setAllowsMixedState_(False)
+            toggle.setState_(
+                NSControlStateValueOn if self._gestures[spec.key] else 0
+            )
+            toggle.setToolTip_(f"Enable {spec.face_gesture}")
+            view.addSubview_(toggle)
+            controls[spec.key] = toggle
+            add_label(spec.action, action_x, row_y + 5.0, 235.0)
+            add_label(
+                spec.shortcut,
+                shortcut_x,
+                row_y + 5.0,
+                155.0,
+                monospaced=True,
+            )
+
+        return view, controls
+
     def _load_break_timer(self) -> dict:
         """Load the persisted recurring Break Timer configuration."""
         timer = {
@@ -4658,11 +5010,13 @@ class MooditoApp(rumps.App):
 
     def toggle_pause(self, _sender) -> None:
         self._paused = not self._paused
+        self._worker.set_paused(self._paused)
+        self._worker.set_gestures_active(not self._paused)
         if self._paused:
             self._reset_privacy()
             self._pause_item.title = "Resume"
             set_symbol_icon(self._pause_item, "play.fill")
-            self._set_menubar(None, "⏸️ Moodito")
+            self._set_menubar(self._icon_path, "⏸️")
             self._detected_item.title = "Detected: paused"
             self._send_notification("app_paused")
         else:
@@ -4951,7 +5305,52 @@ class MooditoApp(rumps.App):
         rumps.quit_application()
 
 
+def installed_app_is_running() -> bool:
+    """Return whether the canonical installed Moodito executable is running."""
+    try:
+        from AppKit import NSRunningApplication
+
+        applications = NSRunningApplication.runningApplicationsWithBundleIdentifier_(
+            APP_BUNDLE_IDENTIFIER
+        )
+        installed_root = f"{os.path.realpath(INSTALLED_APP_PATH)}{os.sep}"
+        for application in applications:
+            executable_url = application.executableURL()
+            if executable_url is None:
+                continue
+            executable_path = str(executable_url.path())
+            if os.path.realpath(executable_path).startswith(installed_root):
+                return True
+    except Exception:  # noqa: BLE001 - redirect remains best-effort
+        pass
+    return False
+
+
+def redirect_to_installed_app() -> bool:
+    """Redirect a non-installed packaged copy to the canonical app bundle."""
+    if not getattr(sys, "frozen", False) or not os.path.isdir(INSTALLED_APP_PATH):
+        return False
+    current_bundle = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.realpath(sys.executable)))
+    )
+    if os.path.realpath(current_bundle) == os.path.realpath(INSTALLED_APP_PATH):
+        return False
+    if installed_app_is_running():
+        return True
+    try:
+        subprocess.Popen(
+            ["open", "-n", INSTALLED_APP_PATH],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return True
+
+
 def main() -> None:
+    if redirect_to_installed_app():
+        return
     # Validate the emoji table is wired up (cheap sanity check at startup).
     assert "happy" in EMOTION_EMOJI
     # Ask for camera access up front so macOS shows the permission prompt.

@@ -70,6 +70,8 @@ app = BUNDLE(
         "LSUIElement": True,
         # Required so macOS can prompt for and grant camera access.
         "NSCameraUsageDescription": "Moodito uses the camera to detect your facial expression.",
+        # Required for System Events automation used by global gesture actions.
+        "NSAppleEventsUsageDescription": "Moodito uses System Events to perform enabled macOS gesture shortcuts.",
         "CFBundleName": "Moodito",
         "CFBundleDisplayName": "Moodito",
         "CFBundleShortVersionString": VERSION,

@@ -18,3 +18,4 @@ opencv-python==4.13.0.92
 mediapipe==0.10.35
 numpy==2.4.6
 pyobjc-framework-AVFoundation==12.2.1; sys_platform == "darwin"
+pyobjc-framework-Quartz==12.2.1; sys_platform == "darwin"

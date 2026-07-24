@@ -46,8 +46,8 @@ jobs:
 
       - name: Syntax / import check
         run: |
-          python -m compileall -q app.py emotion.py scripts/make_icon.py scripts/make_qr.py
-          python -c "import app, emotion"
+          python -m compileall -q app.py emotion.py gestures.py scripts/make_icon.py scripts/make_qr.py
+          python -c "import app, emotion, gestures"
 
       - name: Unit tests (pytest)
         run: |
@@ -88,7 +88,7 @@ jobs:
       - name: Tests with coverage
         run: |
           # Generate coverage.xml for Sonar; tolerate "no tests collected" (exit 5).
-          python -m pytest --cov=app --cov=emotion --cov-report=xml -q || [ $? -eq 5 ]
+          python -m pytest --cov=app --cov=emotion --cov=gestures --cov-report=xml -q || [ $? -eq 5 ]
 
       - name: SonarCloud scan
         uses: SonarSource/sonarqube-scan-action@713881670b6b3676cda39549040e2d88c70d582e # v8.2.0

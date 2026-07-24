@@ -20,5 +20,13 @@ python -m PyInstaller --noconfirm --clean moodito.spec
 
 echo
 echo "Built dist/Moodito.app"
-echo "Run it with:  open dist/Moodito.app"
-echo "Install it with:  cp -R dist/Moodito.app /Applications/"
+if [[ -d /Applications/Moodito.app ]]; then
+  echo
+  echo "An installed copy already exists at /Applications/Moodito.app."
+  echo "Opening dist/Moodito.app redirects to the installed copy so macOS"
+  echo "privacy grants are not split across two ad-hoc app identities."
+  echo "Replace /Applications/Moodito.app only when testing the new build."
+else
+  echo "Run it with:  open dist/Moodito.app"
+  echo "Install it with:  cp -R dist/Moodito.app /Applications/"
+fi

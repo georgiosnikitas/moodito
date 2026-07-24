@@ -580,13 +580,169 @@ class TestFaceWorker:
 
     def test_set_error_records_message(self) -> None:
         worker = app.FaceWorker()
+        worker._gesture_events.append("double_blink")
+        worker._gesture_detector.update(0.0, True, {}, (0.0, 0.0))
         worker._set_error("boom")
         assert worker.error == "boom"
+        assert worker.consume_gesture_events() == ()
+        assert worker._gesture_detector._command_active is False
 
     def test_stop_sets_event(self) -> None:
         worker = app.FaceWorker()
         worker.stop()
         assert worker._stop.is_set()
+
+    def test_queues_and_consumes_recognised_gesture(self, monkeypatch) -> None:
+        worker = app.FaceWorker()
+        times = iter((0.0, 0.1, 0.8, 0.9))
+        command_states = iter((True, True, True, False))
+        monkeypatch.setattr(app, "command_key_down", lambda: next(command_states))
+        monkeypatch.setattr(app.time, "monotonic", lambda: next(times))
+
+        worker._update_gesture({}, (0.0, 0.0))
+        worker._update_gesture({}, (0.0, 14.0))
+        worker._update_gesture({}, (0.0, 14.0))
+        assert worker.consume_gesture_events() == ()
+        worker._update_gesture({}, (0.0, 14.0))
+
+        assert worker.consume_gesture_events() == ("tilt_right",)
+        assert worker.consume_gesture_events() == ()
+
+    def test_disabled_command_requirement_bypasses_physical_key(
+        self, monkeypatch
+    ) -> None:
+        worker = app.FaceWorker()
+        worker.gesture_require_command = False
+        times = iter((0.0, 0.1, 0.8))
+        monkeypatch.setattr(
+            app,
+            "command_key_down",
+            lambda: pytest.fail("Command state should not be read"),
+        )
+        monkeypatch.setattr(app.time, "monotonic", lambda: next(times))
+
+        worker._update_gesture({}, (0.0, 0.0))
+        worker._update_gesture({}, (0.0, 14.0))
+        worker._update_gesture({}, (0.0, 14.0))
+
+        assert worker.consume_gesture_events() == ("tilt_right",)
+
+    def test_command_free_pose_keeps_baseline_through_brief_face_loss(
+        self, monkeypatch
+    ) -> None:
+        worker = app.FaceWorker()
+        worker.gesture_require_command = False
+        now = 0.0
+        monkeypatch.setattr(app.time, "monotonic", lambda: now)
+
+        worker._update_gesture({}, (0.0, 0.0))
+        now = 0.1
+        worker._update_gesture({}, (-13.0, 0.0))
+        now = 0.2
+        worker._update_gesture({}, None, single_face=False)
+        now = 0.3
+        worker._update_gesture({}, (-13.0, 0.0))
+        now = 1.3
+        worker._update_gesture({}, (-13.0, 0.0))
+
+        assert worker.consume_gesture_events() == ("tilt_down",)
+
+        now = 1.5
+        worker._update_gesture({}, (0.0, 0.0))
+        now = 1.6
+        worker._update_gesture({}, (13.0, 0.0))
+        now = 2.6
+        worker._update_gesture({}, (13.0, 0.0))
+
+        assert worker.consume_gesture_events() == ("tilt_up",)
+
+    def test_command_free_pose_recalibrates_after_prolonged_face_loss(
+        self, monkeypatch
+    ) -> None:
+        worker = app.FaceWorker()
+        worker.gesture_require_command = False
+        now = 0.0
+        monkeypatch.setattr(app.time, "monotonic", lambda: now)
+
+        worker._update_gesture({}, (0.0, 0.0))
+        now = 0.1
+        worker._update_gesture({}, None, single_face=False)
+        now = 1.2
+        worker._update_gesture({}, None, single_face=False)
+        now = 1.3
+        worker._update_gesture({}, (-13.0, 0.0))
+        now = 2.4
+        worker._update_gesture({}, (-13.0, 0.0))
+
+        assert worker.consume_gesture_events() == ()
+        assert worker._gesture_detector._baseline_pose == (-13.0, 0.0)
+
+    def test_apps_gesture_does_not_wait_for_command_release(
+        self, monkeypatch
+    ) -> None:
+        worker = app.FaceWorker()
+        times = iter((0.0, 0.1, 0.2, 0.4, 0.5))
+        monkeypatch.setattr(app, "command_key_down", lambda: True)
+        monkeypatch.setattr(app.time, "monotonic", lambda: next(times))
+        closed = {"eyeBlinkLeft": 0.9, "eyeBlinkRight": 0.9}
+
+        worker._update_gesture({}, (0.0, 0.0))
+        worker._update_gesture(closed, (0.0, 0.0))
+        worker._update_gesture({}, (0.0, 0.0))
+        worker._update_gesture(closed, (0.0, 0.0))
+        worker._update_gesture({}, (0.0, 0.0))
+
+        assert worker.consume_gesture_events() == ("double_blink",)
+
+    def test_pending_system_gesture_is_cleared_when_face_is_lost(
+        self, monkeypatch
+    ) -> None:
+        worker = app.FaceWorker()
+        times = iter((0.0, 0.1, 0.8, 0.9))
+        monkeypatch.setattr(app, "command_key_down", lambda: True)
+        monkeypatch.setattr(app.time, "monotonic", lambda: next(times))
+
+        worker._update_gesture({}, (0.0, 0.0))
+        worker._update_gesture({}, (0.0, 14.0))
+        worker._update_gesture({}, (0.0, 14.0))
+        worker._update_gesture({}, None, single_face=False)
+
+        assert worker._pending_system_gesture is None
+        assert worker.consume_gesture_events() == ()
+
+    def test_multiple_faces_reset_partial_gesture(self, monkeypatch) -> None:
+        worker = app.FaceWorker()
+        times = iter((0.0, 0.1, 0.2, 0.3, 0.4))
+        monkeypatch.setattr(app, "command_key_down", lambda: True)
+        monkeypatch.setattr(app.time, "monotonic", lambda: next(times))
+        closed = {"eyeBlinkLeft": 0.9, "eyeBlinkRight": 0.9}
+
+        worker._update_gesture({}, (0.0, 0.0))
+        worker._update_gesture(closed, (0.0, 0.0))
+        worker._update_gesture({}, None, single_face=False)
+        worker._update_gesture({}, (0.0, 0.0))
+        worker._update_gesture(closed, (0.0, 0.0))
+
+        assert worker.consume_gesture_events() == ()
+
+    def test_suspending_gestures_clears_events_and_partial_state(
+        self, monkeypatch
+    ) -> None:
+        worker = app.FaceWorker()
+        times = iter((0.0, 0.1, 0.2, 0.3, 0.4))
+        monkeypatch.setattr(app, "command_key_down", lambda: True)
+        monkeypatch.setattr(app.time, "monotonic", lambda: next(times))
+        closed = {"eyeBlinkLeft": 0.9, "eyeBlinkRight": 0.9}
+
+        worker._update_gesture({}, (0.0, 0.0))
+        worker._update_gesture(closed, (0.0, 0.0))
+        worker._update_gesture({}, (0.0, 0.0))
+        worker.set_gestures_active(False)
+        worker.set_gestures_active(True)
+        worker._update_gesture(closed, (0.0, 0.0))
+        worker._update_gesture({}, (0.0, 0.0))
+
+        assert worker.consume_gesture_events() == ()
 
 
 def _bare_app():
@@ -2054,9 +2210,14 @@ class TestToggles:
         full_app.toggle_pause(None)
         assert full_app._paused is True
         assert "Resume" in full_app._pause_item.title
+        assert full_app._last_render == (full_app._icon_path, "⏸️")
+        assert full_app.icon is not None
+        assert full_app.title == "⏸️"
+        assert full_app._worker.capture_active is False
         full_app.toggle_pause(None)
         assert full_app._paused is False
         assert "Pause" in full_app._pause_item.title
+        assert full_app._worker.capture_active is True
 
     def test_toggle_emojis_persists(self, full_app, monkeypatch) -> None:
         saved = []
@@ -3289,6 +3450,162 @@ class TestPrivacy:
         assert calls == [(True, False), (True, False)]
 
 
+class TestGestures:
+    def test_defaults_enable_every_gesture_and_update_worker(self, full_app) -> None:
+        assert full_app._gestures == app.DEFAULT_GESTURES
+        assert full_app._worker.gestures == app.DEFAULT_GESTURES
+        assert full_app._gesture_require_command is True
+        assert full_app._worker.gesture_require_command is True
+
+    def test_menu_item_is_directly_after_break_timer(self, full_app) -> None:
+        menu_titles = list(full_app.menu.keys())
+        break_timer_index = menu_titles.index(full_app._break_timer_menu.title)
+        assert menu_titles[break_timer_index + 1] == full_app._gestures_menu.title
+
+    def test_apply_persists_and_updates_worker(self, full_app, monkeypatch) -> None:
+        saved = []
+        accessibility_requests = []
+        monkeypatch.setattr(app, "save_settings", lambda settings: saved.append(settings))
+        monkeypatch.setattr(
+            app,
+            "request_accessibility_access",
+            lambda: accessibility_requests.append(True) or True,
+        )
+        updated = dict(app.DEFAULT_GESTURES)
+        updated["long_blink"] = False
+
+        assert full_app._apply_gestures(updated) is True
+        assert full_app._gestures == updated
+        assert full_app._worker.gestures == updated
+        assert saved[-1]["gestures"] == updated
+        assert accessibility_requests == [True]
+
+    def test_apply_can_disable_required_command_key(
+        self, full_app, monkeypatch
+    ) -> None:
+        saved = []
+        accessibility_requests = []
+        monkeypatch.setattr(app, "save_settings", lambda settings: saved.append(settings))
+        monkeypatch.setattr(
+            app,
+            "request_accessibility_access",
+            lambda: accessibility_requests.append(True) or True,
+        )
+
+        assert full_app._apply_gestures(full_app._gestures, False) is True
+        assert full_app._gesture_require_command is False
+        assert full_app._worker.gesture_require_command is False
+        assert saved[-1]["gesture_require_command"] is False
+        assert accessibility_requests == [True]
+
+    def test_apply_rejects_missing_or_non_boolean_values(
+        self, full_app, monkeypatch
+    ) -> None:
+        saved = []
+        monkeypatch.setattr(app, "save_settings", lambda settings: saved.append(settings))
+        invalid = dict(app.DEFAULT_GESTURES)
+        invalid["double_blink"] = 1
+        assert full_app._apply_gestures(invalid) is False
+        assert full_app._apply_gestures({"double_blink": True}) is False
+        assert saved == []
+
+    def test_apply_from_controls_reads_every_toggle(
+        self, full_app, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(app, "save_settings", lambda settings: None)
+        monkeypatch.setattr(app, "request_accessibility_access", lambda: True)
+        controls = {
+            key: _FakeToggle(index % 2 == 0)
+            for index, key in enumerate(app.GESTURE_KEYS)
+        }
+        controls["_require_command"] = _FakeToggle(False)
+        assert full_app._apply_gestures_from_controls(controls) is True
+        assert full_app._gestures == {
+            key: index % 2 == 0
+            for index, key in enumerate(app.GESTURE_KEYS)
+        }
+        assert full_app._gesture_require_command is False
+
+    def test_build_accessory_has_one_toggle_per_gesture(self, full_app) -> None:
+        _view, controls = full_app._build_gestures_accessory()
+        assert tuple(key for key in controls if not key.startswith("_")) == app.GESTURE_KEYS
+        assert bool(controls["_require_command"].state()) is True
+        assert all(bool(control.state()) for control in controls.values())
+
+    def test_load_restores_only_boolean_values(self, data_dir, monkeypatch) -> None:
+        app.save_settings(
+            {
+                "gestures": {
+                    "nod": False,
+                    "head_shake": "off",
+                    "raise_eyebrows": True,
+                    "long_blink": True,
+                },
+                "gesture_require_command": False,
+            }
+        )
+        monkeypatch.setattr(app.FaceWorker, "start", lambda self: None)
+        monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
+        instance = app.MooditoApp()
+        assert "nod" not in instance._gestures
+        assert "head_shake" not in instance._gestures
+        assert "raise_eyebrows" not in instance._gestures
+        assert instance._gestures["long_blink"] is True
+        assert instance._gesture_require_command is False
+        assert instance._worker.gesture_require_command is False
+        instance.refresh(None)
+
+    def test_refresh_dispatches_worker_gesture(self, full_app, monkeypatch) -> None:
+        actions = []
+        monkeypatch.setattr(
+            full_app._worker,
+            "consume_gesture_events",
+            lambda: ("tilt_up",),
+        )
+        monkeypatch.setattr(
+            app,
+            "perform_gesture_action",
+            lambda gesture: actions.append(gesture) or True,
+        )
+        full_app.refresh(None)
+        assert actions == ["tilt_up"]
+
+    def test_refresh_requests_accessibility_for_failed_system_action(
+        self, full_app, monkeypatch
+    ) -> None:
+        requests = []
+        monkeypatch.setattr(
+            full_app._worker,
+            "consume_gesture_events",
+            lambda: ("tilt_up",),
+        )
+        monkeypatch.setattr(app, "perform_gesture_action", lambda _gesture: False)
+        monkeypatch.setattr(
+            app,
+            "request_accessibility_access",
+            lambda: requests.append(True) or False,
+        )
+        full_app.refresh(None)
+        full_app.refresh(None)
+        assert requests == [True]
+
+    def test_refresh_discards_gesture_while_paused(self, full_app, monkeypatch) -> None:
+        actions = []
+        full_app._paused = True
+        monkeypatch.setattr(
+            full_app._worker,
+            "consume_gesture_events",
+            lambda: ("tilt_up",),
+        )
+        monkeypatch.setattr(
+            app,
+            "perform_gesture_action",
+            lambda gesture: actions.append(gesture) or True,
+        )
+        full_app.refresh(None)
+        assert actions == []
+
+
 class TestBreakTimer:
     def test_defaults_are_disabled(self, full_app) -> None:
         assert full_app._break_timer == {
@@ -4457,9 +4774,62 @@ class _Blendshape:
 class _Detection:
     def __init__(self, face_count=1) -> None:
         self.face_blendshapes = [[_Blendshape()] for _ in range(face_count)]
+        identity = (
+            (1.0, 0.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0, 0.0),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+        self.facial_transformation_matrixes = [identity for _ in range(face_count)]
 
 
 class TestFaceWorkerRun:
+    def test_run_releases_camera_when_paused(self, monkeypatch) -> None:
+        worker = app.FaceWorker()
+
+        class PausingCap:
+            reads = 0
+            released = False
+
+            def isOpened(self) -> bool:
+                return True
+
+            def read(self):
+                self.reads += 1
+                worker.set_paused(True)
+                return True, "frame"
+
+            def release(self) -> None:
+                self.released = True
+                worker.stop()
+
+        cap = PausingCap()
+
+        class FakeLandmarkerContext:
+            def __enter__(self):
+                return object()
+
+            def __exit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(app, "ensure_model", lambda: None)
+        monkeypatch.setattr(
+            app.vision,
+            "FaceLandmarkerOptions",
+            lambda **options: options,
+        )
+        monkeypatch.setattr(
+            app.vision.FaceLandmarker,
+            "create_from_options",
+            lambda _options: FakeLandmarkerContext(),
+        )
+        monkeypatch.setattr(app.cv2, "VideoCapture", lambda _index: cap)
+
+        worker.run()
+
+        assert cap.reads == 1
+        assert cap.released is True
+
     def test_run_reports_model_download_failure(self, monkeypatch) -> None:
         def boom() -> None:
             raise RuntimeError("no network")
@@ -4546,6 +4916,7 @@ class TestFaceWorkerRun:
 
         assert captured["num_faces"] == app.MAX_DETECTED_FACES
         assert captured["num_faces"] > 1
+        assert captured["output_facial_transformation_matrixes"] is True
 
     def test_capture_loop_processes_face_frame(self, monkeypatch) -> None:
         monkeypatch.setattr(app.cv2, "cvtColor", lambda *a, **k: "rgb")
@@ -4638,6 +5009,7 @@ class TestFaceWorkerRun:
 
 class TestMain:
     def test_main_runs_app(self, monkeypatch) -> None:
+        monkeypatch.setattr(app, "redirect_to_installed_app", lambda: False)
         monkeypatch.setattr(app, "request_camera_access", lambda: None)
         run_calls = []
         monkeypatch.setattr(app.MooditoApp, "run", lambda self: run_calls.append(True))
@@ -4645,6 +5017,74 @@ class TestMain:
         monkeypatch.setattr(app, "camera_authorization_status", lambda: 3)
         app.main()
         assert run_calls == [True]
+
+    def test_source_run_does_not_redirect(self, monkeypatch) -> None:
+        calls = []
+        monkeypatch.setattr(app.sys, "frozen", False, raising=False)
+        monkeypatch.setattr(app.subprocess, "Popen", lambda *args, **kwargs: calls.append(args))
+        assert app.redirect_to_installed_app() is False
+        assert calls == []
+
+    def test_installed_bundle_does_not_redirect(self, monkeypatch) -> None:
+        calls = []
+        monkeypatch.setattr(app.sys, "frozen", True, raising=False)
+        monkeypatch.setattr(
+            app.sys,
+            "executable",
+            "/Applications/Moodito.app/Contents/MacOS/Moodito",
+        )
+        monkeypatch.setattr(app.os.path, "isdir", lambda _path: True)
+        monkeypatch.setattr(app.subprocess, "Popen", lambda *args, **kwargs: calls.append(args))
+        assert app.redirect_to_installed_app() is False
+        assert calls == []
+
+    def test_dist_bundle_redirects_to_installed_copy(self, monkeypatch) -> None:
+        calls = []
+        monkeypatch.setattr(app.sys, "frozen", True, raising=False)
+        monkeypatch.setattr(
+            app.sys,
+            "executable",
+            "/workspace/dist/Moodito.app/Contents/MacOS/Moodito",
+        )
+        monkeypatch.setattr(app.os.path, "isdir", lambda _path: True)
+        monkeypatch.setattr(app, "installed_app_is_running", lambda: False)
+        monkeypatch.setattr(
+            app.subprocess,
+            "Popen",
+            lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+        assert app.redirect_to_installed_app() is True
+        assert calls[0][0][0] == ["open", "-n", app.INSTALLED_APP_PATH]
+
+    def test_dist_bundle_exits_when_installed_copy_is_running(
+        self, monkeypatch
+    ) -> None:
+        calls = []
+        monkeypatch.setattr(app.sys, "frozen", True, raising=False)
+        monkeypatch.setattr(
+            app.sys,
+            "executable",
+            "/workspace/dist/Moodito.app/Contents/MacOS/Moodito",
+        )
+        monkeypatch.setattr(app.os.path, "isdir", lambda _path: True)
+        monkeypatch.setattr(app, "installed_app_is_running", lambda: True)
+        monkeypatch.setattr(
+            app.subprocess,
+            "Popen",
+            lambda *args, **kwargs: calls.append(args),
+        )
+
+        assert app.redirect_to_installed_app() is True
+        assert calls == []
+
+    def test_main_stops_after_redirect(self, monkeypatch) -> None:
+        monkeypatch.setattr(app, "redirect_to_installed_app", lambda: True)
+        monkeypatch.setattr(
+            app,
+            "request_camera_access",
+            lambda: pytest.fail("camera should not initialize"),
+        )
+        app.main()
 
 
 def _capture_notifications(inst, monkeypatch, *enabled_events):
