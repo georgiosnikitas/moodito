@@ -12,6 +12,9 @@ on:
     branches: ["**"]
   workflow_call: # allows release.yml to run CI before publishing
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
